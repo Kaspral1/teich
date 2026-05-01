@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from difflib import SequenceMatcher
 import re
 from typing import Any
@@ -66,6 +67,37 @@ def _tokenize_text(text_tokenizer: Any, text: str) -> tuple[list[int], list[int]
     if attention_mask is None:
         attention_mask = [1] * len(input_ids)
     return list(input_ids), list(attention_mask)
+
+
+def _tokenize_text_with_offsets(text_tokenizer: Any, text: str) -> tuple[list[int], list[int], list[tuple[int, int]]] | None:
+    try:
+        encoded = text_tokenizer(
+            text,
+            add_special_tokens=False,
+            return_attention_mask=True,
+            return_offsets_mapping=True,
+        )
+    except (TypeError, ValueError, NotImplementedError):
+        return None
+    input_ids = encoded.get("input_ids")
+    offsets = encoded.get("offset_mapping")
+    if input_ids is None or offsets is None:
+        return None
+    attention_mask = encoded.get("attention_mask")
+    if input_ids and isinstance(input_ids[0], list):
+        input_ids = input_ids[0]
+    if attention_mask and isinstance(attention_mask[0], list):
+        attention_mask = attention_mask[0]
+    if offsets and isinstance(offsets[0], list):
+        offsets = offsets[0]
+    if attention_mask is None:
+        attention_mask = [1] * len(input_ids)
+    normalized_offsets = [tuple(offset) for offset in offsets]
+    return list(input_ids), list(attention_mask), normalized_offsets
+
+
+def _supports_offsets(text_tokenizer: Any) -> bool:
+    return _tokenize_text_with_offsets(text_tokenizer, "") is not None
 
 
 def _initial_prefix_length(
@@ -218,6 +250,221 @@ def _fast_mask_row(
     )
 
 
+def _prepend_marker(value: Any, marker: str) -> tuple[Any, bool]:
+    if isinstance(value, str) and value:
+        return marker + value, True
+    if isinstance(value, list):
+        updated = list(value)
+        for index, item in enumerate(updated):
+            new_item, changed = _prepend_marker(item, marker)
+            if changed:
+                updated[index] = new_item
+                return updated, True
+        return value, False
+    if isinstance(value, dict):
+        updated = dict(value)
+        for key, item in updated.items():
+            new_item, changed = _prepend_marker(item, marker)
+            if changed:
+                updated[key] = new_item
+                return updated, True
+        return value, False
+    return value, False
+
+
+def _append_marker(value: Any, marker: str) -> tuple[Any, bool]:
+    if isinstance(value, str) and value:
+        return value + marker, True
+    if isinstance(value, list):
+        updated = list(value)
+        for index in range(len(updated) - 1, -1, -1):
+            new_item, changed = _append_marker(updated[index], marker)
+            if changed:
+                updated[index] = new_item
+                return updated, True
+        return value, False
+    if isinstance(value, dict):
+        updated = dict(value)
+        keys = list(updated.keys())
+        for key in reversed(keys):
+            new_item, changed = _append_marker(updated[key], marker)
+            if changed:
+                updated[key] = new_item
+                return updated, True
+        return value, False
+    return value, False
+
+
+def _wrap_with_markers(value: Any, start_marker: str, end_marker: str) -> tuple[Any, bool]:
+    if isinstance(value, str) and value:
+        return start_marker + value + end_marker, True
+    updated_value, changed_start = _prepend_marker(value, start_marker)
+    if not changed_start:
+        return value, False
+    updated_value, changed_end = _append_marker(updated_value, end_marker)
+    if not changed_end:
+        return value, False
+    return updated_value, True
+
+
+def _mark_supervised_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    marked_messages = deepcopy(messages)
+    markers: list[tuple[str, str]] = []
+    marker_index = 0
+
+    def mark_value(value: Any) -> tuple[Any, bool]:
+        nonlocal marker_index
+        start_marker = f"\ue000AGD{marker_index}S\ue001"
+        end_marker = f"\ue000AGD{marker_index}E\ue001"
+        updated_value, changed = _wrap_with_markers(value, start_marker, end_marker)
+        if changed:
+            markers.append((start_marker, end_marker))
+            marker_index += 1
+        return updated_value, changed
+
+    for message in marked_messages:
+        if not _is_assistant_message(message):
+            continue
+        reasoning = message.get("reasoning_content")
+        updated_reasoning, changed = mark_value(reasoning)
+        if changed:
+            message["reasoning_content"] = updated_reasoning
+        tool_calls = message.get("tool_calls") or []
+        for tool_call in tool_calls:
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            updated_name, changed = mark_value(name)
+            if changed:
+                function["name"] = updated_name
+            arguments = function.get("arguments")
+            updated_arguments, changed = mark_value(arguments)
+            if changed:
+                function["arguments"] = updated_arguments
+        content = message.get("content")
+        updated_content, changed = mark_value(content)
+        if changed:
+            message["content"] = updated_content
+    return marked_messages, markers
+
+
+def _strip_markers_and_collect_spans(text: str, markers: list[tuple[str, str]]) -> tuple[str, list[tuple[int, int]]] | None:
+    if not markers:
+        return text, []
+    marker_lookup: dict[str, tuple[str, int]] = {}
+    pattern_parts: list[str] = []
+    for index, (start_marker, end_marker) in enumerate(markers):
+        marker_lookup[start_marker] = ("start", index)
+        marker_lookup[end_marker] = ("end", index)
+        pattern_parts.append(re.escape(start_marker))
+        pattern_parts.append(re.escape(end_marker))
+    pattern = re.compile("|".join(pattern_parts))
+    cleaned_parts: list[str] = []
+    active_starts: dict[int, int] = {}
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    cleaned_length = 0
+    for match in pattern.finditer(text):
+        chunk = text[cursor:match.start()]
+        if chunk:
+            cleaned_parts.append(chunk)
+            cleaned_length += len(chunk)
+        marker = match.group(0)
+        kind, index = marker_lookup[marker]
+        if kind == "start":
+            active_starts[index] = cleaned_length
+        else:
+            start = active_starts.pop(index, None)
+            if start is None:
+                return None
+            if start < cleaned_length:
+                spans.append((start, cleaned_length))
+        cursor = match.end()
+    tail = text[cursor:]
+    if tail:
+        cleaned_parts.append(tail)
+    if active_starts:
+        return None
+    cleaned_text = "".join(cleaned_parts)
+    if not spans:
+        return cleaned_text, []
+    spans.sort()
+    merged_spans: list[tuple[int, int]] = [spans[0]]
+    for start, end in spans[1:]:
+        last_start, last_end = merged_spans[-1]
+        if start <= last_end:
+            merged_spans[-1] = (last_start, max(last_end, end))
+        else:
+            merged_spans.append((start, end))
+    return cleaned_text, merged_spans
+
+
+def _labels_from_offsets(
+    input_ids: list[int],
+    offsets: list[tuple[int, int]],
+    supervised_spans: list[tuple[int, int]],
+) -> list[int]:
+    labels: list[int] = []
+    span_index = 0
+    for token_id, (start, end) in zip(input_ids, offsets):
+        if end <= start:
+            labels.append(-100)
+            continue
+        while span_index < len(supervised_spans) and supervised_spans[span_index][1] <= start:
+            span_index += 1
+        is_supervised = (
+            span_index < len(supervised_spans)
+            and supervised_spans[span_index][0] < end
+            and start < supervised_spans[span_index][1]
+        )
+        labels.append(token_id if is_supervised else -100)
+    return labels
+
+
+def _offset_mask_row(
+    renderer: Any,
+    text_tokenizer: Any,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    chat_template_kwargs: dict[str, Any],
+    max_length: int | None,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    if not _supports_offsets(text_tokenizer):
+        return None
+    marked_messages, markers = _mark_supervised_messages(messages)
+    marked_text = _render_chat(renderer, marked_messages, tools, chat_template_kwargs)
+    stripped = _strip_markers_and_collect_spans(marked_text, markers)
+    if stripped is None:
+        return None
+    formatted_text, supervised_spans = stripped
+    encoded = _tokenize_text_with_offsets(text_tokenizer, formatted_text)
+    if encoded is None:
+        return None
+    input_ids, attention_mask, offsets = encoded
+    labels = _labels_from_offsets(input_ids, offsets, supervised_spans)
+    assistant_masks = [0 if label == -100 else 1 for label in labels]
+    if max_length is not None:
+        input_ids = input_ids[:max_length]
+        attention_mask = attention_mask[:max_length]
+        assistant_masks = assistant_masks[:max_length]
+        labels = labels[:max_length]
+    return (
+        {
+            "text": formatted_text,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "assistant_masks": assistant_masks,
+            "labels": labels,
+        },
+        {
+            "text": formatted_text,
+            "input_ids": input_ids,
+            "labels": labels,
+        },
+    )
+
+
 def _mask_row(
     row: dict[str, Any],
     renderer: Any,
@@ -237,6 +484,10 @@ def _mask_row(
     fast_path = _fast_mask_row(renderer, text_tokenizer, messages, tools, chat_template_kwargs, max_length)
     if fast_path is not None:
         return fast_path
+
+    offset_path = _offset_mask_row(renderer, text_tokenizer, messages, tools, chat_template_kwargs, max_length)
+    if offset_path is not None:
+        return offset_path
 
     formatted_text = _render_chat(renderer, messages, tools, chat_template_kwargs)
     input_ids, attention_mask = _tokenize_text(text_tokenizer, formatted_text)

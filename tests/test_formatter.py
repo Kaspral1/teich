@@ -81,6 +81,14 @@ class CountingTokenizer(FakeTokenizer):
         return super().apply_chat_template(messages, **kwargs)
 
 
+class OffsetCountingTokenizer(CountingTokenizer):
+    def __call__(self, text, add_special_tokens=False, return_attention_mask=True, return_offsets_mapping=False):
+        output = super().__call__(text, add_special_tokens=add_special_tokens, return_attention_mask=return_attention_mask)
+        if return_offsets_mapping:
+            output["offset_mapping"] = [(index, index + 1) for index in range(len(text))]
+        return output
+
+
 class FakeProcessor:
     def __init__(self):
         self.tokenizer = FakeTokenizer()
@@ -426,3 +434,53 @@ def test_format_and_mask_renders_only_supervision_checkpoints_in_fallback():
 
     assert training_data.num_rows == 1
     assert tokenizer.render_count == 4
+
+
+def test_format_and_mask_uses_single_render_offset_mask_path_when_offsets_are_available():
+    tokenizer = OffsetCountingTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "system", "content": "system rules"},
+                    {"role": "user", "content": "first request"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "inspect repo",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": {"command": "ls"}},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "name": "bash", "content": "file_a.py"},
+                    {"role": "assistant", "content": "done"},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    training_data = format_and_mask(dataset, tokenizer)
+
+    row = training_data[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    assert supervised_text == "inspect repobashdone"
+    masked_text = tokenizer.decode(
+        [token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100]
+    )
+    assert "<system>system rules</system>" in masked_text
+    assert "<user>first request</user>" in masked_text
+    assert "<tool>file_a.py</tool>" in masked_text
+    assert tokenizer.render_count == 1
