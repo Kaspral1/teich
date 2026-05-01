@@ -64,6 +64,14 @@ class FakeTokenizer:
         return "".join(self._reverse_vocab[token_id] for token_id in token_ids)
 
 
+class FakeProcessor:
+    def __init__(self):
+        self.tokenizer = FakeTokenizer()
+
+    def apply_chat_template(self, *args, **kwargs):
+        return self.tokenizer.apply_chat_template(*args, **kwargs)
+
+
 def test_format_and_mask_supervises_only_assistant_turns_across_multi_turn_conversation():
     tokenizer = FakeTokenizer()
     dataset = Dataset.from_list(
@@ -167,3 +175,26 @@ def test_format_and_mask_rejects_reserved_chat_template_kwargs():
         assert "reserved" in str(exc)
     else:
         raise AssertionError("Expected format_and_mask to reject reserved chat_template_kwargs")
+
+
+def test_format_and_mask_supports_processor_objects_with_nested_text_tokenizer():
+    processor = FakeProcessor()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world", "reasoning_content": "think"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    training_data = format_and_mask(dataset, processor)
+
+    row = training_data[0]
+    assert row["text"] == "<user>hello</user><assistant><think>think</think>world</assistant>"
+    supervised_text = processor.tokenizer.decode([token for token in row["labels"] if token != -100])
+    assert supervised_text == "<assistant><think>think</think>world</assistant>"
+    assert "\033[31m" in training_data.preview()

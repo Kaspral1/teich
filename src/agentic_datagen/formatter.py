@@ -5,6 +5,17 @@ from typing import Any
 from datasets import Dataset
 
 
+def _resolve_text_tokenizer(tokenizer: Any) -> Any:
+    text_tokenizer = getattr(tokenizer, "tokenizer", None)
+    if text_tokenizer is None:
+        text_tokenizer = tokenizer
+    if not callable(text_tokenizer):
+        raise TypeError("tokenizer must be callable or expose a callable .tokenizer for text tokenization")
+    if not hasattr(text_tokenizer, "decode"):
+        raise TypeError("tokenizer must expose decode() directly or via tokenizer.decode()")
+    return text_tokenizer
+
+
 def _validate_chat_template_kwargs(chat_template_kwargs: dict[str, Any] | None) -> dict[str, Any]:
     kwargs = dict(chat_template_kwargs or {})
     reserved = {"add_generation_prompt", "tokenize", "tools"}
@@ -36,8 +47,8 @@ def _render_chat(
     return rendered
 
 
-def _tokenize_text(tokenizer: Any, text: str) -> tuple[list[int], list[int]]:
-    encoded = tokenizer(text, add_special_tokens=False, return_attention_mask=True)
+def _tokenize_text(text_tokenizer: Any, text: str) -> tuple[list[int], list[int]]:
+    encoded = text_tokenizer(text, add_special_tokens=False, return_attention_mask=True)
     input_ids = encoded["input_ids"]
     attention_mask = encoded.get("attention_mask")
     if input_ids and isinstance(input_ids[0], list):
@@ -51,6 +62,7 @@ def _tokenize_text(tokenizer: Any, text: str) -> tuple[list[int], list[int]]:
 
 def _initial_prefix_length(
     tokenizer: Any,
+    text_tokenizer: Any,
     tools: list[dict[str, Any]],
     chat_template_kwargs: dict[str, Any],
 ) -> tuple[int, list[int]]:
@@ -58,7 +70,7 @@ def _initial_prefix_length(
         prefix_text = _render_chat(tokenizer, [], tools, chat_template_kwargs)
     except Exception:
         return 0, []
-    prefix_ids, _ = _tokenize_text(tokenizer, prefix_text)
+    prefix_ids, _ = _tokenize_text(text_tokenizer, prefix_text)
     return len(prefix_ids), prefix_ids
 
 
@@ -66,14 +78,14 @@ def _is_prefix(prefix_ids: list[int], full_ids: list[int]) -> bool:
     return len(prefix_ids) <= len(full_ids) and full_ids[: len(prefix_ids)] == prefix_ids
 
 
-def _decode_token(tokenizer: Any, token_id: int) -> str:
+def _decode_token(text_tokenizer: Any, token_id: int) -> str:
     try:
-        return tokenizer.decode([token_id], skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        return text_tokenizer.decode([token_id], skip_special_tokens=False, clean_up_tokenization_spaces=False)
     except TypeError:
-        return tokenizer.decode([token_id], skip_special_tokens=False)
+        return text_tokenizer.decode([token_id], skip_special_tokens=False)
 
 
-def _build_preview(tokenizer: Any, input_ids: list[int], labels: list[int]) -> str:
+def _build_preview(text_tokenizer: Any, input_ids: list[int], labels: list[int]) -> str:
     parts: list[str] = []
     masked = False
     for token_id, label in zip(input_ids, labels):
@@ -84,7 +96,7 @@ def _build_preview(tokenizer: Any, input_ids: list[int], labels: list[int]) -> s
         elif not is_masked and masked:
             parts.append("\033[0m")
             masked = False
-        parts.append(_decode_token(tokenizer, token_id))
+        parts.append(_decode_token(text_tokenizer, token_id))
     if masked:
         parts.append("\033[0m")
     return "".join(parts)
@@ -93,6 +105,7 @@ def _build_preview(tokenizer: Any, input_ids: list[int], labels: list[int]) -> s
 def _mask_row(
     row: dict[str, Any],
     tokenizer: Any,
+    text_tokenizer: Any,
     messages_column: str,
     tools_column: str,
     chat_template_kwargs: dict[str, Any],
@@ -106,17 +119,17 @@ def _mask_row(
         raise TypeError(f"Row is missing a list-valued '{tools_column}' column")
 
     formatted_text = _render_chat(tokenizer, messages, tools, chat_template_kwargs)
-    input_ids, attention_mask = _tokenize_text(tokenizer, formatted_text)
+    input_ids, attention_mask = _tokenize_text(text_tokenizer, formatted_text)
     assistant_masks = [0] * len(input_ids)
     labels = [-100] * len(input_ids)
-    previous_length, base_prefix_ids = _initial_prefix_length(tokenizer, tools, chat_template_kwargs)
+    previous_length, base_prefix_ids = _initial_prefix_length(tokenizer, text_tokenizer, tools, chat_template_kwargs)
 
     if previous_length and not _is_prefix(base_prefix_ids, input_ids):
         previous_length = 0
 
     for index, message in enumerate(messages, start=1):
         prefix_text = _render_chat(tokenizer, messages[:index], tools, chat_template_kwargs)
-        prefix_ids, _ = _tokenize_text(tokenizer, prefix_text)
+        prefix_ids, _ = _tokenize_text(text_tokenizer, prefix_text)
         if not _is_prefix(prefix_ids, input_ids):
             role = message.get("role") if isinstance(message, dict) else None
             raise ValueError(
@@ -163,6 +176,7 @@ def format_and_mask(
     max_length: int | None = None,
 ) -> Dataset:
     template_kwargs = _validate_chat_template_kwargs(chat_template_kwargs)
+    text_tokenizer = _resolve_text_tokenizer(tokenizer)
     rows: list[dict[str, Any]] = []
     preview_rows: list[dict[str, Any]] = []
 
@@ -170,6 +184,7 @@ def format_and_mask(
         masked_row, preview_row = _mask_row(
             row,
             tokenizer,
+            text_tokenizer,
             messages_column,
             tools_column,
             template_kwargs,
@@ -186,7 +201,7 @@ def format_and_mask(
         if index < 0 or index >= len(preview_rows):
             raise IndexError(f"Preview index {index} is out of range for dataset of size {len(preview_rows)}")
         row = preview_rows[index]
-        return _build_preview(tokenizer, row["input_ids"], row["labels"])
+        return _build_preview(text_tokenizer, row["input_ids"], row["labels"])
 
     training_data.preview = preview
     training_data._preview_rows = preview_rows
