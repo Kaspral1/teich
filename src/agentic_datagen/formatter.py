@@ -114,6 +114,23 @@ def _try_render_prefix(
         raise
 
 
+def _is_assistant_message(message: dict[str, Any]) -> bool:
+    return isinstance(message, dict) and message.get("role") == "assistant"
+
+
+def _mask_checkpoints(messages: list[dict[str, Any]]) -> list[tuple[int, bool]]:
+    if not messages:
+        return []
+    checkpoints: list[tuple[int, bool]] = []
+    current_supervision = _is_assistant_message(messages[0])
+    for index in range(1, len(messages) + 1):
+        next_supervision = _is_assistant_message(messages[index]) if index < len(messages) else None
+        if next_supervision != current_supervision:
+            checkpoints.append((index, current_supervision))
+            current_supervision = next_supervision
+    return checkpoints
+
+
 def _extract_token_sequence(values: Any) -> list[int] | None:
     if values is None:
         return None
@@ -226,12 +243,14 @@ def _mask_row(
     current_ids: list[int] = []
     labels: list[int] = []
 
-    for index, message in enumerate(messages, start=1):
-        prefix_text = _try_render_prefix(renderer, messages[:index], tools, chat_template_kwargs)
-        if prefix_text is None:
-            continue
-        prefix_ids, _ = _tokenize_text(text_tokenizer, prefix_text)
-        supervise_current_message = isinstance(message, dict) and message.get("role") == "assistant"
+    for index, supervise_current_message in _mask_checkpoints(messages):
+        if index == len(messages):
+            prefix_ids = input_ids
+        else:
+            prefix_text = _try_render_prefix(renderer, messages[:index], tools, chat_template_kwargs)
+            if prefix_text is None:
+                continue
+            prefix_ids, _ = _tokenize_text(text_tokenizer, prefix_text)
         labels = _update_labels_with_diff(current_ids, labels, prefix_ids, supervise_current_message)
         current_ids = prefix_ids
 

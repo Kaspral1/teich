@@ -71,6 +71,16 @@ class RequiresUserTokenizer(FakeTokenizer):
         return super().apply_chat_template(messages, **kwargs)
 
 
+class CountingTokenizer(FakeTokenizer):
+    def __init__(self):
+        super().__init__()
+        self.render_count = 0
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.render_count += 1
+        return super().apply_chat_template(messages, **kwargs)
+
+
 class FakeProcessor:
     def __init__(self):
         self.tokenizer = FakeTokenizer()
@@ -392,3 +402,27 @@ def test_format_and_mask_skips_unrenderable_prefixes_before_first_user_message()
     )
     assert "<system>system rules</system>" in masked_text
     assert "<user>hello</user>" in masked_text
+
+
+def test_format_and_mask_renders_only_supervision_checkpoints_in_fallback():
+    tokenizer = CountingTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "system", "content": "system rules"},
+                    {"role": "user", "content": "first request"},
+                    {"role": "assistant", "content": "draft answer", "reasoning_content": "think"},
+                    {"role": "tool", "content": "tool output"},
+                    {"role": "user", "content": "follow up"},
+                    {"role": "assistant", "content": "final answer"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    training_data = format_and_mask(dataset, tokenizer)
+
+    assert training_data.num_rows == 1
+    assert tokenizer.render_count == 4
