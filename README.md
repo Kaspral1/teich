@@ -79,18 +79,6 @@ Each generated JSONL line will look like:
 {"messages":[{"role":"system","content":"You are a helpful assistant","thinking":null},{"role":"user","content":"Hello","thinking":null},{"role":"assistant","content":"Hi!","thinking":"I should greet the user."}],"system":"You are a helpful assistant","prompt":"Hello","thinking":"I should greet the user.","response":"Hi!","model":"gpt-4.1-mini"}
 ```
 
-### Convert traces or structured JSONL to training data
-
-```python
-from teich import convert_traces_to_training_data
-from pathlib import Path
-
-examples = convert_traces_to_training_data(Path("./output"))
-print(examples[0]["messages"])
-```
-
-`convert_traces_to_training_data` accepts either raw trace directories/files or already-structured JSONL datasets and returns normalized `messages` / `tools` rows.
-
 ### Load and format for training
 
 ```python
