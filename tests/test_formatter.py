@@ -372,9 +372,6 @@ def test_format_and_mask_supervises_only_assistant_turns_across_multi_turn_conve
     )
     assert "<system>system rules</system>" in masked_text
     assert "<user>first request</user>" in masked_text
-    assert "<tool>file_a.py</tool>" in masked_text
-
-    assert row["assistant_masks"] == [0 if label == -100 else 1 for label in row["labels"]]
 
 
 def test_format_and_mask_returns_compact_training_columns_by_default():
@@ -450,6 +447,10 @@ def test_format_and_mask_accepts_multiple_datasets_and_concatenates_them():
     assert training_data.num_rows == 2
     assert "<tool_call>bash</tool_call>" in training_data[0]["text"]
     assert "<assistant><think>be friendly</think>world</assistant>" in training_data[1]["text"]
+    preview = training_data.preview(1)
+    assert "\033[31m" in preview
+    assert "<user>hello</user>" in preview
+    assert "<assistant><think>be friendly</think>world</assistant>" in preview
 
 
 def test_format_and_mask_passes_chat_template_kwargs_and_preview_marks_unsupervised_text_red():

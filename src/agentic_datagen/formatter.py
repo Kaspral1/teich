@@ -888,6 +888,19 @@ def _build_preview(text_tokenizer: Any, input_ids: list[int], labels: list[int])
     return "".join(parts)
 
 
+def _attach_preview(training_data: Dataset, text_tokenizer: Any) -> Dataset:
+    def preview(index: int = 0) -> str:
+        if training_data.num_rows == 0:
+            raise IndexError("Cannot preview an empty dataset")
+        if index < 0 or index >= training_data.num_rows:
+            raise IndexError(f"Preview index {index} is out of range for dataset of size {training_data.num_rows}")
+        row = training_data[index]
+        return _build_preview(text_tokenizer, row["input_ids"], row["labels"])
+
+    training_data.preview = preview
+    return training_data
+
+
 def format_and_mask(
     dataset: Dataset | Sequence[Dataset],
     tokenizer: Any,
@@ -904,6 +917,7 @@ def format_and_mask(
         if not datasets:
             raise ValueError("At least one dataset must be provided to format_and_mask.")
         if len(datasets) > 1:
+            text_tokenizer = _resolve_text_tokenizer(tokenizer)
             formatted_datasets: list[Dataset] = []
             for item in datasets:
                 if not isinstance(item, Dataset):
@@ -920,7 +934,8 @@ def format_and_mask(
                         drop_oversized_examples=drop_oversized_examples,
                     )
                 )
-            return concatenate_datasets(formatted_datasets)
+            training_data = concatenate_datasets(formatted_datasets)
+            return _attach_preview(training_data, text_tokenizer)
         else:
             dataset = datasets[0]
     if not isinstance(dataset, Dataset):
@@ -1018,13 +1033,4 @@ def format_and_mask(
         table.add_row("Oversized dropped", str(dropped_oversized_examples_count))
     console.print(table)
 
-    def preview(index: int = 0) -> str:
-        if training_data.num_rows == 0:
-            raise IndexError("Cannot preview an empty dataset")
-        if index < 0 or index >= training_data.num_rows:
-            raise IndexError(f"Preview index {index} is out of range for dataset of size {training_data.num_rows}")
-        row = training_data[index]
-        return _build_preview(text_tokenizer, row["input_ids"], row["labels"])
-
-    training_data.preview = preview
-    return training_data
+    return _attach_preview(training_data, text_tokenizer)
