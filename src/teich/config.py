@@ -140,7 +140,8 @@ class PromptInput(BaseModel):
     def normalize_prompt(cls, value: object) -> str:
         if value is None:
             return ""
-        return (value if isinstance(value, str) else str(value)).strip()
+        text = value if isinstance(value, str) else str(value)
+        return text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
     @field_validator("prompt")
     @classmethod

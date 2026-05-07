@@ -139,6 +139,9 @@ def generate(
             repo_url = _publish_dataset_to_hub(cfg)
             console.print(f"[green]Published dataset: {repo_url}[/green]")
 
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted. Completed outputs remain on disk.[/yellow]")
+        raise typer.Exit(130)
     except Exception as e:
         console.print(f"\n[red]Error: {e}[/red]")
         raise typer.Exit(1)

@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import io
 import json
 from pathlib import Path
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -230,6 +231,132 @@ def test_run_all_reports_progress_and_preserves_prompt_order(tmp_path: Path):
     assert all(update.metrics is not None for update in completed)
     assert completed[0].metrics.total_tokens == 17
     assert completed[0].metrics.total_cost == 0.25
+
+
+def test_run_all_queues_prompts_lazily_as_workers_free_up(tmp_path: Path):
+    config = Config(prompts=["Prompt 1", "Prompt 2", "Prompt 3"], max_concurrency=2)
+
+    with patch.object(CodexRunner, '_ensure_image'):
+        runner = CodexRunner(config)
+
+    updates = []
+    started = []
+    started_lock = threading.Lock()
+    first_batch_started = threading.Event()
+    release_first_batch = threading.Event()
+
+    def fake_task(prompt_id, prompt_index, total_prompts, prompt_input, progress_callback):
+        with started_lock:
+            started.append(prompt_id)
+            if len(started) == 2:
+                first_batch_started.set()
+        if prompt_id in {"prompt-1", "prompt-2"}:
+            assert release_first_batch.wait(timeout=2)
+        return tmp_path / f"{prompt_id}.jsonl"
+
+    with patch.object(runner, '_run_prompt_task', side_effect=fake_task):
+        result_holder = {}
+
+        def run():
+            result_holder["results"] = runner.run_all(max_concurrency=2, progress_callback=updates.append)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        assert first_batch_started.wait(timeout=2)
+        time.sleep(0.05)
+        assert [update.prompt_id for update in updates if update.status == "queued"] == ["prompt-1", "prompt-2"]
+        release_first_batch.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert [path.name for path in result_holder["results"]] == ["prompt-1.jsonl", "prompt-2.jsonl", "prompt-3.jsonl"]
+    assert [update.prompt_id for update in updates if update.status == "queued"] == ["prompt-1", "prompt-2", "prompt-3"]
+
+
+def test_run_all_preserves_completed_agent_trace_files_when_later_prompt_fails(tmp_path: Path):
+    config = Config(prompts=["Prompt 1", "Prompt 2"], max_concurrency=1)
+
+    with patch.object(CodexRunner, '_ensure_image'):
+        runner = CodexRunner(config)
+
+    first_trace = tmp_path / "first.jsonl"
+
+    def fake_run_session(
+        prompt: str,
+        session_id: str | None = None,
+        progress_callback=None,
+        progress_base=None,
+        prompt_input=None,
+    ) -> Path:
+        if prompt == "Prompt 2":
+            raise RuntimeError("boom")
+        first_trace.write_text(json.dumps({"prompt": prompt}) + "\n", encoding="utf-8")
+        return first_trace
+
+    with patch.object(runner, 'run_session', side_effect=fake_run_session):
+        with pytest.raises(RuntimeError, match="boom"):
+            runner.run_all(max_concurrency=1)
+
+    assert first_trace.exists()
+    assert json.loads(first_trace.read_text(encoding="utf-8")) == {"prompt": "Prompt 1"}
+
+
+def test_prompt_thread_pool_shutdown_does_not_wait_for_blocked_daemon_workers():
+    started = threading.Event()
+    release = threading.Event()
+    pool = runner_module._PromptThreadPool(max_workers=1)
+
+    def blocked_task():
+        started.set()
+        release.wait(timeout=2)
+
+    pool.submit(blocked_task)
+    assert started.wait(timeout=1)
+    start = time.monotonic()
+    pool.shutdown(wait=False, cancel_futures=True)
+    elapsed = time.monotonic() - start
+    release.set()
+    pool.shutdown(wait=True)
+
+    assert elapsed < 0.5
+    assert all(thread.daemon for thread in pool._threads)
+
+
+def test_run_all_propagates_keyboard_interrupt_without_waiting_for_agent_workers(tmp_path: Path):
+    config = Config(prompts=["Prompt 1", "Prompt 2"], max_concurrency=2)
+
+    with patch.object(CodexRunner, '_ensure_image'):
+        runner = CodexRunner(config)
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_run_session(
+        prompt: str,
+        session_id: str | None = None,
+        progress_callback=None,
+        progress_base=None,
+        prompt_input=None,
+    ) -> Path:
+        started.set()
+        release.wait(timeout=2)
+        return tmp_path / f"{prompt}.jsonl"
+
+    def interrupt_after_worker_starts(*args, **kwargs):
+        assert started.wait(timeout=1)
+        raise KeyboardInterrupt
+
+    try:
+        with patch.object(runner, 'run_session', side_effect=blocked_run_session):
+            with patch("teich.runner.wait", side_effect=interrupt_after_worker_starts):
+                start = time.monotonic()
+                with pytest.raises(KeyboardInterrupt):
+                    runner.run_all(max_concurrency=2)
+                elapsed = time.monotonic() - start
+    finally:
+        release.set()
+
+    assert elapsed < 0.5
 
 
 def test_summarize_trace_file_uses_pi_usage_payload(tmp_path: Path):
@@ -845,6 +972,101 @@ def test_chat_runner_writes_structured_dataset_row_from_responses_api(tmp_path: 
     assert request.full_url == "https://api.openai.com/v1/responses"
 
 
+@pytest.mark.parametrize(
+    ("payload", "match"),
+    [
+        ({"error": {"message": "Rate limit exceeded", "code": 429}}, "Rate limit exceeded"),
+        ({"error": "temporarily unavailable"}, "temporarily unavailable"),
+        ({"status": "failed", "error": {"message": "provider failed"}}, "provider failed"),
+        ({"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}, "max_output_tokens"),
+        ({"output": [{"type": "error", "message": "upstream timeout"}]}, "upstream timeout"),
+        ({"choices": [{"error": {"message": "model overloaded"}}]}, "model overloaded"),
+        ({"choices": [{"finish_reason": "content_filter", "message": {"role": "assistant", "content": "blocked"}}]}, "content_filter"),
+    ],
+)
+def test_chat_runner_rejects_openai_compatible_error_payloads(tmp_path: Path, payload: dict[str, object], match: str):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini"),
+        api=APIConfig(provider="openrouter", api_key="sk-test", wire_api="responses"),
+        output={"traces_dir": tmp_path / "output"},
+    )
+    runner = ChatRunner(config)
+    response = MagicMock()
+    response.read.return_value = json.dumps(payload).encode("utf-8")
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+
+    with patch("teich.runner.urlopen", return_value=response):
+        with pytest.raises(RuntimeError, match=match):
+            runner.run_session("Hello", "chat-session")
+
+    assert not (tmp_path / "output" / "chat-session.jsonl").exists()
+
+
+def test_chat_runner_run_all_marks_api_error_as_failed_and_does_not_append_row(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini"),
+        api=APIConfig(provider="openrouter", api_key="sk-test", wire_api="responses"),
+        prompts=["Hello"],
+        output={"traces_dir": tmp_path / "output"},
+    )
+    runner = ChatRunner(config)
+    updates = []
+    payload = {"error": {"message": "Rate limit exceeded", "code": 429}}
+    response = MagicMock()
+    response.read.return_value = json.dumps(payload).encode("utf-8")
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+
+    with patch("teich.runner.urlopen", return_value=response):
+        with pytest.raises(RuntimeError, match="Rate limit exceeded"):
+            runner.run_all(max_concurrency=1, progress_callback=updates.append)
+
+    assert [update.status for update in updates] == ["queued", "running", "failed"]
+    assert updates[-1].error and "Rate limit exceeded" in updates[-1].error
+    destination = tmp_path / "output" / "chat.jsonl"
+    assert destination.exists()
+    assert destination.read_text(encoding="utf-8") == ""
+
+
+def test_chat_runner_run_all_preserves_completed_rows_when_later_response_is_invalid_json(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini"),
+        api=APIConfig(provider="openrouter", api_key="sk-test", wire_api="responses"),
+        prompts=["Hello", "Bad JSON"],
+        output={"traces_dir": tmp_path / "output"},
+    )
+    runner = ChatRunner(config)
+    updates = []
+    good_payload = {
+        "model": "gpt-4.1-mini",
+        "output": [
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Hi!"}]},
+        ],
+    }
+    good_response = MagicMock()
+    good_response.read.return_value = json.dumps(good_payload).encode("utf-8")
+    good_response.__enter__.return_value = good_response
+    good_response.__exit__.return_value = False
+    bad_response = MagicMock()
+    bad_response.read.return_value = b"<html>rate limited</html>"
+    bad_response.__enter__.return_value = bad_response
+    bad_response.__exit__.return_value = False
+
+    with patch("teich.runner.urlopen", side_effect=[good_response, bad_response]):
+        with pytest.raises(RuntimeError, match="invalid JSON"):
+            runner.run_all(max_concurrency=1, progress_callback=updates.append)
+
+    destination = tmp_path / "output" / "chat.jsonl"
+    assert destination.exists()
+    rows = [json.loads(line) for line in destination.read_text(encoding="utf-8").splitlines()]
+    assert [row["prompt"] for row in rows] == ["Hello"]
+    assert [update.status for update in updates] == ["queued", "running", "completed", "queued", "running", "failed"]
+
+
 def test_chat_runner_run_all_writes_one_dataset_file_with_all_rows(tmp_path: Path):
     config = Config(
         agent={"provider": "chat"},
@@ -879,10 +1101,183 @@ def test_chat_runner_run_all_writes_one_dataset_file_with_all_rows(tmp_path: Pat
     assert results == [tmp_path / "output" / "chat.jsonl"]
     assert sorted(path.name for path in (tmp_path / "output").glob("*.jsonl")) == ["chat.jsonl"]
     rows = [json.loads(line) for line in results[0].read_text(encoding="utf-8").splitlines()]
-    assert [row["prompt"] for row in rows] == ["Hello", "Who are you?"]
+    assert sorted(row["prompt"] for row in rows) == ["Hello", "Who are you?"]
     assert [update.status for update in updates].count("queued") == 2
     assert [update.status for update in updates].count("completed") == 2
     assert all(update.trace_path == results[0] for update in updates if update.status == "completed")
+
+
+def test_chat_runner_run_all_creates_and_appends_dataset_while_batch_is_running(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini"),
+        api=APIConfig(provider="openai", api_key="sk-test", wire_api="responses"),
+        prompts=["fast", "blocked"],
+        output={"traces_dir": tmp_path / "output"},
+    )
+    runner = ChatRunner(config)
+    release_blocked = threading.Event()
+
+    def fake_completion(prompt: str) -> dict[str, object]:
+        if prompt == "blocked":
+            assert release_blocked.wait(timeout=2)
+        return {
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant", "thinking": None},
+                {"role": "user", "content": prompt, "thinking": None},
+                {"role": "assistant", "content": f"Response to {prompt}", "thinking": None},
+            ],
+            "prompt": prompt,
+            "response": f"Response to {prompt}",
+        }
+
+    result_holder = {}
+    with patch.object(runner, "_request_chat_completion", side_effect=fake_completion):
+        thread = threading.Thread(
+            target=lambda: result_holder.update(results=runner.run_all(max_concurrency=2))
+        )
+        thread.start()
+        destination = tmp_path / "output" / "chat.jsonl"
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if destination.exists() and destination.read_text(encoding="utf-8").count("\n") == 1:
+                break
+            time.sleep(0.01)
+        else:
+            release_blocked.set()
+            thread.join(timeout=2)
+            pytest.fail("chat.jsonl did not receive the completed row while another prompt was still running")
+
+        rows = [json.loads(line) for line in destination.read_text(encoding="utf-8").splitlines()]
+        assert [row["prompt"] for row in rows] == ["fast"]
+        release_blocked.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert result_holder["results"] == [destination]
+    rows = [json.loads(line) for line in destination.read_text(encoding="utf-8").splitlines()]
+    assert sorted(row["prompt"] for row in rows) == ["blocked", "fast"]
+
+
+def test_chat_runner_run_all_queues_prompts_lazily(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini"),
+        api=APIConfig(provider="openai", api_key="sk-test", wire_api="responses"),
+        prompts=["Hello", "Who are you?", "What now?"],
+        output={"traces_dir": tmp_path / "output"},
+    )
+    runner = ChatRunner(config)
+    updates = []
+    started = []
+    started_lock = threading.Lock()
+    first_batch_started = threading.Event()
+    release_first_batch = threading.Event()
+
+    def fake_task(prompt_id, prompt_index, total_prompts, prompt_input, destination, progress_callback, append_lock=None):
+        with started_lock:
+            started.append(prompt_id)
+            if len(started) == 2:
+                first_batch_started.set()
+        if prompt_id in {"prompt-1", "prompt-2"}:
+            assert release_first_batch.wait(timeout=2)
+        return prompt_index, {
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant", "thinking": None},
+                {"role": "user", "content": prompt_input.prompt, "thinking": None},
+                {"role": "assistant", "content": f"Response to {prompt_input.prompt}", "thinking": None},
+            ],
+            "prompt": prompt_input.prompt,
+            "response": f"Response to {prompt_input.prompt}",
+        }
+
+    with patch.object(runner, '_run_chat_prompt_task', side_effect=fake_task):
+        result_holder = {}
+
+        def run():
+            result_holder["results"] = runner.run_all(max_concurrency=2, progress_callback=updates.append)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        assert first_batch_started.wait(timeout=2)
+        time.sleep(0.05)
+        assert [update.prompt_id for update in updates if update.status == "queued"] == ["prompt-1", "prompt-2"]
+        release_first_batch.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert result_holder["results"] == [tmp_path / "output" / "chat.jsonl"]
+    assert [update.prompt_id for update in updates if update.status == "queued"] == ["prompt-1", "prompt-2", "prompt-3"]
+
+
+def test_chat_runner_run_all_preserves_completed_rows_when_later_prompt_fails(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini"),
+        api=APIConfig(provider="openai", api_key="sk-test", wire_api="responses"),
+        prompts=["Hello", "Who are you?"],
+        output={"traces_dir": tmp_path / "output"},
+    )
+    runner = ChatRunner(config)
+
+    def fake_task(prompt_id, prompt_index, total_prompts, prompt_input, destination, progress_callback, append_lock=None):
+        if prompt_id == "prompt-2":
+            raise RuntimeError("boom")
+        training_row = {
+            "messages": [
+                {"role": "user", "content": prompt_input.prompt, "thinking": None},
+                {"role": "assistant", "content": "Hi", "thinking": None},
+            ],
+            "prompt": prompt_input.prompt,
+            "response": "Hi",
+        }
+        if append_lock is not None:
+            with append_lock:
+                runner._append_chat_training_row(destination, training_row)
+        return prompt_index, training_row
+
+    with patch.object(runner, '_run_chat_prompt_task', side_effect=fake_task):
+        with pytest.raises(RuntimeError, match="boom"):
+            runner.run_all(max_concurrency=1)
+
+    destination = tmp_path / "output" / "chat.jsonl"
+    assert destination.exists()
+    rows = [json.loads(line) for line in destination.read_text(encoding="utf-8").splitlines()]
+    assert [row["prompt"] for row in rows] == ["Hello"]
+
+
+def test_chat_run_all_propagates_keyboard_interrupt_without_waiting_for_workers(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini"),
+        api=APIConfig(provider="openai", api_key="sk-test", wire_api="responses"),
+        prompts=["Hello", "Who are you?"],
+        output={"traces_dir": tmp_path / "output"},
+    )
+    runner = ChatRunner(config)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_task(prompt_id, prompt_index, total_prompts, prompt_input, destination, progress_callback, append_lock=None):
+        started.set()
+        release.wait(timeout=2)
+        return prompt_index, {"prompt": prompt_input.prompt, "messages": []}
+
+    def interrupt_after_worker_starts(*args, **kwargs):
+        assert started.wait(timeout=1)
+        raise KeyboardInterrupt
+
+    try:
+        with patch.object(runner, '_run_chat_prompt_task', side_effect=blocked_task):
+            with patch("teich.runner.wait", side_effect=interrupt_after_worker_starts):
+                start = time.monotonic()
+                with pytest.raises(KeyboardInterrupt):
+                    runner.run_all(max_concurrency=2)
+                elapsed = time.monotonic() - start
+    finally:
+        release.set()
+
+    assert elapsed < 0.5
 
 
 def test_pi_runner_init_uses_shared_runtime_image():

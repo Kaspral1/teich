@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, wait
 from dataclasses import dataclass
 import json
 import os
+import queue
 import re
 import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -33,6 +35,60 @@ WORKSPACE_IN_CONTAINER = "/workspace"
 LOCAL_PROVIDER_PROXY_SCRIPT_NAME = "local_provider_proxy.js"
 PI_SYSTEM_PROMPT_CUSTOM_TYPE = "teich-system-prompt"
 PI_EMPTY_TOOL_NOT_FOUND_TEXT = "Tool  not found"
+
+
+class _PromptThreadPool:
+    def __init__(self, max_workers: int):
+        self._queue: queue.Queue[tuple[Future[Any], Callable[..., Any], tuple[Any, ...], dict[str, Any]] | None] = queue.Queue()
+        self._shutdown = False
+        self._lock = threading.Lock()
+        self._threads = [
+            threading.Thread(target=self._worker, name=f"teich-prompt-worker-{index}", daemon=True)
+            for index in range(max_workers)
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future[Any]:
+        future: Future[Any] = Future()
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("Cannot schedule new prompts after shutdown.")
+            self._queue.put((future, fn, args, kwargs))
+        return future
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        with self._lock:
+            self._shutdown = True
+            if cancel_futures:
+                while True:
+                    try:
+                        item = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item is not None:
+                        future, _, _, _ = item
+                        future.cancel()
+            for _ in self._threads:
+                self._queue.put(None)
+        if wait:
+            for thread in self._threads:
+                thread.join()
+
+    def _worker(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            future, fn, args, kwargs = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
 
 LOCAL_PROVIDER_PROXY_SCRIPT = """
 const http = require('node:http');
@@ -668,7 +724,8 @@ class DockerRuntimeRunner:
 
         total_prompts = len(prompt_inputs)
         worker_count = max(1, min(max_concurrency, total_prompts))
-        for prompt_index, prompt_input in enumerate(prompt_inputs, start=1):
+
+        def emit_queued(prompt_index: int, prompt_input: PromptInput) -> None:
             if progress_callback:
                 progress_callback(
                     SessionProgressUpdate(
@@ -681,11 +738,23 @@ class DockerRuntimeRunner:
                     )
                 )
 
+        def submit_prompt(executor: _PromptThreadPool, prompt_index: int, prompt_input: PromptInput):
+            emit_queued(prompt_index, prompt_input)
+            return executor.submit(
+                self._run_prompt_task,
+                f"prompt-{prompt_index}",
+                prompt_index,
+                total_prompts,
+                prompt_input,
+                progress_callback,
+            )
+
         results_by_index: dict[int, Path] = {}
         errors: list[Exception] = []
         if worker_count == 1:
             for prompt_index, prompt_input in enumerate(prompt_inputs, start=1):
                 try:
+                    emit_queued(prompt_index, prompt_input)
                     results_by_index[prompt_index] = self._run_prompt_task(
                         f"prompt-{prompt_index}",
                         prompt_index,
@@ -699,24 +768,35 @@ class DockerRuntimeRunner:
                 raise errors[0]
             return [results_by_index[index] for index in range(1, total_prompts + 1)]
 
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = {
-                executor.submit(
-                    self._run_prompt_task,
-                    f"prompt-{prompt_index}",
-                    prompt_index,
-                    total_prompts,
-                    prompt_input,
-                    progress_callback,
-                ): prompt_index
-                for prompt_index, prompt_input in enumerate(prompt_inputs, start=1)
-            }
-            for future in as_completed(futures):
-                prompt_index = futures[future]
+        executor = _PromptThreadPool(max_workers=worker_count)
+        try:
+            prompt_iterator = iter(enumerate(prompt_inputs, start=1))
+            futures = {}
+            for _ in range(worker_count):
                 try:
-                    results_by_index[prompt_index] = future.result()
-                except Exception as exc:
-                    errors.append(exc)
+                    prompt_index, prompt_input = next(prompt_iterator)
+                except StopIteration:
+                    break
+                futures[submit_prompt(executor, prompt_index, prompt_input)] = prompt_index
+
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    prompt_index = futures.pop(future)
+                    try:
+                        results_by_index[prompt_index] = future.result()
+                    except Exception as exc:
+                        errors.append(exc)
+                    try:
+                        next_prompt_index, next_prompt_input = next(prompt_iterator)
+                    except StopIteration:
+                        continue
+                    futures[submit_prompt(executor, next_prompt_index, next_prompt_input)] = next_prompt_index
+        except KeyboardInterrupt:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
 
         if errors:
             raise errors[0]
@@ -1323,6 +1403,50 @@ class ChatRunner(DockerRuntimeRunner):
         }
         return normalized
 
+    @staticmethod
+    def _chat_api_error_message(error: Any) -> str:
+        if isinstance(error, dict):
+            message = error.get("message") or error.get("detail") or error.get("code")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+            return json.dumps(error, ensure_ascii=False)
+        if isinstance(error, str) and error.strip():
+            return error.strip()
+        if error is not None:
+            return json.dumps(error, ensure_ascii=False)
+        return "unknown API error"
+
+    def _raise_for_chat_api_error(self, payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Chat request returned unexpected payload type: {type(payload).__name__}.")
+
+        if "error" in payload and payload.get("error") is not None:
+            raise RuntimeError(f"Chat request failed: {self._chat_api_error_message(payload.get('error'))}")
+
+        status = payload.get("status")
+        if isinstance(status, str) and status.strip().lower() in {"failed", "cancelled", "canceled", "incomplete"}:
+            details = payload.get("error") or payload.get("incomplete_details") or payload.get("status_details")
+            raise RuntimeError(f"Chat request failed with status {status}: {self._chat_api_error_message(details)}")
+
+        output_items = payload.get("output")
+        if isinstance(output_items, list):
+            for item in output_items:
+                if isinstance(item, dict) and item.get("type") == "error":
+                    raise RuntimeError(f"Chat request failed: {self._chat_api_error_message(item)}")
+
+        choices = payload.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                if "error" in choice and choice.get("error") is not None:
+                    raise RuntimeError(f"Chat request failed: {self._chat_api_error_message(choice.get('error'))}")
+                finish_reason = choice.get("finish_reason")
+                if isinstance(finish_reason, str) and finish_reason.strip().lower() in {"error", "content_filter"}:
+                    raise RuntimeError(f"Chat request failed with finish_reason {finish_reason}.")
+
+        return payload
+
     def _request_chat_completion(self, prompt: str) -> dict[str, Any]:
         body = self._chat_request_body(prompt)
         request = Request(
@@ -1341,10 +1465,7 @@ class ChatRunner(DockerRuntimeRunner):
             raise RuntimeError(f"Chat request failed: {exc.reason}") from exc
         except json.JSONDecodeError as exc:
             raise RuntimeError("Chat request returned invalid JSON.") from exc
-        error = payload.get("error")
-        if isinstance(error, dict):
-            message = error.get("message") if isinstance(error.get("message"), str) else json.dumps(error, ensure_ascii=False)
-            raise RuntimeError(f"Chat request failed: {message}")
+        payload = self._raise_for_chat_api_error(payload)
         content, thinking, usage, model = self._parse_chat_response(payload)
         if not content and not thinking:
             raise RuntimeError("Chat request returned neither assistant content nor thinking.")
@@ -1424,6 +1545,7 @@ class ChatRunner(DockerRuntimeRunner):
         prompt_input: PromptInput,
         destination: Path,
         progress_callback: SessionProgressCallback | None,
+        append_lock: threading.Lock | None = None,
     ) -> tuple[int, dict[str, Any]]:
         session_id = str(uuid.uuid4())
         started_at = datetime.now(timezone.utc)
@@ -1447,6 +1569,9 @@ class ChatRunner(DockerRuntimeRunner):
             if prompt_input.github_repo:
                 raise RuntimeError("Chat runner does not support github_repo prompt inputs.")
             training_row = self._request_chat_completion(prompt_input.prompt)
+            if append_lock is not None:
+                with append_lock:
+                    self._append_chat_training_row(destination, training_row)
             if progress_callback:
                 progress_callback(
                     SessionProgressUpdate(
@@ -1482,6 +1607,19 @@ class ChatRunner(DockerRuntimeRunner):
                 )
             raise
 
+    @staticmethod
+    def _append_chat_training_row(destination: Path, training_row: dict[str, Any]) -> None:
+        with destination.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(training_row, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    @staticmethod
+    def _initialize_chat_output_file(destination: Path) -> None:
+        with destination.open("w", encoding="utf-8") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+
     def run_all(
         self,
         max_concurrency: int = 1,
@@ -1492,9 +1630,13 @@ class ChatRunner(DockerRuntimeRunner):
             raise ValueError("No prompts configured")
 
         destination = self._resolve_output_path("chat.jsonl")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize_chat_output_file(destination)
         total_prompts = len(prompt_inputs)
         worker_count = max(1, min(max_concurrency, total_prompts))
-        for prompt_index, prompt_input in enumerate(prompt_inputs, start=1):
+        append_lock = threading.Lock()
+
+        def emit_queued(prompt_index: int, prompt_input: PromptInput) -> None:
             if progress_callback:
                 progress_callback(
                     SessionProgressUpdate(
@@ -1507,56 +1649,71 @@ class ChatRunner(DockerRuntimeRunner):
                     )
                 )
 
-        rows_by_index: dict[int, dict[str, Any]] = {}
+        def submit_prompt(executor: _PromptThreadPool, prompt_index: int, prompt_input: PromptInput):
+            emit_queued(prompt_index, prompt_input)
+            return executor.submit(
+                self._run_chat_prompt_task,
+                f"prompt-{prompt_index}",
+                prompt_index,
+                total_prompts,
+                prompt_input,
+                destination,
+                progress_callback,
+                append_lock,
+            )
+
         errors: list[Exception] = []
         if worker_count == 1:
             for prompt_index, prompt_input in enumerate(prompt_inputs, start=1):
                 try:
-                    row_index, training_row = self._run_chat_prompt_task(
+                    emit_queued(prompt_index, prompt_input)
+                    _, training_row = self._run_chat_prompt_task(
                         f"prompt-{prompt_index}",
                         prompt_index,
                         total_prompts,
                         prompt_input,
                         destination,
                         progress_callback,
+                        append_lock,
                     )
-                    rows_by_index[row_index] = training_row
                 except Exception as exc:
                     errors.append(exc)
             if errors:
                 raise errors[0]
         else:
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                futures = {
-                    executor.submit(
-                        self._run_chat_prompt_task,
-                        f"prompt-{prompt_index}",
-                        prompt_index,
-                        total_prompts,
-                        prompt_input,
-                        destination,
-                        progress_callback,
-                    ): prompt_index
-                    for prompt_index, prompt_input in enumerate(prompt_inputs, start=1)
-                }
-                for future in as_completed(futures):
+            executor = _PromptThreadPool(max_workers=worker_count)
+            try:
+                prompt_iterator = iter(enumerate(prompt_inputs, start=1))
+                futures = {}
+                for _ in range(worker_count):
                     try:
-                        row_index, training_row = future.result()
-                        rows_by_index[row_index] = training_row
-                    except Exception as exc:
-                        errors.append(exc)
+                        prompt_index, prompt_input = next(prompt_iterator)
+                    except StopIteration:
+                        break
+                    futures[submit_prompt(executor, prompt_index, prompt_input)] = prompt_index
+
+                while futures:
+                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        prompt_index = futures.pop(future)
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            errors.append(exc)
+                        try:
+                            next_prompt_index, next_prompt_input = next(prompt_iterator)
+                        except StopIteration:
+                            continue
+                        futures[submit_prompt(executor, next_prompt_index, next_prompt_input)] = next_prompt_index
+            except KeyboardInterrupt:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                executor.shutdown(wait=True)
 
             if errors:
                 raise errors[0]
 
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(
-            "".join(
-                json.dumps(rows_by_index[index], ensure_ascii=False) + "\n"
-                for index in range(1, total_prompts + 1)
-            ),
-            encoding="utf-8",
-        )
         return [destination]
 
 

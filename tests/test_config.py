@@ -116,6 +116,34 @@ prompts:
     assert prompt_inputs[2].image is None
 
 
+def test_config_prompts_file_supports_multiline_csv_prompts(tmp_path: Path):
+    prompts_file = tmp_path / "prompts.csv"
+    prompts_file.write_text(
+        '"image","github_repo","prompt"\n'
+        '"None","None","Premise:\n'
+        '""Apparently Thorn thought the same thing.""\n'
+        'Available choices:\n'
+        ' - yes\n'
+        ' - no"\n'
+        '"None","None","Solve 1148583*a = 1148360*a - 5352 for a.\n'
+        'Solve this problem."\n',
+        encoding="utf-8",
+    )
+
+    config = Config(prompts_file=prompts_file)
+    prompts = config.get_prompts()
+
+    assert len(prompts) == 2
+    assert prompts[0] == (
+        'Premise:\n'
+        '"Apparently Thorn thought the same thing."\n'
+        'Available choices:\n'
+        ' - yes\n'
+        ' - no'
+    )
+    assert prompts[1] == "Solve 1148583*a = 1148360*a - 5352 for a.\nSolve this problem."
+
+
 def test_config_prompts_file_resolves_relative_to_yaml(tmp_path: Path):
     """Test loading prompts_file relative to the config file location."""
     prompts_file = tmp_path / "prompts.csv"
