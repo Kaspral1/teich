@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 from pathlib import Path
 import re
+import sys
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -20,6 +22,16 @@ def _get_env_alias(*names: str) -> str | None:
         if value:
             return value
     return None
+
+
+def _raise_csv_field_limit() -> None:
+    limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(limit)
+            return
+        except OverflowError:
+            limit //= 10
 
 
 class MCPConfig(BaseModel):
@@ -280,8 +292,13 @@ class Config(BaseModel):
 
     @staticmethod
     def _load_prompt_inputs_from_file(path: Path) -> list[PromptInput]:
-        if path.suffix.lower() == ".csv":
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
             return Config._load_prompt_inputs_from_csv(path)
+        if suffix in {".jsonl", ".ndjson"}:
+            return Config._load_prompt_inputs_from_jsonl(path)
+        if suffix == ".json":
+            return Config._load_prompt_inputs_from_json(path)
         return Config._load_prompt_inputs_from_text(path)
 
     @staticmethod
@@ -295,30 +312,119 @@ class Config(BaseModel):
 
     @staticmethod
     def _load_prompt_inputs_from_csv(path: Path) -> list[PromptInput]:
-        with path.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle)
-            fieldnames = [name.strip().lower() for name in reader.fieldnames or [] if isinstance(name, str)]
-            if "prompt" not in fieldnames:
-                raise ValueError("Prompt CSV must include a 'prompt' column")
-            prompt_inputs: list[PromptInput] = []
-            for row in reader:
-                normalized_row = {
-                    key.strip().lower(): value
-                    for key, value in row.items()
-                    if isinstance(key, str)
-                }
-                if not any(
-                    isinstance(value, str) and value.strip()
-                    for value in normalized_row.values()
-                ):
+        _raise_csv_field_limit()
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle, restkey="__extra_columns__", strict=True)
+                raw_fieldnames = reader.fieldnames or []
+                fieldnames = [
+                    name.strip().lower()
+                    for name in raw_fieldnames
+                    if isinstance(name, str) and name.strip()
+                ]
+                if "prompt" not in fieldnames:
+                    raise ValueError("Prompt CSV must include a 'prompt' column")
+                if len(fieldnames) != len(set(fieldnames)):
+                    raise ValueError("Prompt CSV contains duplicate column names after normalization")
+                prompt_inputs: list[PromptInput] = []
+                for row_number, row in enumerate(reader, start=2):
+                    normalized_row = {
+                        key.strip().lower(): value
+                        for key, value in row.items()
+                        if isinstance(key, str)
+                    }
+                    if normalized_row.get("__extra_columns__"):
+                        raise ValueError(
+                            f"Prompt CSV row {row_number} has more columns than the header. "
+                            "If a prompt contains commas or newlines, quote the entire prompt field."
+                        )
+                    if not any(
+                        isinstance(value, str) and value.strip()
+                        for value in normalized_row.values()
+                    ):
+                        continue
+                    prompt = normalized_row.get("prompt")
+                    if not isinstance(prompt, str) or not prompt.strip():
+                        raise ValueError(f"Prompt CSV row {row_number} has an empty 'prompt' value")
+                    try:
+                        prompt_inputs.append(
+                            PromptInput(
+                                image=normalized_row.get("image"),
+                                github_repo=normalized_row.get("github_repo"),
+                                prompt=prompt,
+                            )
+                        )
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid prompt CSV row {row_number}: {exc}") from exc
+        except csv.Error as exc:
+            raise ValueError(
+                f"Failed to parse prompt CSV {path}: {exc}. "
+                "Multiline prompts must be inside a quoted prompt field; for very long prompts, prefer JSONL."
+            ) from exc
+        return prompt_inputs
+
+    @staticmethod
+    def _prompt_input_from_mapping(row: dict[str, object], *, source: str) -> PromptInput | None:
+        normalized_row = {
+            key.strip().lower(): value
+            for key, value in row.items()
+            if isinstance(key, str)
+        }
+        if not any(
+            isinstance(value, str) and value.strip()
+            for value in normalized_row.values()
+        ):
+            return None
+        prompt = normalized_row.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError(f"{source} has an empty or missing 'prompt' value")
+        try:
+            return PromptInput(
+                image=normalized_row.get("image"),
+                github_repo=normalized_row.get("github_repo"),
+                prompt=prompt,
+            )
+        except ValueError as exc:
+            raise ValueError(f"Invalid {source}: {exc}") from exc
+
+    @staticmethod
+    def _load_prompt_inputs_from_jsonl(path: Path) -> list[PromptInput]:
+        prompt_inputs: list[PromptInput] = []
+        with path.open("r", encoding="utf-8-sig") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
+                if not line:
                     continue
-                prompt_inputs.append(
-                    PromptInput(
-                        image=normalized_row.get("image"),
-                        github_repo=normalized_row.get("github_repo"),
-                        prompt=normalized_row.get("prompt") or "",
-                    )
-                )
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid prompt JSONL line {line_number}: {exc.msg}") from exc
+                if not isinstance(row, dict):
+                    raise ValueError(f"Prompt JSONL line {line_number} must be a JSON object")
+                prompt_input = Config._prompt_input_from_mapping(row, source=f"prompt JSONL line {line_number}")
+                if prompt_input is not None:
+                    prompt_inputs.append(prompt_input)
+        return prompt_inputs
+
+    @staticmethod
+    def _load_prompt_inputs_from_json(path: Path) -> list[PromptInput]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid prompt JSON file {path}: {exc.msg}") from exc
+        rows = payload.get("prompts") if isinstance(payload, dict) else payload
+        if not isinstance(rows, list):
+            raise ValueError("Prompt JSON must be a list of objects or an object with a 'prompts' list")
+        prompt_inputs: list[PromptInput] = []
+        for index, row in enumerate(rows, start=1):
+            if isinstance(row, str):
+                prompt_inputs.append(PromptInput(prompt=row))
+                continue
+            if not isinstance(row, dict):
+                raise ValueError(f"Prompt JSON entry {index} must be an object or string")
+            prompt_input = Config._prompt_input_from_mapping(row, source=f"prompt JSON entry {index}")
+            if prompt_input is not None:
+                prompt_inputs.append(prompt_input)
         return prompt_inputs
 
 

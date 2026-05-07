@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from concurrent.futures import FIRST_COMPLETED, Future, wait
 from dataclasses import dataclass
 import json
 import os
@@ -26,6 +25,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .config import Config, PromptInput
 
+from .converter import convert_trace_to_training_example
+
 RUNTIME_IMAGE_NAME = "teich-runtime:v3"
 RUNTIME_DOCKERFILE_NAME = "codex-runtime.Dockerfile"
 CODEX_HOME_IN_CONTAINER = "/home/codex/.codex"
@@ -33,62 +34,10 @@ PI_AGENT_DIR_IN_CONTAINER = "/home/codex/.pi/agent"
 PI_SESSIONS_DIR_IN_CONTAINER = "/home/codex/pi-sessions"
 WORKSPACE_IN_CONTAINER = "/workspace"
 LOCAL_PROVIDER_PROXY_SCRIPT_NAME = "local_provider_proxy.js"
+TEICH_PROMPT_FILE_NAME = ".teich-prompt.txt"
 PI_SYSTEM_PROMPT_CUSTOM_TYPE = "teich-system-prompt"
 PI_EMPTY_TOOL_NOT_FOUND_TEXT = "Tool  not found"
 
-
-class _PromptThreadPool:
-    def __init__(self, max_workers: int):
-        self._queue: queue.Queue[tuple[Future[Any], Callable[..., Any], tuple[Any, ...], dict[str, Any]] | None] = queue.Queue()
-        self._shutdown = False
-        self._lock = threading.Lock()
-        self._threads = [
-            threading.Thread(target=self._worker, name=f"teich-prompt-worker-{index}", daemon=True)
-            for index in range(max_workers)
-        ]
-        for thread in self._threads:
-            thread.start()
-
-    def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future[Any]:
-        future: Future[Any] = Future()
-        with self._lock:
-            if self._shutdown:
-                raise RuntimeError("Cannot schedule new prompts after shutdown.")
-            self._queue.put((future, fn, args, kwargs))
-        return future
-
-    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
-        with self._lock:
-            self._shutdown = True
-            if cancel_futures:
-                while True:
-                    try:
-                        item = self._queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    if item is not None:
-                        future, _, _, _ = item
-                        future.cancel()
-            for _ in self._threads:
-                self._queue.put(None)
-        if wait:
-            for thread in self._threads:
-                thread.join()
-
-    def _worker(self) -> None:
-        while True:
-            item = self._queue.get()
-            if item is None:
-                return
-            future, fn, args, kwargs = item
-            if not future.set_running_or_notify_cancel():
-                continue
-            try:
-                result = fn(*args, **kwargs)
-            except BaseException as exc:
-                future.set_exception(exc)
-            else:
-                future.set_result(result)
 
 LOCAL_PROVIDER_PROXY_SCRIPT = """
 const http = require('node:http');
@@ -287,12 +236,103 @@ class SessionProgressUpdate:
 SessionProgressCallback = Callable[[SessionProgressUpdate], None]
 
 
+def _prompt_completion_key(prompt: str) -> str:
+    return "\n".join(prompt.replace("\r\n", "\n").replace("\r", "\n").strip().splitlines())
+
+
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, str) and item.strip():
+            parts.append(item.strip())
+            continue
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts).strip()
+
+
+def _training_example_has_answer(example: dict[str, Any]) -> bool:
+    response = example.get("response")
+    if isinstance(response, str) and response.strip():
+        return True
+    messages = example.get("messages")
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        if _message_text(message.get("content")):
+            return True
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            return True
+    return False
+
+
+def _structured_rows_from_jsonl(path: Path) -> list[dict[str, Any]] | None:
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                return None
+            rows.append(event)
+    if rows and all(isinstance(row.get("messages"), list) and isinstance(row.get("prompt"), str) for row in rows):
+        return rows
+    return None
+
+
+def completed_prompt_keys_from_outputs(traces_dir: Path) -> set[str]:
+    if not traces_dir.exists():
+        return set()
+    completed: set[str] = set()
+    for path in sorted(traces_dir.rglob("*.jsonl")):
+        if not path.is_file():
+            continue
+        try:
+            structured_rows = _structured_rows_from_jsonl(path)
+            if structured_rows is not None:
+                examples = structured_rows
+            else:
+                examples = [convert_trace_to_training_example(path).to_dict()]
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        for example in examples:
+            prompt = example.get("prompt")
+            if isinstance(prompt, str) and prompt.strip() and _training_example_has_answer(example):
+                completed.add(_prompt_completion_key(prompt))
+    return completed
+
+
+def pending_prompt_inputs_for_resume(prompt_inputs: list[PromptInput], traces_dir: Path) -> list[PromptInput]:
+    completed = completed_prompt_keys_from_outputs(traces_dir)
+    if not completed:
+        return prompt_inputs
+    return [
+        prompt_input
+        for prompt_input in prompt_inputs
+        if _prompt_completion_key(prompt_input.prompt) not in completed
+    ]
+
+
 class DockerRuntimeRunner:
     """Shared Docker runtime used by agent runners."""
 
     def __init__(self, config: Config):
         self.config = config
         self.image_name = RUNTIME_IMAGE_NAME
+        self._active_processes: dict[subprocess.Popen[str], str | None] = {}
+        self._active_processes_lock = threading.Lock()
         self._ensure_image()
 
     @staticmethod
@@ -373,6 +413,65 @@ class DockerRuntimeRunner:
         if len(normalized) <= limit:
             return normalized
         return normalized[: limit - 3] + "..."
+
+    @staticmethod
+    def _container_name(kind: str, session_id: str) -> str:
+        safe_session_id = re.sub(r"[^a-zA-Z0-9_.-]+", "-", session_id).strip("-")
+        return f"teich-{kind}-{safe_session_id}"
+
+    def _register_active_process(self, process: subprocess.Popen[str], container_name: str | None) -> None:
+        with self._active_processes_lock:
+            self._active_processes[process] = container_name
+
+    def _unregister_active_process(self, process: subprocess.Popen[str]) -> None:
+        with self._active_processes_lock:
+            self._active_processes.pop(process, None)
+
+    @staticmethod
+    def _remove_container(container_name: str | None) -> None:
+        if not container_name:
+            return
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def _terminate_process(self, process: subprocess.Popen[str], container_name: str | None) -> None:
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        finally:
+            self._remove_container(container_name)
+
+    def _terminate_active_processes(self) -> None:
+        with self._active_processes_lock:
+            active = list(self._active_processes.items())
+        for process, container_name in active:
+            self._terminate_process(process, container_name)
+
+    def _preserve_partial_session_files(self, session_dir: Path, session_id: str, prefix: str) -> list[Path]:
+        session_files = sorted(path for path in session_dir.rglob("*.jsonl") if path.is_file())
+        if not session_files:
+            return []
+        destination_dir = self.config.output.traces_dir / "partials"
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        preserved: list[Path] = []
+        for index, source_path in enumerate(session_files, start=1):
+            destination = destination_dir / f"{prefix}-{session_id[:8]}-{index}-{source_path.name}"
+            counter = 1
+            while destination.exists():
+                destination = destination_dir / f"{prefix}-{session_id[:8]}-{index}_{counter}-{source_path.name}"
+                counter += 1
+            shutil.copy2(source_path, destination)
+            preserved.append(destination)
+        return preserved
 
     @staticmethod
     def _copy_workspace_snapshot(workspace: Path, destination: Path) -> None:
@@ -717,13 +816,22 @@ class DockerRuntimeRunner:
         self,
         max_concurrency: int = 1,
         progress_callback: SessionProgressCallback | None = None,
+        prompt_inputs: list[PromptInput] | None = None,
+        resume: bool = False,
     ) -> list[Path]:
-        prompt_inputs = self.config.get_prompt_inputs()
+        prompt_inputs = prompt_inputs if prompt_inputs is not None else self.config.get_prompt_inputs()
         if not prompt_inputs:
             raise ValueError("No prompts configured")
 
         total_prompts = len(prompt_inputs)
         worker_count = max(1, min(max_concurrency, total_prompts))
+        prompt_queue: queue.Queue[tuple[int, PromptInput]] = queue.Queue()
+        for item in enumerate(prompt_inputs, start=1):
+            prompt_queue.put(item)
+        results_by_index: dict[int, Path] = {}
+        errors: list[Exception] = []
+        result_lock = threading.Lock()
+        stop_event = threading.Event()
 
         def emit_queued(prompt_index: int, prompt_input: PromptInput) -> None:
             if progress_callback:
@@ -738,24 +846,15 @@ class DockerRuntimeRunner:
                     )
                 )
 
-        def submit_prompt(executor: _PromptThreadPool, prompt_index: int, prompt_input: PromptInput):
-            emit_queued(prompt_index, prompt_input)
-            return executor.submit(
-                self._run_prompt_task,
-                f"prompt-{prompt_index}",
-                prompt_index,
-                total_prompts,
-                prompt_input,
-                progress_callback,
-            )
-
-        results_by_index: dict[int, Path] = {}
-        errors: list[Exception] = []
-        if worker_count == 1:
-            for prompt_index, prompt_input in enumerate(prompt_inputs, start=1):
+        def worker() -> None:
+            while not stop_event.is_set():
+                try:
+                    prompt_index, prompt_input = prompt_queue.get_nowait()
+                except queue.Empty:
+                    return
                 try:
                     emit_queued(prompt_index, prompt_input)
-                    results_by_index[prompt_index] = self._run_prompt_task(
+                    result = self._run_prompt_task(
                         f"prompt-{prompt_index}",
                         prompt_index,
                         total_prompts,
@@ -763,40 +862,28 @@ class DockerRuntimeRunner:
                         progress_callback,
                     )
                 except Exception as exc:
-                    errors.append(exc)
-            if errors:
-                raise errors[0]
-            return [results_by_index[index] for index in range(1, total_prompts + 1)]
-
-        executor = _PromptThreadPool(max_workers=worker_count)
-        try:
-            prompt_iterator = iter(enumerate(prompt_inputs, start=1))
-            futures = {}
-            for _ in range(worker_count):
-                try:
-                    prompt_index, prompt_input = next(prompt_iterator)
-                except StopIteration:
-                    break
-                futures[submit_prompt(executor, prompt_index, prompt_input)] = prompt_index
-
-            while futures:
-                done, _ = wait(futures, return_when=FIRST_COMPLETED)
-                for future in done:
-                    prompt_index = futures.pop(future)
-                    try:
-                        results_by_index[prompt_index] = future.result()
-                    except Exception as exc:
+                    with result_lock:
                         errors.append(exc)
-                    try:
-                        next_prompt_index, next_prompt_input = next(prompt_iterator)
-                    except StopIteration:
-                        continue
-                    futures[submit_prompt(executor, next_prompt_index, next_prompt_input)] = next_prompt_index
+                else:
+                    with result_lock:
+                        results_by_index[prompt_index] = result
+                finally:
+                    prompt_queue.task_done()
+
+        threads = [
+            threading.Thread(target=worker, name=f"teich-prompt-worker-{index}", daemon=True)
+            for index in range(worker_count)
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            while any(thread.is_alive() for thread in threads):
+                for thread in threads:
+                    thread.join(timeout=0.1)
         except KeyboardInterrupt:
-            executor.shutdown(wait=False, cancel_futures=True)
+            stop_event.set()
+            self._terminate_active_processes()
             raise
-        else:
-            executor.shutdown(wait=True)
 
         if errors:
             raise errors[0]
@@ -810,31 +897,47 @@ class DockerRuntimeRunner:
         session_dir: Path | None = None,
         progress_callback: SessionProgressCallback | None = None,
         progress_base: SessionProgressUpdate | None = None,
+        container_name: str | None = None,
+        stdin_text: str | None = None,
     ) -> None:
         with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout_handle, tempfile.TemporaryFile(
             mode="w+", encoding="utf-8"
         ) as stderr_handle:
+            process: subprocess.Popen[str] | None = None
             try:
                 process = subprocess.Popen(
                     command,
+                    stdin=subprocess.PIPE if stdin_text is not None else None,
                     stdout=stdout_handle,
                     stderr=stderr_handle,
                     text=True,
                 )
             except FileNotFoundError as exc:
-                raise RuntimeError(
-                    "Docker runtime not available. Ensure Docker is installed and the runtime image can be built."
-                ) from exc
-            self._monitor_process(
-                process,
-                session_id,
-                started_at,
-                session_dir,
-                progress_callback,
-                progress_base,
-                stdout_handle,
-                stderr_handle,
-            )
+                if shutil.which(command[0]) is None:
+                    raise RuntimeError(
+                        "Docker runtime not available. Ensure Docker is installed and the runtime image can be built."
+                    ) from exc
+                raise RuntimeError(f"Failed to start Docker runtime process: {exc}") from exc
+            self._register_active_process(process, container_name)
+            try:
+                if stdin_text is not None and process.stdin is not None:
+                    process.stdin.write(stdin_text)
+                    process.stdin.close()
+                self._monitor_process(
+                    process,
+                    session_id,
+                    started_at,
+                    session_dir,
+                    progress_callback,
+                    progress_base,
+                    stdout_handle,
+                    stderr_handle,
+                )
+            except BaseException:
+                self._terminate_process(process, container_name)
+                raise
+            finally:
+                self._unregister_active_process(process)
 
 
 class CodexRunner(DockerRuntimeRunner):
@@ -1031,7 +1134,13 @@ class CodexRunner(DockerRuntimeRunner):
                 normalized_lines.append(json.dumps(cls._normalize_trace_event(event), separators=(",", ":")))
         destination.write_text("\n".join(normalized_lines) + "\n", encoding="utf-8")
 
-    def _build_codex_command(self, prompt: str, workspace: Path, codex_home: Path) -> list[str]:
+    def _build_codex_command(
+        self,
+        prompt: str,
+        workspace: Path,
+        codex_home: Path,
+        container_name: str,
+    ) -> list[str]:
         api_key = self.config.get_api_key() or ""
         configured_base_url = self.config.get_base_url()
         base_url = configured_base_url
@@ -1045,6 +1154,8 @@ class CodexRunner(DockerRuntimeRunner):
             "docker",
             "run",
             "--rm",
+            "--name",
+            container_name,
             "--user",
             "codex",
             "-e",
@@ -1117,7 +1228,7 @@ class CodexRunner(DockerRuntimeRunner):
             )
             codex_cmd.extend(cmd[-4:])
             cmd = cmd[:-4]
-        codex_cmd.append(prompt)
+        codex_cmd.append("-")
         cmd.append(self.image_name)
         if proxy_target:
             proxy_script = f"{CODEX_HOME_IN_CONTAINER}/{LOCAL_PROVIDER_PROXY_SCRIPT_NAME}"
@@ -1182,13 +1293,14 @@ class CodexRunner(DockerRuntimeRunner):
         workspace_root, workspace = self._prepare_workspace(session_id, prompt_input, "codex")
         codex_home = Path(tempfile.mkdtemp(prefix=f"codex-home-{session_id}-"))
         started_at = datetime.now(timezone.utc)
+        container_name = self._container_name("codex", session_id)
 
         try:
             self._write_codex_config(codex_home)
             if self._local_provider_proxy_target(self.config.api.provider, self.config.get_base_url()):
                 self._write_local_provider_proxy(codex_home)
             existing_sessions = {path.resolve() for path in self._list_session_files(codex_home)}
-            cmd = self._build_codex_command(prompt, workspace, codex_home)
+            cmd = self._build_codex_command(prompt, workspace, codex_home, container_name)
             try:
                 self._run_process(
                     cmd,
@@ -1197,6 +1309,8 @@ class CodexRunner(DockerRuntimeRunner):
                     codex_home / "sessions",
                     progress_callback,
                     progress_base,
+                    container_name,
+                    prompt,
                 )
             except subprocess.TimeoutExpired:
                 raise RuntimeError(
@@ -1218,6 +1332,9 @@ class CodexRunner(DockerRuntimeRunner):
             )
             self._copy_workspace_snapshot(workspace, self._sandbox_destination(trace_path))
             return trace_path
+        except BaseException:
+            self._preserve_partial_session_files(codex_home / "sessions", session_id, "codex")
+            raise
         finally:
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(codex_home, ignore_errors=True)
@@ -1226,8 +1343,15 @@ class CodexRunner(DockerRuntimeRunner):
         self,
         max_concurrency: int = 1,
         progress_callback: SessionProgressCallback | None = None,
+        prompt_inputs: list[PromptInput] | None = None,
+        resume: bool = False,
     ) -> list[Path]:
-        return super().run_all(max_concurrency=max_concurrency, progress_callback=progress_callback)
+        return super().run_all(
+            max_concurrency=max_concurrency,
+            progress_callback=progress_callback,
+            prompt_inputs=prompt_inputs,
+            resume=resume,
+        )
 
 
 class ChatRunner(DockerRuntimeRunner):
@@ -1624,17 +1748,26 @@ class ChatRunner(DockerRuntimeRunner):
         self,
         max_concurrency: int = 1,
         progress_callback: SessionProgressCallback | None = None,
+        prompt_inputs: list[PromptInput] | None = None,
+        resume: bool = False,
     ) -> list[Path]:
-        prompt_inputs = self.config.get_prompt_inputs()
+        prompt_inputs = prompt_inputs if prompt_inputs is not None else self.config.get_prompt_inputs()
         if not prompt_inputs:
             raise ValueError("No prompts configured")
 
-        destination = self._resolve_output_path("chat.jsonl")
+        destination = self.config.output.traces_dir / "chat.jsonl" if resume else self._resolve_output_path("chat.jsonl")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize_chat_output_file(destination)
+        if not resume or not destination.exists():
+            self._initialize_chat_output_file(destination)
         total_prompts = len(prompt_inputs)
         worker_count = max(1, min(max_concurrency, total_prompts))
         append_lock = threading.Lock()
+        prompt_queue: queue.Queue[tuple[int, PromptInput]] = queue.Queue()
+        for item in enumerate(prompt_inputs, start=1):
+            prompt_queue.put(item)
+        errors: list[Exception] = []
+        error_lock = threading.Lock()
+        stop_event = threading.Event()
 
         def emit_queued(prompt_index: int, prompt_input: PromptInput) -> None:
             if progress_callback:
@@ -1649,25 +1782,15 @@ class ChatRunner(DockerRuntimeRunner):
                     )
                 )
 
-        def submit_prompt(executor: _PromptThreadPool, prompt_index: int, prompt_input: PromptInput):
-            emit_queued(prompt_index, prompt_input)
-            return executor.submit(
-                self._run_chat_prompt_task,
-                f"prompt-{prompt_index}",
-                prompt_index,
-                total_prompts,
-                prompt_input,
-                destination,
-                progress_callback,
-                append_lock,
-            )
-
-        errors: list[Exception] = []
-        if worker_count == 1:
-            for prompt_index, prompt_input in enumerate(prompt_inputs, start=1):
+        def worker() -> None:
+            while not stop_event.is_set():
+                try:
+                    prompt_index, prompt_input = prompt_queue.get_nowait()
+                except queue.Empty:
+                    return
                 try:
                     emit_queued(prompt_index, prompt_input)
-                    _, training_row = self._run_chat_prompt_task(
+                    self._run_chat_prompt_task(
                         f"prompt-{prompt_index}",
                         prompt_index,
                         total_prompts,
@@ -1677,42 +1800,27 @@ class ChatRunner(DockerRuntimeRunner):
                         append_lock,
                     )
                 except Exception as exc:
-                    errors.append(exc)
-            if errors:
-                raise errors[0]
-        else:
-            executor = _PromptThreadPool(max_workers=worker_count)
-            try:
-                prompt_iterator = iter(enumerate(prompt_inputs, start=1))
-                futures = {}
-                for _ in range(worker_count):
-                    try:
-                        prompt_index, prompt_input = next(prompt_iterator)
-                    except StopIteration:
-                        break
-                    futures[submit_prompt(executor, prompt_index, prompt_input)] = prompt_index
+                    with error_lock:
+                        errors.append(exc)
+                finally:
+                    prompt_queue.task_done()
 
-                while futures:
-                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
-                    for future in done:
-                        prompt_index = futures.pop(future)
-                        try:
-                            future.result()
-                        except Exception as exc:
-                            errors.append(exc)
-                        try:
-                            next_prompt_index, next_prompt_input = next(prompt_iterator)
-                        except StopIteration:
-                            continue
-                        futures[submit_prompt(executor, next_prompt_index, next_prompt_input)] = next_prompt_index
-            except KeyboardInterrupt:
-                executor.shutdown(wait=False, cancel_futures=True)
-                raise
-            else:
-                executor.shutdown(wait=True)
+        threads = [
+            threading.Thread(target=worker, name=f"teich-chat-worker-{index}", daemon=True)
+            for index in range(worker_count)
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            while any(thread.is_alive() for thread in threads):
+                for thread in threads:
+                    thread.join(timeout=0.1)
+        except KeyboardInterrupt:
+            stop_event.set()
+            raise
 
-            if errors:
-                raise errors[0]
+        if errors:
+            raise errors[0]
 
         return [destination]
 
@@ -1853,11 +1961,14 @@ class PiRunner(DockerRuntimeRunner):
         workspace: Path,
         agent_dir: Path,
         session_dir: Path,
+        container_name: str,
     ) -> list[str]:
         command = [
             "docker",
             "run",
             "--rm",
+            "--name",
+            container_name,
             "--user",
             "codex",
             "-e",
@@ -1900,7 +2011,7 @@ class PiRunner(DockerRuntimeRunner):
         api_key = self.config.get_api_key()
         if api_key and not configured_base_url:
             pi_command.extend(["--api-key", api_key])
-        pi_command.append(prompt)
+        pi_command.extend(["--print", f"@{WORKSPACE_IN_CONTAINER}/{TEICH_PROMPT_FILE_NAME}"])
         command.append(self.image_name)
         command.extend(pi_command)
         return command
@@ -2098,10 +2209,13 @@ class PiRunner(DockerRuntimeRunner):
         agent_dir = Path(tempfile.mkdtemp(prefix=f"pi-agent-{session_id}-"))
         session_dir = Path(tempfile.mkdtemp(prefix=f"pi-sessions-{session_id}-"))
         started_at = datetime.now(timezone.utc)
+        container_name = self._container_name("pi", session_id)
         try:
             self._write_pi_agent_settings(agent_dir)
+            workspace.mkdir(parents=True, exist_ok=True)
             self._write_pi_project_settings(workspace)
-            command = self._build_pi_command(prompt, workspace, agent_dir, session_dir)
+            (workspace / TEICH_PROMPT_FILE_NAME).write_text(prompt, encoding="utf-8")
+            command = self._build_pi_command(prompt, workspace, agent_dir, session_dir, container_name)
             try:
                 self._run_process(
                     command,
@@ -2110,6 +2224,7 @@ class PiRunner(DockerRuntimeRunner):
                     session_dir,
                     progress_callback,
                     progress_base,
+                    container_name,
                 )
             except subprocess.TimeoutExpired:
                 raise RuntimeError(
@@ -2123,6 +2238,9 @@ class PiRunner(DockerRuntimeRunner):
             trace_path = self._extract_session_file(session_id, session_dir, started_at)
             self._copy_workspace_snapshot(workspace, self._sandbox_destination(trace_path))
             return trace_path
+        except BaseException:
+            self._preserve_partial_session_files(session_dir, session_id, "pi")
+            raise
         finally:
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(agent_dir, ignore_errors=True)
@@ -2132,5 +2250,12 @@ class PiRunner(DockerRuntimeRunner):
         self,
         max_concurrency: int = 1,
         progress_callback: SessionProgressCallback | None = None,
+        prompt_inputs: list[PromptInput] | None = None,
+        resume: bool = False,
     ) -> list[Path]:
-        return super().run_all(max_concurrency=max_concurrency, progress_callback=progress_callback)
+        return super().run_all(
+            max_concurrency=max_concurrency,
+            progress_callback=progress_callback,
+            prompt_inputs=prompt_inputs,
+            resume=resume,
+        )

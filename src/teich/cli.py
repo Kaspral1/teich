@@ -14,8 +14,17 @@ from rich.panel import Panel
 from rich.table import Table
 
 from .config import Config
-from .runner import ChatRunner, CodexRunner, PiRunner, SessionProgressUpdate, TraceMetrics
+from .runner import (
+    ChatRunner,
+    CodexRunner,
+    PiRunner,
+    SessionProgressUpdate,
+    TraceMetrics,
+    completed_prompt_keys_from_outputs,
+    pending_prompt_inputs_for_resume,
+)
 from .trace_readme import write_traces_readme
+from .tool_schema import snapshot_configured_tools
 
 console = Console()
 app = typer.Typer(
@@ -63,6 +72,11 @@ def generate(
         min=1,
         help="Number of prompts to run in parallel",
     ),
+    resume: bool = typer.Option(
+        False,
+        "--resume",
+        help="Skip prompts that already have completed answers in the output directory",
+    ),
 ) -> None:
     """Generate training traces from prompts."""
     console.print(Panel.fit("Teich", style="bold blue"))
@@ -84,13 +98,31 @@ def generate(
 
     # Ensure output dir exists
     cfg.output.traces_dir.mkdir(parents=True, exist_ok=True)
+    if resume:
+        completed_keys = completed_prompt_keys_from_outputs(cfg.output.traces_dir)
+        pending_prompt_inputs = pending_prompt_inputs_for_resume(prompt_inputs, cfg.output.traces_dir)
+        skipped_count = len(prompt_inputs) - len(pending_prompt_inputs)
+    else:
+        completed_keys = set()
+        pending_prompt_inputs = prompt_inputs
+        skipped_count = 0
     effective_concurrency = (
-        max(1, min(cfg.max_concurrency, len(prompt_inputs))) if prompt_inputs else cfg.max_concurrency
+        max(1, min(cfg.max_concurrency, len(pending_prompt_inputs)))
+        if pending_prompt_inputs
+        else cfg.max_concurrency
     )
 
     console.print(f"[green]Loaded config: {config}[/green]")
+    if resume:
+        console.print(
+            f"[yellow]Resume enabled: found {len(completed_keys)} completed output prompts; "
+            f"skipping {skipped_count} configured prompts.[/yellow]"
+        )
+    if not pending_prompt_inputs:
+        console.print("[green]All configured prompts already have completed outputs. Nothing to run.[/green]")
+        return
     console.print(
-        f"[blue]Processing {len(prompt_inputs)} prompts with concurrency {effective_concurrency}...[/blue]\n"
+        f"[blue]Processing {len(pending_prompt_inputs)} prompts with concurrency {effective_concurrency}...[/blue]\n"
     )
 
     # Run generation
@@ -112,13 +144,18 @@ def generate(
             results = runner.run_all(
                 max_concurrency=cfg.max_concurrency,
                 progress_callback=reporter.update,
+                prompt_inputs=pending_prompt_inputs,
+                resume=resume,
             )
         dataset_tags = cfg.get_dataset_tags()
+        tools = snapshot_configured_tools(cfg)
         readme_path = write_traces_readme(
             cfg.output.traces_dir,
             pretty_name=cfg.output.pretty_name,
             tags=dataset_tags,
             model_id=cfg.model.model,
+            repo_id=cfg.get_publish_repo_id(),
+            tools=tools,
         )
         totals = reporter.snapshot_totals()
 

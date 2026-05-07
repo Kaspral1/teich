@@ -12,7 +12,7 @@ import pytest
 
 import teich.runner as runner_module
 from teich.config import APIConfig, Config, MCPConfig, ModelConfig, PromptInput
-from teich.runner import ChatRunner, CodexRunner, PiRunner
+from teich.runner import ChatRunner, CodexRunner, PiRunner, pending_prompt_inputs_for_resume
 
 
 def test_codex_runner_init():
@@ -105,6 +105,8 @@ def test_run_session_command_generation():
         assert "docker" in cmd
         assert "run" in cmd
         assert "--rm" in cmd
+        assert "--name" in cmd
+        assert "teich-codex-test-session-123" in cmd
         assert "-e" in cmd
         assert "OPENAI_API_KEY=sk-test123" in cmd
         assert "codex" in cmd
@@ -117,7 +119,9 @@ def test_run_session_command_generation():
         assert config.model.sandbox in cmd
         assert "--skip-git-repo-check" in cmd
         assert cmd.index("--ask-for-approval") < cmd.index("exec")
-        assert "Build a todo app" in cmd
+        assert cmd[-1] == "-"
+        assert mock_run_process.call_args.args[6] == "teich-codex-test-session-123"
+        assert mock_run_process.call_args.args[7] == "Build a todo app"
         mock_copy_workspace.assert_called_once()
 
 
@@ -134,6 +138,107 @@ def test_run_session_timeout():
 
         with pytest.raises(RuntimeError, match="timed out"):
             runner.run_session("Test prompt")
+
+
+def test_docker_runners_keep_long_prompt_out_of_host_command_line(tmp_path: Path):
+    long_prompt = "x" * 40000
+
+    codex_config = Config(output={"traces_dir": tmp_path / "codex-output", "sandbox_dir": tmp_path / "codex-sandbox"})
+    with patch.object(CodexRunner, '_ensure_image'):
+        codex_runner = CodexRunner(codex_config)
+    with patch.object(codex_runner, '_run_process') as mock_run_process, \
+         patch.object(codex_runner, '_extract_session_file', return_value=tmp_path / "codex-output" / "trace.jsonl"), \
+         patch.object(codex_runner, '_copy_workspace_snapshot'):
+        codex_runner.run_session(long_prompt, "codex-session")
+
+    codex_command = mock_run_process.call_args.args[0]
+    assert long_prompt not in codex_command
+    assert codex_command[-1] == "-"
+    assert mock_run_process.call_args.args[7] == long_prompt
+
+    pi_config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "pi-output", "sandbox_dir": tmp_path / "pi-sandbox"})
+    with patch.object(PiRunner, '_ensure_image'):
+        pi_runner = PiRunner(pi_config)
+    captured_workspace = None
+
+    def capture_project_settings(workspace: Path) -> None:
+        nonlocal captured_workspace
+        captured_workspace = workspace
+
+    def assert_pi_prompt_file_before_cleanup(*args, **kwargs) -> None:
+        assert captured_workspace is not None
+        assert (captured_workspace / ".teich-prompt.txt").read_text(encoding="utf-8") == long_prompt
+
+    with patch.object(pi_runner, '_run_process', side_effect=assert_pi_prompt_file_before_cleanup) as mock_pi_run_process, \
+         patch.object(pi_runner, '_extract_session_file', return_value=tmp_path / "pi-output" / "trace.jsonl"), \
+         patch.object(pi_runner, '_copy_workspace_snapshot'), \
+         patch.object(pi_runner, '_write_pi_agent_settings'), \
+         patch.object(pi_runner, '_write_pi_project_settings', side_effect=capture_project_settings):
+        pi_runner.run_session(long_prompt, "pi-session")
+
+    pi_command = mock_pi_run_process.call_args.args[0]
+    assert long_prompt not in pi_command
+    assert "@/workspace/.teich-prompt.txt" in pi_command
+
+
+def test_run_process_removes_named_container_on_failure():
+    config = Config()
+
+    with patch.object(CodexRunner, '_ensure_image'):
+        runner = CodexRunner(config)
+
+    process = MagicMock()
+    process.poll.return_value = None
+    with patch("teich.runner.subprocess.Popen", return_value=process) as mock_popen, \
+         patch.object(runner, "_monitor_process", side_effect=KeyboardInterrupt), \
+         patch("teich.runner.subprocess.run") as mock_run:
+        with pytest.raises(KeyboardInterrupt):
+            runner._run_process(
+                ["docker", "run", "--name", "teich-codex-test", "teich-runtime:v3"],
+                "test-session",
+                datetime.now(timezone.utc),
+                container_name="teich-codex-test",
+            )
+
+    mock_popen.assert_called_once()
+    process.terminate.assert_called_once()
+    mock_run.assert_called_with(
+        ["docker", "rm", "-f", "teich-codex-test"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_codex_run_session_preserves_partial_trace_on_failure(tmp_path: Path):
+    config = Config(output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"})
+
+    with patch.object(CodexRunner, '_ensure_image'):
+        runner = CodexRunner(config)
+
+    workspace_root = tmp_path / "workspace-root"
+    workspace = workspace_root
+    codex_home = tmp_path / "codex-home"
+    sessions_dir = codex_home / "sessions"
+    workspace.mkdir()
+    sessions_dir.mkdir(parents=True)
+
+    def fail_after_writing_trace(*args, **kwargs):
+        (sessions_dir / "partial.jsonl").write_text(
+            '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Test prompt"}]}}\n',
+            encoding="utf-8",
+        )
+        raise RuntimeError("boom")
+
+    with patch.object(runner, "_prepare_workspace", return_value=(workspace_root, workspace)), \
+         patch("teich.runner.tempfile.mkdtemp", return_value=str(codex_home)), \
+         patch.object(runner, "_run_process", side_effect=fail_after_writing_trace):
+        with pytest.raises(RuntimeError, match="boom"):
+            runner.run_session("Test prompt", "test-session")
+
+    partials = sorted((tmp_path / "output" / "partials").glob("codex-test-ses*-partial.jsonl"))
+    assert len(partials) == 1
+    assert "Test prompt" in partials[0].read_text(encoding="utf-8")
 
 
 def test_run_all_with_no_prompts():
@@ -240,10 +345,15 @@ def test_run_all_queues_prompts_lazily_as_workers_free_up(tmp_path: Path):
         runner = CodexRunner(config)
 
     updates = []
+    update_thread_names = []
     started = []
     started_lock = threading.Lock()
     first_batch_started = threading.Event()
     release_first_batch = threading.Event()
+
+    def record_update(update):
+        update_thread_names.append(threading.current_thread().name)
+        updates.append(update)
 
     def fake_task(prompt_id, prompt_index, total_prompts, prompt_input, progress_callback):
         with started_lock:
@@ -258,7 +368,7 @@ def test_run_all_queues_prompts_lazily_as_workers_free_up(tmp_path: Path):
         result_holder = {}
 
         def run():
-            result_holder["results"] = runner.run_all(max_concurrency=2, progress_callback=updates.append)
+            result_holder["results"] = runner.run_all(max_concurrency=2, progress_callback=record_update)
 
         thread = threading.Thread(target=run)
         thread.start()
@@ -271,15 +381,24 @@ def test_run_all_queues_prompts_lazily_as_workers_free_up(tmp_path: Path):
     assert not thread.is_alive()
     assert [path.name for path in result_holder["results"]] == ["prompt-1.jsonl", "prompt-2.jsonl", "prompt-3.jsonl"]
     assert [update.prompt_id for update in updates if update.status == "queued"] == ["prompt-1", "prompt-2", "prompt-3"]
+    queued_update_thread_names = [
+        thread_name
+        for update, thread_name in zip(updates, update_thread_names, strict=True)
+        if update.status == "queued"
+    ]
+    assert all(thread_name.startswith("teich-prompt-worker-") for thread_name in queued_update_thread_names)
 
 
 def test_run_all_preserves_completed_agent_trace_files_when_later_prompt_fails(tmp_path: Path):
-    config = Config(prompts=["Prompt 1", "Prompt 2"], max_concurrency=1)
+    config = Config(prompts=["Prompt 1", "Prompt 2", "Prompt 3"], max_concurrency=1)
 
     with patch.object(CodexRunner, '_ensure_image'):
         runner = CodexRunner(config)
 
-    first_trace = tmp_path / "first.jsonl"
+    trace_paths = {
+        "Prompt 1": tmp_path / "first.jsonl",
+        "Prompt 3": tmp_path / "third.jsonl",
+    }
 
     def fake_run_session(
         prompt: str,
@@ -290,36 +409,18 @@ def test_run_all_preserves_completed_agent_trace_files_when_later_prompt_fails(t
     ) -> Path:
         if prompt == "Prompt 2":
             raise RuntimeError("boom")
-        first_trace.write_text(json.dumps({"prompt": prompt}) + "\n", encoding="utf-8")
-        return first_trace
+        trace_path = trace_paths[prompt]
+        trace_path.write_text(json.dumps({"prompt": prompt}) + "\n", encoding="utf-8")
+        return trace_path
 
     with patch.object(runner, 'run_session', side_effect=fake_run_session):
         with pytest.raises(RuntimeError, match="boom"):
             runner.run_all(max_concurrency=1)
 
-    assert first_trace.exists()
-    assert json.loads(first_trace.read_text(encoding="utf-8")) == {"prompt": "Prompt 1"}
-
-
-def test_prompt_thread_pool_shutdown_does_not_wait_for_blocked_daemon_workers():
-    started = threading.Event()
-    release = threading.Event()
-    pool = runner_module._PromptThreadPool(max_workers=1)
-
-    def blocked_task():
-        started.set()
-        release.wait(timeout=2)
-
-    pool.submit(blocked_task)
-    assert started.wait(timeout=1)
-    start = time.monotonic()
-    pool.shutdown(wait=False, cancel_futures=True)
-    elapsed = time.monotonic() - start
-    release.set()
-    pool.shutdown(wait=True)
-
-    assert elapsed < 0.5
-    assert all(thread.daemon for thread in pool._threads)
+    assert trace_paths["Prompt 1"].exists()
+    assert trace_paths["Prompt 3"].exists()
+    assert json.loads(trace_paths["Prompt 1"].read_text(encoding="utf-8")) == {"prompt": "Prompt 1"}
+    assert json.loads(trace_paths["Prompt 3"].read_text(encoding="utf-8")) == {"prompt": "Prompt 3"}
 
 
 def test_run_all_propagates_keyboard_interrupt_without_waiting_for_agent_workers(tmp_path: Path):
@@ -348,7 +449,7 @@ def test_run_all_propagates_keyboard_interrupt_without_waiting_for_agent_workers
 
     try:
         with patch.object(runner, 'run_session', side_effect=blocked_run_session):
-            with patch("teich.runner.wait", side_effect=interrupt_after_worker_starts):
+            with patch("teich.runner.threading.Thread.join", side_effect=interrupt_after_worker_starts):
                 start = time.monotonic()
                 with pytest.raises(KeyboardInterrupt):
                     runner.run_all(max_concurrency=2)
@@ -893,11 +994,14 @@ def test_pi_runner_builds_command_and_project_settings(tmp_path: Path):
             tmp_path / "workspace",
             tmp_path,
             tmp_path / "sessions",
+            "teich-pi-test-session",
         )
         assert command == [
             "docker",
             "run",
             "--rm",
+            "--name",
+            "teich-pi-test-session",
             "--user",
             "codex",
             "-e",
@@ -926,12 +1030,47 @@ def test_pi_runner_builds_command_and_project_settings(tmp_path: Path):
             "claude-sonnet-4-20250514",
             "--thinking",
             "high",
-            "Inspect the repo",
+            "--print",
+            "@/workspace/.teich-prompt.txt",
         ]
 
 
 def test_pi_runner_resolves_pi_executable_from_path():
     assert PiRunner._resolve_pi_executable() == "@mariozechner/pi-coding-agent"
+
+
+def test_pi_run_session_preserves_partial_trace_on_failure(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"})
+
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(config)
+
+    workspace_root = tmp_path / "workspace-root"
+    workspace = workspace_root
+    agent_dir = tmp_path / "pi-agent"
+    session_dir = tmp_path / "pi-sessions"
+    workspace.mkdir()
+    agent_dir.mkdir()
+    session_dir.mkdir()
+
+    def fail_after_writing_trace(*args, **kwargs):
+        (session_dir / "partial.jsonl").write_text(
+            '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"Test prompt"}]}}\n',
+            encoding="utf-8",
+        )
+        raise RuntimeError("boom")
+
+    with patch.object(runner, "_prepare_workspace", return_value=(workspace_root, workspace)), \
+         patch("teich.runner.tempfile.mkdtemp", side_effect=[str(agent_dir), str(session_dir)]), \
+         patch.object(runner, "_write_pi_agent_settings"), \
+         patch.object(runner, "_write_pi_project_settings"), \
+         patch.object(runner, "_run_process", side_effect=fail_after_writing_trace):
+        with pytest.raises(RuntimeError, match="boom"):
+            runner.run_session("Test prompt", "test-session")
+
+    partials = sorted((tmp_path / "output" / "partials").glob("pi-test-ses*-partial.jsonl"))
+    assert len(partials) == 1
+    assert "Test prompt" in partials[0].read_text(encoding="utf-8")
 
 
 def test_chat_runner_writes_structured_dataset_row_from_responses_api(tmp_path: Path):
@@ -1169,10 +1308,15 @@ def test_chat_runner_run_all_queues_prompts_lazily(tmp_path: Path):
     )
     runner = ChatRunner(config)
     updates = []
+    update_thread_names = []
     started = []
     started_lock = threading.Lock()
     first_batch_started = threading.Event()
     release_first_batch = threading.Event()
+
+    def record_update(update):
+        update_thread_names.append(threading.current_thread().name)
+        updates.append(update)
 
     def fake_task(prompt_id, prompt_index, total_prompts, prompt_input, destination, progress_callback, append_lock=None):
         with started_lock:
@@ -1195,7 +1339,7 @@ def test_chat_runner_run_all_queues_prompts_lazily(tmp_path: Path):
         result_holder = {}
 
         def run():
-            result_holder["results"] = runner.run_all(max_concurrency=2, progress_callback=updates.append)
+            result_holder["results"] = runner.run_all(max_concurrency=2, progress_callback=record_update)
 
         thread = threading.Thread(target=run)
         thread.start()
@@ -1208,6 +1352,12 @@ def test_chat_runner_run_all_queues_prompts_lazily(tmp_path: Path):
     assert not thread.is_alive()
     assert result_holder["results"] == [tmp_path / "output" / "chat.jsonl"]
     assert [update.prompt_id for update in updates if update.status == "queued"] == ["prompt-1", "prompt-2", "prompt-3"]
+    queued_update_thread_names = [
+        thread_name
+        for update, thread_name in zip(updates, update_thread_names, strict=True)
+        if update.status == "queued"
+    ]
+    assert all(thread_name.startswith("teich-chat-worker-") for thread_name in queued_update_thread_names)
 
 
 def test_chat_runner_run_all_preserves_completed_rows_when_later_prompt_fails(tmp_path: Path):
@@ -1246,6 +1396,115 @@ def test_chat_runner_run_all_preserves_completed_rows_when_later_prompt_fails(tm
     assert [row["prompt"] for row in rows] == ["Hello"]
 
 
+def test_resume_detects_completed_chat_prompts(tmp_path: Path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "chat.jsonl").write_text(
+        json.dumps(
+            {
+                "prompt": "Hello",
+                "response": "Hi",
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi"},
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    prompt_inputs = [PromptInput(prompt="Hello"), PromptInput(prompt="Who are you?")]
+
+    pending = pending_prompt_inputs_for_resume(prompt_inputs, output_dir)
+
+    assert [item.prompt for item in pending] == ["Who are you?"]
+
+
+def test_resume_detects_completed_codex_and_pi_traces(tmp_path: Path):
+    output_dir = tmp_path / "output"
+    recovered_dir = output_dir / "recovered-pi-sessions"
+    recovered_dir.mkdir(parents=True)
+    (output_dir / "codex.jsonl").write_text(
+        '{"type":"session_meta","payload":{"id":"codex-1"}}\n'
+        '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Build app"}]}}\n'
+        '{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}\n',
+        encoding="utf-8",
+    )
+    (recovered_dir / "pi.jsonl").write_text(
+        '{"type":"session","id":"pi-1"}\n'
+        '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"Fix bug"}]}}\n'
+        '{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"Fixed"}]}}\n',
+        encoding="utf-8",
+    )
+    prompt_inputs = [
+        PromptInput(prompt="Build app"),
+        PromptInput(prompt="Fix bug"),
+        PromptInput(prompt="Write tests"),
+    ]
+
+    pending = pending_prompt_inputs_for_resume(prompt_inputs, output_dir)
+
+    assert [item.prompt for item in pending] == ["Write tests"]
+
+
+def test_chat_runner_resume_appends_existing_chat_file(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini"),
+        api=APIConfig(provider="openai", api_key="sk-test", wire_api="responses"),
+        prompts=["Who are you?"],
+        output={"traces_dir": tmp_path / "output"},
+    )
+    runner = ChatRunner(config)
+    destination = tmp_path / "output" / "chat.jsonl"
+    destination.parent.mkdir(parents=True)
+    destination.write_text(json.dumps({"prompt": "Hello", "response": "Hi", "messages": []}) + "\n", encoding="utf-8")
+
+    def fake_task(prompt_id, prompt_index, total_prompts, prompt_input, destination, progress_callback, append_lock=None):
+        training_row = {"prompt": prompt_input.prompt, "response": "I am Teich", "messages": []}
+        if append_lock is not None:
+            with append_lock:
+                runner._append_chat_training_row(destination, training_row)
+        return prompt_index, training_row
+
+    with patch.object(runner, '_run_chat_prompt_task', side_effect=fake_task):
+        assert runner.run_all(max_concurrency=1, resume=True) == [destination]
+
+    rows = [json.loads(line) for line in destination.read_text(encoding="utf-8").splitlines()]
+    assert [row["prompt"] for row in rows] == ["Hello", "Who are you?"]
+
+
+def test_chat_runner_continues_claiming_new_prompts_after_failure(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini"),
+        api=APIConfig(provider="openai", api_key="sk-test", wire_api="responses"),
+        prompts=["one", "two", "three", "four"],
+        output={"traces_dir": tmp_path / "output"},
+    )
+    runner = ChatRunner(config)
+    release = threading.Event()
+    claimed = []
+    claimed_lock = threading.Lock()
+
+    def fake_task(prompt_id, prompt_index, total_prompts, prompt_input, destination, progress_callback, append_lock=None):
+        with claimed_lock:
+            claimed.append(prompt_id)
+        if prompt_id == "prompt-1":
+            release.wait(timeout=2)
+            return prompt_index, {"prompt": prompt_input.prompt, "messages": []}
+        if prompt_id == "prompt-2":
+            release.set()
+            raise RuntimeError("boom")
+        return prompt_index, {"prompt": prompt_input.prompt, "messages": []}
+
+    with patch.object(runner, '_run_chat_prompt_task', side_effect=fake_task):
+        with pytest.raises(RuntimeError, match="boom"):
+            runner.run_all(max_concurrency=2)
+
+    assert set(claimed) == {"prompt-1", "prompt-2", "prompt-3", "prompt-4"}
+
+
 def test_chat_run_all_propagates_keyboard_interrupt_without_waiting_for_workers(tmp_path: Path):
     config = Config(
         agent={"provider": "chat"},
@@ -1269,7 +1528,7 @@ def test_chat_run_all_propagates_keyboard_interrupt_without_waiting_for_workers(
 
     try:
         with patch.object(runner, '_run_chat_prompt_task', side_effect=blocked_task):
-            with patch("teich.runner.wait", side_effect=interrupt_after_worker_starts):
+            with patch("teich.runner.threading.Thread.join", side_effect=interrupt_after_worker_starts):
                 start = time.monotonic()
                 with pytest.raises(KeyboardInterrupt):
                     runner.run_all(max_concurrency=2)

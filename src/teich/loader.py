@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
 from datasets import Dataset, Features, Json, List, Value
 from huggingface_hub import snapshot_download
@@ -33,6 +35,33 @@ def _dataset_from_rows(rows: list[dict]) -> Dataset:
     return Dataset.from_list(rows, features=features)
 
 
+def _load_tools_snapshot(root: Path) -> list[dict[str, Any]]:
+    candidates = [root / "tools.json"]
+    if root.is_dir():
+        candidates.extend(path for path in root.rglob("tools.json") if path.is_file())
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            tools = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(tools, list):
+            return [tool for tool in tools if isinstance(tool, dict)]
+    return []
+
+
+def _apply_tools_snapshot(rows: list[dict], tools: list[dict[str, Any]]) -> list[dict]:
+    if not tools:
+        return rows
+    updated_rows: list[dict] = []
+    for row in rows:
+        updated = dict(row)
+        updated["tools"] = tools
+        updated_rows.append(updated)
+    return updated_rows
+
+
 def load_traces(
     source: str | Path,
     split: str | None = "train",
@@ -56,7 +85,7 @@ def load_traces(
                 token=token,
                 cache_dir=str(cache_dir) if cache_dir is not None else None,
                 local_dir=str(local_dir) if local_dir is not None else None,
-                allow_patterns=["*.jsonl", "**/*.jsonl"],
+                allow_patterns=["*.jsonl", "**/*.jsonl", "tools.json", "**/tools.json"],
             )
         )
     traces_dir = root if root.is_file() else _trace_directory(root, split)
@@ -66,6 +95,8 @@ def load_traces(
         if split and traces_dir == root and root.is_dir():
             raise ValueError(f"No trace files found in {location} for split '{split}'.")
         raise ValueError(f"No JSONL trace or training data files found in {location}.")
+    snapshot_root = root if root.is_dir() else root.parent
+    rows = _apply_tools_snapshot(rows, _load_tools_snapshot(snapshot_root))
     dataset = _dataset_from_rows(rows)
     if max_examples is not None:
         dataset = dataset.shuffle(seed=3407)

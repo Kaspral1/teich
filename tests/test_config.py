@@ -1,5 +1,6 @@
 """Tests for config module."""
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -142,6 +143,64 @@ def test_config_prompts_file_supports_multiline_csv_prompts(tmp_path: Path):
         ' - no'
     )
     assert prompts[1] == "Solve 1148583*a = 1148360*a - 5352 for a.\nSolve this problem."
+
+
+def test_config_prompts_file_rejects_csv_rows_with_extra_columns(tmp_path: Path):
+    prompts_file = tmp_path / "prompts.csv"
+    prompts_file.write_text(
+        "prompt,github_repo\n"
+        "Build a dashboard,with an unquoted comma,None\n",
+        encoding="utf-8",
+    )
+    config = Config(prompts_file=prompts_file)
+
+    with pytest.raises(ValueError, match="more columns than the header"):
+        config.get_prompt_inputs()
+
+
+def test_config_prompts_file_supports_jsonl_prompts(tmp_path: Path):
+    prompts_file = tmp_path / "prompts.jsonl"
+    rows = [
+        {
+            "prompt": "Premise:\nUse a safer long prompt format.\nAvailable choices:\n - yes\n - no",
+            "github_repo": "armand0e/perplexica-mcp",
+        },
+        {"prompt": "Build a todo app"},
+    ]
+    prompts_file.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    config = Config(prompts_file=prompts_file)
+    prompt_inputs = config.get_prompt_inputs()
+
+    assert len(prompt_inputs) == 2
+    assert prompt_inputs[0].prompt == rows[0]["prompt"]
+    assert prompt_inputs[0].github_repo == "armand0e/perplexica-mcp"
+    assert prompt_inputs[1].prompt == "Build a todo app"
+
+
+def test_config_prompts_file_supports_json_prompt_list(tmp_path: Path):
+    prompts_file = tmp_path / "prompts.json"
+    prompts_file.write_text(
+        json.dumps(
+            {
+                "prompts": [
+                    {"prompt": "Review this code:\n```python\nprint('hello')\n```"},
+                    "Create a landing page",
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = Config(prompts_file=prompts_file)
+
+    assert config.get_prompts() == [
+        "Review this code:\n```python\nprint('hello')\n```",
+        "Create a landing page",
+    ]
 
 
 def test_config_prompts_file_resolves_relative_to_yaml(tmp_path: Path):
