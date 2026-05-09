@@ -170,8 +170,8 @@ def _tokenize_trainer_text_with_offsets(
     text: str,
 ) -> tuple[list[int], list[int], list[tuple[int, int]]] | None:
     call_variants = (
-        ((), {"text": text, "return_attention_mask": True, "return_offsets_mapping": True}),
-        ((text,), {"return_attention_mask": True, "return_offsets_mapping": True}),
+        ((), {"text": text, "add_special_tokens": False, "return_attention_mask": True, "return_offsets_mapping": True}),
+        ((text,), {"add_special_tokens": False, "return_attention_mask": True, "return_offsets_mapping": True}),
     )
     encoded = None
     for args, kwargs in call_variants:
@@ -199,6 +199,33 @@ def _tokenize_trainer_text_with_offsets(
         attention_mask = [1] * len(input_ids)
     normalized_offsets = [tuple(offset) for offset in offsets]
     return list(input_ids), list(attention_mask), normalized_offsets
+
+
+def _tokenize_trainer_text(text_tokenizer: Any, text: str) -> tuple[list[int], list[int]] | None:
+    call_variants = (
+        ((), {"text": text, "add_special_tokens": False, "return_attention_mask": True}),
+        ((text,), {"add_special_tokens": False, "return_attention_mask": True}),
+    )
+    encoded = None
+    for args, kwargs in call_variants:
+        try:
+            encoded = text_tokenizer(*args, **kwargs)
+            break
+        except TypeError:
+            continue
+    if encoded is None:
+        return None
+    input_ids = encoded.get("input_ids")
+    if input_ids is None:
+        return None
+    attention_mask = encoded.get("attention_mask")
+    if input_ids and isinstance(input_ids[0], list):
+        input_ids = input_ids[0]
+    if attention_mask and isinstance(attention_mask[0], list):
+        attention_mask = attention_mask[0]
+    if attention_mask is None:
+        attention_mask = [1] * len(input_ids)
+    return list(input_ids), list(attention_mask)
 
 
 def _supports_offsets(text_tokenizer: Any) -> bool:
@@ -1250,6 +1277,29 @@ def mask_data(
             return None
         if not isinstance(dataset, Dataset):
             raise TypeError(f"trainer.{dataset_name} must be a datasets.Dataset instance.")
+        if "input_ids" not in dataset.column_names and dataset_text_field in dataset.column_names:
+            def _tokenize_batch(batch: dict[str, list[Any]]) -> dict[str, list[Any]]:
+                output_batch: dict[str, list[Any]] = {"input_ids": [], "attention_mask": []}
+                for text in batch[dataset_text_field]:
+                    if not isinstance(text, str):
+                        raise TypeError(f"trainer.{dataset_name} has a non-string '{dataset_text_field}' value.")
+                    tokenized = _tokenize_trainer_text(text_tokenizer, text)
+                    if tokenized is None:
+                        raise ValueError(
+                            f"trainer.{dataset_name} is missing input_ids, and tokenizer could not tokenize "
+                            f"the '{dataset_text_field}' column."
+                        )
+                    input_ids, attention_mask = tokenized
+                    output_batch["input_ids"].append(input_ids)
+                    output_batch["attention_mask"].append(attention_mask)
+                return output_batch
+
+            dataset = dataset.map(
+                _tokenize_batch,
+                batched=True,
+                batch_size=_FORMAT_AND_MASK_BATCH_SIZE,
+                desc=f"Tokenizing {dataset_name} for Teich masks",
+            )
         missing = {"input_ids"}.difference(dataset.column_names)
         if missing:
             raise ValueError(f"trainer.{dataset_name} is missing required columns for mask_data: {', '.join(sorted(missing))}")

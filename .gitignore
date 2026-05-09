@@ -21,3 +21,6 @@ traces-test/
 *.env.*
 .DS_Store
 Thumbs.db
+unsloth_compiled_cache/
+qwen3.6_chat_template.jinja
+

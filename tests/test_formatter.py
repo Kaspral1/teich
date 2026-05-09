@@ -814,6 +814,57 @@ def test_mask_data_applies_teich_labels_after_trainer_tokenization():
     assert "<tool>file_a.py</tool>" in masked_text
 
 
+def test_mask_data_tokenizes_prepared_text_when_trainer_has_not_tokenized():
+    tokenizer = TrainerStyleTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "system", "content": "system rules"},
+                    {"role": "user", "content": "first request"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "inspect repo",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": {"command": "ls"}},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "name": "bash", "content": "file_a.py"},
+                    {"role": "assistant", "content": "done"},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    prepared = prepare_data(dataset, tokenizer, verbose=False)
+    trainer = SimpleNamespace(
+        train_dataset=prepared,
+        eval_dataset=None,
+        processing_class=tokenizer,
+        args=SimpleNamespace(dataset_text_field="text", packing=False),
+    )
+
+    trainer = mask_data(trainer, audit=True)
+
+    row = trainer.train_dataset[0]
+    assert set(trainer.train_dataset.column_names) == {"input_ids", "labels"}
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    assert supervised_text == "<think>inspect repo</think><tool_call>bash</tool_call></assistant>done</assistant>"
+
+
 def test_mask_data_can_drop_rows_with_too_many_supervised_tokens():
     tokenizer = TrainerStyleTokenizer()
     dataset = Dataset.from_list(

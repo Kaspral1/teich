@@ -1,28 +1,27 @@
 # -*- coding: utf-8 -*-
 import os
-
 from unsloth import FastLanguageModel
 import torch
 from trl import SFTConfig, SFTTrainer
-
 from teich import mask_data, prepare_data
 
-
 MAX_SEQ_LEN = 32768
-MODEL_NAME = "unsloth/Qwen3.5-0.8B"
-TRAIN_ON_REASONING = True
-CHAT_TEMPLATE_KWARGS = {"enable_thinking": True}
-PUSH_TO_HUB_REPO_ID = "armand0e/traces-test"
-HF_TOKEN = os.environ.get("HF_TOKEN") or ""
-
 
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name=MODEL_NAME,
+    model_name="unsloth/Qwen3.5-0.8B",
     max_seq_length=MAX_SEQ_LEN,
     load_in_4bit=False,
     load_in_8bit=False,
     full_finetuning=False,
 )
+
+# Optional: Train with any chat template
+
+"""with open("custom_chat_template.jinja", "r", encoding="utf-8") as f:
+    custom_chat_template = f.read()
+tokenizer.chat_template = custom_chat_template
+if hasattr(tokenizer, "tokenizer") and tokenizer.tokenizer is not None:
+    tokenizer.tokenizer.chat_template = custom_chat_template"""
 
 model = FastLanguageModel.get_peft_model(
     model,
@@ -38,12 +37,12 @@ model = FastLanguageModel.get_peft_model(
 )
 
 train_dataset = prepare_data(
-    "TeichAI/lordx64-claude-opus-4.7-max-cleaned",
+    "armand0e/teich-test-v1",
     tokenizer,
     split="train",
-    max_examples=500,
-    chat_template_kwargs=CHAT_TEMPLATE_KWARGS,
-    train_on_reasoning=TRAIN_ON_REASONING,
+    #max_examples=100,
+    chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True},
+    train_on_reasoning=True,
     max_length=MAX_SEQ_LEN,
     drop_oversized_examples=True,
     strict=True,
@@ -65,8 +64,7 @@ trainer = SFTTrainer(
         num_train_epochs=1,
         learning_rate=2e-4,
         logging_steps=1,
-        optim="muon",
-        optim_target_modules="all-linear",
+        optim = "adamw_8bit",
         weight_decay=0.001,
         lr_scheduler_type="linear",
         output_dir="outputs",
@@ -74,25 +72,11 @@ trainer = SFTTrainer(
         report_to="none",
     ),
 )
+
 trainer = mask_data(trainer, tokenizer=tokenizer)
 
-gpu_stats = torch.cuda.get_device_properties(0)
-start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
-max_memory = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
-print(f"GPU = {gpu_stats.name}. Max memory = {max_memory} GB.")
-print(f"{start_gpu_memory} GB of memory reserved.")
+print(trainer.train_dataset.preview())
 
 trainer_stats = trainer.train(resume_from_checkpoint=False)
 
-used_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
-used_memory_for_lora = round(used_memory - start_gpu_memory, 3)
-used_percentage = round(used_memory / max_memory * 100, 3)
-lora_percentage = round(used_memory_for_lora / max_memory * 100, 3)
-print(f"{trainer_stats.metrics['train_runtime']} seconds used for training.")
-print(f"{round(trainer_stats.metrics['train_runtime'] / 60, 2)} minutes used for training.")
-print(f"Peak reserved memory = {used_memory} GB.")
-print(f"Peak reserved memory for training = {used_memory_for_lora} GB.")
-print(f"Peak reserved memory % of max memory = {used_percentage} %.")
-print(f"Peak reserved memory for training % of max memory = {lora_percentage} %.")
-
-model.push_to_hub_merged(PUSH_TO_HUB_REPO_ID, tokenizer, save_method="merged_16bit", token=HF_TOKEN)
+model.push_to_hub_merged("armand0e/traces-test", tokenizer, save_method="merged_16bit", token="")
