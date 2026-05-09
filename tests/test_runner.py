@@ -1451,6 +1451,35 @@ def test_resume_detects_completed_chat_prompts(tmp_path: Path):
     assert [item.prompt for item in pending] == ["Who are you?"]
 
 
+def test_resume_deduplicates_new_configured_prompts(tmp_path: Path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "chat.jsonl").write_text(
+        json.dumps(
+            {
+                "prompt": "Hello",
+                "response": "Hi",
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi"},
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    prompt_inputs = [
+        PromptInput(prompt="Hello"),
+        PromptInput(prompt="New task"),
+        PromptInput(prompt=" New task \n"),
+        PromptInput(prompt="Another task"),
+    ]
+
+    pending = pending_prompt_inputs_for_resume(prompt_inputs, output_dir)
+
+    assert [item.prompt for item in pending] == ["New task", "Another task"]
+
+
 def test_resume_detects_completed_codex_and_pi_traces(tmp_path: Path):
     output_dir = tmp_path / "output"
     recovered_dir = output_dir / "recovered-pi-sessions"

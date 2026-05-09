@@ -332,7 +332,20 @@ def completed_prompt_keys_from_outputs(traces_dir: Path) -> set[str]:
     return completed
 
 
+def unique_prompt_inputs_by_completion_key(prompt_inputs: list[PromptInput]) -> list[PromptInput]:
+    unique: list[PromptInput] = []
+    seen: set[str] = set()
+    for prompt_input in prompt_inputs:
+        key = _prompt_completion_key(prompt_input.prompt)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(prompt_input)
+    return unique
+
+
 def pending_prompt_inputs_for_resume(prompt_inputs: list[PromptInput], traces_dir: Path) -> list[PromptInput]:
+    prompt_inputs = unique_prompt_inputs_by_completion_key(prompt_inputs)
     completed = completed_prompt_keys_from_outputs(traces_dir)
     if not completed:
         return prompt_inputs
@@ -824,6 +837,7 @@ class DockerRuntimeRunner:
         resume: bool = False,
     ) -> list[Path]:
         prompt_inputs = prompt_inputs if prompt_inputs is not None else self.config.get_prompt_inputs()
+        prompt_inputs = unique_prompt_inputs_by_completion_key(prompt_inputs)
         if not prompt_inputs:
             raise ValueError("No prompts configured")
 
@@ -1752,6 +1766,7 @@ class ChatRunner(DockerRuntimeRunner):
         resume: bool = False,
     ) -> list[Path]:
         prompt_inputs = prompt_inputs if prompt_inputs is not None else self.config.get_prompt_inputs()
+        prompt_inputs = unique_prompt_inputs_by_completion_key(prompt_inputs)
         if not prompt_inputs:
             raise ValueError("No prompts configured")
 

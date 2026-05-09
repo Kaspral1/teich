@@ -22,6 +22,7 @@ from .runner import (
     TraceMetrics,
     completed_prompt_keys_from_outputs,
     pending_prompt_inputs_for_resume,
+    unique_prompt_inputs_by_completion_key,
 )
 from .trace_readme import write_traces_readme
 from .tool_schema import snapshot_configured_tools
@@ -87,8 +88,25 @@ def _publish_dataset_to_hub(cfg: Config) -> str:
         repo_id=repo_id,
         repo_type="dataset",
         commit_message="Upload teich dataset output",
+        ignore_patterns=["partials/**"],
     )
     return str(repo_url)
+
+
+def _prompt_publish_partial_outputs(cfg: Config) -> str | None:
+    repo_id = cfg.get_publish_repo_id()
+    if not repo_id or not _has_non_empty_trace_outputs(cfg.output.traces_dir):
+        return None
+    should_publish = typer.confirm(
+        f"Upload successful traces to Hugging Face dataset {repo_id}?",
+        default=False,
+    )
+    if not should_publish:
+        console.print("[yellow]Skipping Hugging Face upload for partial outputs.[/yellow]")
+        return None
+    repo_url = _publish_dataset_to_hub(cfg)
+    console.print(f"[green]Published partial dataset: {repo_url}[/green]")
+    return repo_url
 
 
 @app.command()
@@ -128,7 +146,7 @@ def generate(
     if concurrency is not None:
         cfg.max_concurrency = concurrency
 
-    prompt_inputs = cfg.get_prompt_inputs()
+    prompt_inputs = unique_prompt_inputs_by_completion_key(cfg.get_prompt_inputs())
     if not prompt_inputs:
         console.print("[red]No prompts configured. Add prompts in config.yaml or prompts.csv.[/red]")
         raise typer.Exit(1)
@@ -211,12 +229,14 @@ def generate(
         readme_path = _try_write_partial_output_metadata(cfg)
         if readme_path:
             console.print(f"\n[green]Wrote README for partial outputs: {readme_path}[/green]")
+            _prompt_publish_partial_outputs(cfg)
         console.print("\n[yellow]Interrupted. Completed outputs remain on disk.[/yellow]")
         raise typer.Exit(130)
     except Exception as e:
         readme_path = _try_write_partial_output_metadata(cfg)
         if readme_path:
             console.print(f"\n[green]Wrote README for partial outputs: {readme_path}[/green]")
+            _prompt_publish_partial_outputs(cfg)
         console.print(f"\n[red]Error: {e}[/red]")
         raise typer.Exit(1)
 

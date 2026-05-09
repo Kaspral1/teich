@@ -291,7 +291,139 @@ api:
             repo_id="armand0e/test-dataset",
             repo_type="dataset",
             commit_message="Upload teich dataset output",
+            ignore_patterns=["partials/**"],
         )
+
+
+def test_generate_command_prompts_before_publishing_partial_outputs_and_defaults_no(tmp_path: Path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(f"""
+agent:
+  provider: chat
+model:
+  model: gpt-4.1-mini
+prompts:
+  - Hello
+  - Who are you?
+output:
+  traces_dir: {tmp_path}/output
+publish:
+  repo_id: armand0e/test-dataset
+  hf_token: hf-test123
+api:
+  provider: openai
+  api_key: sk-test
+  wire_api: responses
+""")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "chat.jsonl").write_text(
+        json.dumps({"prompt": "Hello", "response": "Hi", "messages": [{"role": "assistant", "content": "Hi"}]})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with patch('teich.cli.ChatRunner') as mock_runner, patch('teich.cli.HfApi') as mock_api_cls:
+        mock_instance = MagicMock()
+        mock_instance.run_all.side_effect = RuntimeError("timeout")
+        mock_runner.return_value = mock_instance
+
+        result = runner.invoke(app, ["generate", "-c", str(config_file)], input="\n")
+
+        assert result.exit_code == 1
+        assert "Wrote README for partial outputs" in result.output
+        assert "Upload successful traces to Hugging Face dataset armand0e/test-dataset?" in result.output
+        assert "Skipping Hugging Face upload for partial outputs" in result.output
+        mock_api_cls.assert_not_called()
+
+
+def test_generate_command_can_publish_partial_outputs_after_failure(tmp_path: Path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(f"""
+agent:
+  provider: chat
+model:
+  model: gpt-4.1-mini
+prompts:
+  - Hello
+  - Who are you?
+output:
+  traces_dir: {tmp_path}/output
+publish:
+  repo_id: armand0e/test-dataset
+  hf_token: hf-test123
+api:
+  provider: openai
+  api_key: sk-test
+  wire_api: responses
+""")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "chat.jsonl").write_text(
+        json.dumps({"prompt": "Hello", "response": "Hi", "messages": [{"role": "assistant", "content": "Hi"}]})
+        + "\n",
+        encoding="utf-8",
+    )
+    (output_dir / "partials").mkdir()
+    (output_dir / "partials" / "partial.jsonl").write_text("partial\n", encoding="utf-8")
+
+    with patch('teich.cli.ChatRunner') as mock_runner, patch('teich.cli.HfApi') as mock_api_cls:
+        mock_instance = MagicMock()
+        mock_instance.run_all.side_effect = RuntimeError("timeout")
+        mock_runner.return_value = mock_instance
+        mock_api = MagicMock()
+        mock_api.create_repo.return_value = "https://huggingface.co/datasets/armand0e/test-dataset"
+        mock_api_cls.return_value = mock_api
+
+        result = runner.invoke(app, ["generate", "-c", str(config_file)], input="y\n")
+
+        assert result.exit_code == 1
+        assert "Published partial dataset: https://huggingface.co/datasets/armand0e/test-dataset" in result.output
+        mock_api.upload_folder.assert_called_once_with(
+            folder_path=str(output_dir),
+            repo_id="armand0e/test-dataset",
+            repo_type="dataset",
+            commit_message="Upload teich dataset output",
+            ignore_patterns=["partials/**"],
+        )
+
+
+def test_generate_command_deduplicates_configured_prompts_before_running(tmp_path: Path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(f"""
+agent:
+  provider: chat
+model:
+  model: gpt-4.1-mini
+prompts:
+  - Hello
+  - Hello
+  - Who are you?
+output:
+  traces_dir: {tmp_path}/output
+api:
+  provider: openai
+  api_key: sk-test
+  wire_api: responses
+""")
+
+    with patch('teich.cli.ChatRunner') as mock_runner:
+        mock_instance = MagicMock()
+        mock_instance.run_all.return_value = [tmp_path / "output/chat.jsonl"]
+        mock_runner.return_value = mock_instance
+        output_dir = tmp_path / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "chat.jsonl").write_text(
+            json.dumps({"prompt": "Hello", "response": "Hi", "messages": [{"role": "assistant", "content": "Hi"}]})
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["generate", "-c", str(config_file)])
+
+        assert result.exit_code == 0
+        kwargs = mock_instance.run_all.call_args.kwargs
+        assert [prompt_input.prompt for prompt_input in kwargs["prompt_inputs"]] == ["Hello", "Who are you?"]
 
 
 def test_batch_progress_reporter_only_shows_queued_and_running_rows():
