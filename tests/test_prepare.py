@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from datasets import Dataset
 
-from teich import TeichDataCollator, prepare_sft_dataset
+from teich import prepare_data
 
 
 class TinyChatTokenizer:
@@ -54,6 +55,21 @@ def _dataset() -> Dataset:
     )
 
 
+def _dataset_with_answers(prefix: str, count: int) -> Dataset:
+    return Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": f"{prefix} prompt {index}"},
+                    {"role": "assistant", "content": f"{prefix} answer {index}"},
+                ],
+                "tools": [],
+            }
+            for index in range(count)
+        ]
+    )
+
+
 def _write_structured_dataset(path: Path) -> None:
     path.write_text(
         json.dumps(
@@ -71,62 +87,79 @@ def _write_structured_dataset(path: Path) -> None:
     )
 
 
-def test_prepare_sft_dataset_accepts_dataset_and_returns_training_artifacts():
-    tokenizer = TinyChatTokenizer()
-    prepared = prepare_sft_dataset(
-        _dataset(),
-        tokenizer,
-        audit=True,
-        verbose=False,
-        collator=TeichDataCollator(tokenizer=tokenizer, return_tensors=None),
-    )
-
-    assert prepared.dataset.num_rows == 1
-    assert prepared.dataset_report is not None
-    assert prepared.dataset_report.ok
-    assert prepared.batch_report is not None
-    assert prepared.batch_report.ok
-    assert prepared.sft_config_kwargs == {"dataset_kwargs": {"skip_prepare_dataset": True}, "dataset_num_proc": 1}
-    assert "world</assistant>" in prepared.preview()
-
-
-def test_prepare_sft_dataset_loads_local_source(tmp_path: Path):
+def test_prepare_data_loads_local_source(tmp_path: Path):
     dataset_file = tmp_path / "chat.jsonl"
     _write_structured_dataset(dataset_file)
     tokenizer = TinyChatTokenizer()
 
-    prepared = prepare_sft_dataset(
+    prepared = prepare_data(
         dataset_file,
         tokenizer,
         split=None,
-        audit=True,
         verbose=False,
-        collator=TeichDataCollator(tokenizer=tokenizer, return_tensors=None),
     )
 
-    assert prepared.dataset.num_rows == 1
-    assert prepared.batch_report is not None
-    assert prepared.batch_report.ok
+    assert prepared.num_rows == 1
+    assert set(prepared.column_names) == {"text", "teich_supervised_spans"}
 
 
-def test_prepare_sft_dataset_raises_when_audit_fails():
+def test_prepare_data_forwards_hf_token_alias_to_loader():
     tokenizer = TinyChatTokenizer()
-    empty_target_dataset = Dataset.from_list(
-        [
-            {
-                "messages": [
-                    {"role": "user", "content": "hello"},
-                ],
-                "tools": [],
-            }
-        ]
+
+    with patch("teich.prepare.load_traces", return_value=_dataset()) as mock_load_traces:
+        prepared = prepare_data("armand0e/ag-datagen-v2-test", tokenizer, hf_token="hf-test", verbose=False)
+
+    assert prepared.num_rows == 1
+    mock_load_traces.assert_called_once()
+    assert mock_load_traces.call_args.kwargs["token"] == "hf-test"
+
+
+def test_prepare_data_rejects_conflicting_token_aliases():
+    tokenizer = TinyChatTokenizer()
+
+    with pytest.raises(ValueError, match="token or hf_token"):
+        prepare_data(
+            "armand0e/ag-datagen-v2-test",
+            tokenizer,
+            token="hf-one",
+            hf_token="hf-two",
+            verbose=False,
+        )
+
+
+def test_prepare_data_accepts_source_mix_with_percentages_and_caps():
+    tokenizer = TinyChatTokenizer()
+
+    prepared = prepare_data(
+        {
+            "max_examples": 10,
+            "agent": {"source": _dataset_with_answers("agent", 20), "percentage": 70},
+            "chat": {"source": _dataset_with_answers("chat", 20), "percentage": 30, "max_examples": 4},
+        },
+        tokenizer,
+        verbose=False,
     )
 
-    with pytest.raises(ValueError, match="fully masked"):
-        prepare_sft_dataset(
-            empty_target_dataset,
-            tokenizer,
-            audit=True,
-            verbose=False,
-            collator=TeichDataCollator(tokenizer=tokenizer, return_tensors=None),
-        )
+    texts = [prepared[index]["text"] for index in range(prepared.num_rows)]
+    assert prepared.num_rows == 10
+    assert sum("agent answer" in text for text in texts) == 7
+    assert sum("chat answer" in text for text in texts) == 3
+
+
+def test_prepare_data_source_mix_uses_equal_defaults_and_redistributes_capacity():
+    tokenizer = TinyChatTokenizer()
+
+    prepared = prepare_data(
+        [
+            {"source": _dataset_with_answers("small", 2)},
+            {"source": _dataset_with_answers("large", 10)},
+        ],
+        tokenizer,
+        max_examples=8,
+        verbose=False,
+    )
+
+    texts = [prepared[index]["text"] for index in range(prepared.num_rows)]
+    assert prepared.num_rows == 8
+    assert sum("small answer" in text for text in texts) == 2
+    assert sum("large answer" in text for text in texts) == 6

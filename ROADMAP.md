@@ -11,10 +11,8 @@ Teich now has a usable trace-first generation and SFT preparation flow:
 - Raw trace preservation, partial-output recovery, and deterministic Docker container cleanup.
 - Structured conversion to `messages` / `tools` / `metadata` rows.
 - Configured `tools.json` snapshots for dataset uploads and future rendering.
-- `load_traces` for local folders, local files, and Hugging Face dataset repos.
-- `format_and_mask` for tokenizer chat-template rendering and assistant/tool/reasoning label masks.
-- `prepare_sft_dataset` for one-step load, format, mask, collate, and audit.
-- `TeichDataCollator` for pre-tokenized SFT rows without depending on TRL internals.
+- `prepare_data()` + `mask_data()` as the supported trainer-first SFT path.
+- `load_traces()` for fallback/manual workflows where users own chat-template rendering, filtering, tokenization, and masking.
 - Generated dataset README cards that show the current Teich SFT path.
 
 ---
@@ -79,31 +77,40 @@ trainer = SFTTrainer(
 trainer = mask_data(trainer, tokenizer=tokenizer)
 ```
 
-Advanced/manual path:
+Fallback/manual path:
 
 ```python
-from teich import format_and_mask, load_traces
+from teich import load_traces
 
 dataset = load_traces("./output")
-training_data = format_and_mask(dataset, tokenizer, max_length=32768, strict=True)
+example = dataset[0]
+rendered = tokenizer.apply_chat_template(
+    example["messages"],
+    tools=example.get("tools") or [],
+    tokenize=False,
+    add_generation_prompt=False,
+)
+tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 ```
 
 ### 2.2 Supported Normalized Formats
 
-- [x] **OpenAI-style chat/message format** as the primary normalized training representation:
-  ```json
-  {
-    "messages": [
-      {"role": "system", "content": "..."},
-      {"role": "user", "content": "..."},
-      {"role": "assistant", "content": "...", "reasoning_content": "..."},
-      {"role": "assistant", "tool_calls": [...]},
-      {"role": "tool", "tool_call_id": "...", "content": "..."}
-    ],
-    "tools": [...],
-    "metadata": {...}
-  }
-  ```
+- [x] **OpenAI-style chat/message format** as the primary normalized training representation.
+
+```json
+{
+  "messages": [
+    {"role": "system", "content": "..."},
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "...", "reasoning_content": "..."},
+    {"role": "assistant", "tool_calls": [...]},
+    {"role": "tool", "tool_call_id": "...", "content": "..."}
+  ],
+  "tools": [...],
+  "metadata": {...}
+}
+```
+
 - [x] Structured chat JSONL rows from `agent.provider: chat`
 - [ ] Anthropic Messages export adapter
 - [ ] Gemini export adapter
@@ -120,14 +127,12 @@ training_data = format_and_mask(dataset, tokenizer, max_length=32768, strict=Tru
 
 ### 2.4 SFT Safety
 
-- [x] Precompute `input_ids`, `attention_mask`, and masked `labels`
-- [x] Mask non-assistant context with `-100`
+- [x] Preserve `text` plus Teich supervision spans before trainer tokenization.
+- [x] Apply masked `labels` after `SFTTrainer` tokenization with `mask_data()`.
 - [x] Support optional reasoning supervision with `train_on_reasoning`
 - [x] Drop oversized rows by default
 - [x] Add strict marker-render invariant checks
 - [x] Audit dataset labels
-- [x] Audit collator batching
-- [x] Provide Teich-owned collator for SFTTrainer
 
 ---
 
@@ -206,9 +211,9 @@ training_data = format_and_mask(dataset, tokenizer, max_length=32768, strict=Tru
 
 ### 5.1 Documentation
 
-- [x] Public README / PyPI README updated for `prepare_sft_dataset`
-- [x] Generated dataset README updated for `prepare_sft_dataset`
-- [x] Example training script updated for `prepare_sft_dataset`
+- [x] Public README / PyPI README updated for `prepare_data()` + `mask_data()`
+- [x] Generated dataset README updated for `prepare_data()` + `mask_data()`
+- [x] Example training script updated for `prepare_data()` + `mask_data()`
 - [ ] Full API reference
 - [ ] Tutorial: Creating your first dataset
 - [ ] Tutorial: Fine-tuning with generated data
@@ -234,7 +239,7 @@ training_data = format_and_mask(dataset, tokenizer, max_length=32768, strict=Tru
 ## Immediate Next Steps
 
 1. **Run a small real generation smoke test** for Codex and Pi with 1-2 prompts each.
-2. **Run a small real `prepare_sft_dataset` smoke test** against the newly generated output and the intended tokenizer.
+2. **Run a small real `prepare_data()` + `mask_data()` smoke test** against the newly generated output and the intended tokenizer.
 3. **Audit generated examples manually** for tool-call rendering, reasoning supervision, and empty/error sessions.
 4. **Decide quality-filter policy** for failed sessions and low-value traces.
 5. **Add docs/tutorials** around creating, publishing, loading, and training on a first dataset.

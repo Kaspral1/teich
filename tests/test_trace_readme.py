@@ -47,7 +47,7 @@ def test_build_traces_readme_includes_model_and_references_tools(tmp_path: Path)
     assert "Peak reserved memory for training % of max memory" in readme
     assert "model.push_to_hub_merged" in readme
     assert "load_traces" in readme
-    assert "format_and_mask" in readme
+    assert "format_and_mask" not in readme
     assert "tokenizer.apply_chat_template" in readme
     assert "tools=example.get('tools') or []" in readme
     assert "dataset = load_traces('username/repo')" in readme

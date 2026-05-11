@@ -216,24 +216,9 @@ train_dataset = prepare_data(
 )
 ```
 
-### Advanced load and format flow
+### Fallback manual flow with `load_traces`
 
-```python
-from teich import format_and_mask, load_traces
-
-tool_dataset = load_traces("username/tool-traces", split="train")
-chat_dataset = load_traces("./chat-output/chat.jsonl")
-
-training_data = format_and_mask(
-    [tool_dataset, chat_dataset],
-    tokenizer,
-    max_length=32768,
-    chat_template_kwargs={"enable_thinking": True},
-    strict=True,
-)
-```
-
-### Manual tokenizer flow with `load_traces`
+Use `load_traces` directly only when you want to own the remaining training pipeline yourself: chat-template rendering, filtering, tokenization, label masking, packing policy, and auditing.
 
 ```python
 from teich import load_traces
@@ -323,9 +308,7 @@ Assistant messages capture:
 from teich import (
     prepare_data,        # Recommended: render trainer-friendly text rows
     mask_data,           # Recommended: apply Teich labels after SFTTrainer tokenization
-    load_traces,         # Load from folder, file, or HF dataset
-    format_and_mask,     # Advanced: pre-tokenized SFT preparation
-    prepare_sft_dataset, # Advanced: pre-tokenized, collated, audited SFT data
+    load_traces,         # Fallback: load rows for fully manual processing
     preview_sft_example, # Preview supervised vs masked tokens
     Config,              # Load config.yaml
     TrainingExample,     # Typed training example
@@ -341,7 +324,7 @@ Teich preserves the **raw agent session** as the source of truth:
 1. **Collect**: Run agents on real tasks → raw `.jsonl` traces
 2. **Inspect/Share**: Traces are human-readable and uploadable
 3. **Convert**: Transform to structured examples when ready
-4. **Prepare**: Apply model-specific chat templates, mask labels, collate, and audit for training
+4. **Prepare**: Use `prepare_data()` + `mask_data()` to apply model-specific templates and labels through the trainer-first flow
 
 If you choose `agent.provider: chat`, Teich skips the trace-preservation step and writes structured text-only JSONL rows directly.
 

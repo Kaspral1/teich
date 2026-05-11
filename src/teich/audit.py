@@ -5,8 +5,6 @@ from typing import Any
 
 from datasets import Dataset
 
-from .collator import TeichDataCollator
-
 
 @dataclass
 class SFTAuditReport:
@@ -114,71 +112,3 @@ def audit_sft_dataset(dataset: Dataset, tokenizer: Any, *, sample_size: int = 8)
 
     return SFTAuditReport(ok=not errors, errors=errors, warnings=warnings, samples=samples)
 
-
-def audit_sft_trainer_batch(
-    dataset: Dataset,
-    tokenizer: Any,
-    *,
-    data_collator: Any | None = None,
-    sample_size: int = 2,
-) -> SFTAuditReport:
-    dataset_report = audit_sft_dataset(dataset, tokenizer, sample_size=sample_size)
-    errors = list(dataset_report.errors)
-    warnings = list(dataset_report.warnings)
-    samples = list(dataset_report.samples)
-    if errors:
-        return SFTAuditReport(ok=False, errors=errors, warnings=warnings, samples=samples)
-
-    if data_collator is None:
-        try:
-            data_collator = TeichDataCollator(tokenizer=tokenizer, return_tensors=None)
-        except ValueError as exc:
-            return SFTAuditReport(ok=False, errors=[str(exc)])
-
-    limit = min(max(sample_size, 0), dataset.num_rows)
-    examples = [
-        {column_name: dataset[row_index][column_name] for column_name in ("input_ids", "attention_mask", "labels")}
-        for row_index in range(limit)
-    ]
-    if not examples:
-        return SFTAuditReport(ok=not errors, errors=errors, warnings=warnings, samples=samples)
-
-    try:
-        batch = data_collator(examples)
-    except Exception as exc:
-        return SFTAuditReport(
-            ok=False,
-            errors=errors
-            + [
-                "data collator failed while batching precomputed input_ids/labels. "
-                f"For Teich pre-tokenized SFT data, pass TeichDataCollator. Original error: {exc}"
-            ],
-            warnings=warnings,
-            samples=samples,
-        )
-
-    batch_labels = batch.get("labels") if isinstance(batch, dict) else None
-    if batch_labels is None:
-        errors.append("data collator output is missing labels")
-        return SFTAuditReport(ok=False, errors=errors, warnings=warnings, samples=samples)
-
-    for row_index, example in enumerate(examples):
-        collated_labels = batch_labels[row_index]
-        if hasattr(collated_labels, "tolist"):
-            collated_labels = collated_labels.tolist()
-        original_labels = list(example["labels"])
-        collated_labels = list(collated_labels)
-        right_padded = collated_labels[: len(original_labels)] == original_labels
-        left_padded = collated_labels[-len(original_labels) :] == original_labels
-        if not right_padded and not left_padded:
-            errors.append(f"collated labels differ from dataset labels for sample {row_index}")
-            continue
-        padding_labels = (
-            collated_labels[len(original_labels) :]
-            if right_padded
-            else collated_labels[: -len(original_labels)]
-        )
-        if any(label != -100 for label in padding_labels):
-            errors.append(f"collated padding labels are not masked for sample {row_index}")
-
-    return SFTAuditReport(ok=not errors, errors=errors, warnings=warnings, samples=samples)

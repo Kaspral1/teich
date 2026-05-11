@@ -100,17 +100,25 @@ def _apply_tools_snapshot(rows: list[dict], tools: list[dict[str, Any]]) -> list
     return updated_rows
 
 
+def _resolve_hf_token(token: str | None, hf_token: str | None) -> str | None:
+    if token is not None and hf_token is not None and token != hf_token:
+        raise ValueError("Pass only one of token or hf_token, or pass the same value for both.")
+    return token if token is not None else hf_token
+
+
 def load_traces(
     source: str | Path,
     split: str | None = "train",
     revision: str | None = None,
     token: str | None = None,
+    hf_token: str | None = None,
     cache_dir: str | Path | None = None,
     local_dir: str | Path | None = None,
     max_examples: int | None = None,
 ) -> Dataset:
     if max_examples is not None and max_examples < 0:
         raise ValueError("max_examples must be non-negative.")
+    effective_token = _resolve_hf_token(token, hf_token)
     source_path = Path(source)
     if source_path.exists():
         root = source_path
@@ -120,7 +128,7 @@ def load_traces(
                 repo_id=str(source),
                 repo_type="dataset",
                 revision=revision,
-                token=token,
+                token=effective_token,
                 cache_dir=str(cache_dir) if cache_dir is not None else None,
                 local_dir=str(local_dir) if local_dir is not None else None,
                 allow_patterns=["*.jsonl", "**/*.jsonl", "README.md", "tools.json", "**/tools.json"],

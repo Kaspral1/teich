@@ -79,6 +79,25 @@ def test_load_traces_downloads_dataset_repo_and_converts_split(tmp_path: Path):
     assert dataset[0]["prompt"] == "Inspect repo"
 
 
+def test_load_traces_forwards_hf_token_alias_to_snapshot_download(tmp_path: Path):
+    repo_dir = tmp_path / "downloaded-repo"
+    split_dir = repo_dir / "train"
+    split_dir.mkdir(parents=True)
+    _write_codex_trace(split_dir / "remote-trace.jsonl", prompt="Inspect repo")
+
+    with patch("teich.loader.snapshot_download", return_value=str(repo_dir)) as mock_download:
+        dataset = load_traces("armand0e/ag-datagen-v2-test", split="train", hf_token="hf-test")
+
+    mock_download.assert_called_once()
+    assert mock_download.call_args.kwargs["token"] == "hf-test"
+    assert dataset.num_rows == 1
+
+
+def test_load_traces_rejects_conflicting_token_aliases():
+    with pytest.raises(ValueError, match="token or hf_token"):
+        load_traces("armand0e/ag-datagen-v2-test", token="hf-one", hf_token="hf-two")
+
+
 def test_load_traces_applies_tools_snapshot_embedded_in_readme(tmp_path: Path):
     dataset_file = tmp_path / "chat.jsonl"
     dataset_file.write_text(
