@@ -707,6 +707,46 @@ def _labels_from_offsets(
     return labels
 
 
+def _align_labels_to_input_ids(
+    input_ids: list[int],
+    full_input_ids: list[int],
+    full_labels: list[int],
+) -> list[int] | None:
+    if input_ids == full_input_ids:
+        return full_labels
+    if len(input_ids) <= len(full_input_ids) and input_ids == full_input_ids[: len(input_ids)]:
+        return full_labels[: len(input_ids)]
+
+    if len(input_ids) >= len(full_input_ids):
+        for offset in range(len(input_ids) - len(full_input_ids) + 1):
+            end = offset + len(full_input_ids)
+            if input_ids[offset:end] == full_input_ids:
+                labels = [-100] * len(input_ids)
+                labels[offset:end] = full_labels
+                return labels
+
+    best: tuple[int, int] | None = None
+    max_special_side_tokens = min(8, len(input_ids))
+    for prefix_count in range(max_special_side_tokens + 1):
+        remaining = len(input_ids) - prefix_count
+        if remaining <= 0:
+            continue
+        for suffix_count in range(min(max_special_side_tokens, remaining - 1) + 1):
+            end = len(input_ids) - suffix_count if suffix_count else len(input_ids)
+            candidate = input_ids[prefix_count:end]
+            if not candidate:
+                continue
+            if len(candidate) <= len(full_input_ids) and candidate == full_input_ids[: len(candidate)]:
+                if best is None or len(candidate) > best[1] - best[0]:
+                    best = (prefix_count, end)
+    if best is None:
+        return None
+    start, end = best
+    labels = [-100] * len(input_ids)
+    labels[start:end] = full_labels[: end - start]
+    return labels
+
+
 def _token_text_and_offsets(text_tokenizer: Any, input_ids: list[int]) -> tuple[str, list[tuple[int, int]]]:
     parts: list[str] = []
     offsets: list[tuple[int, int]] = []
@@ -850,6 +890,7 @@ def format_data(
     train_on_reasoning: bool = True,
     max_length: int | None = None,
     drop_oversized_examples: bool = True,
+    tokenize: bool = False,
     strict: bool = False,
     verbose: bool = True,
 ) -> Dataset:
@@ -873,6 +914,7 @@ def format_data(
                         train_on_reasoning=train_on_reasoning,
                         max_length=max_length,
                         drop_oversized_examples=drop_oversized_examples,
+                        tokenize=tokenize,
                         strict=strict,
                         verbose=verbose,
                     )
@@ -894,6 +936,8 @@ def format_data(
         raise TypeError(f"Dataset is missing required '{messages_column}' column")
 
     output_columns = [text_column, TEICH_SUPERVISED_SPANS_COLUMN]
+    if tokenize:
+        output_columns.extend(["input_ids", "attention_mask"])
 
     def _empty_output_batch() -> dict[str, list[Any]]:
         return {column_name: [] for column_name in output_columns}
@@ -929,12 +973,22 @@ def format_data(
             if not supervised_spans:
                 dropped_count += 1
                 continue
+            tokenized: tuple[list[int], list[int]] | None = None
+            if tokenize:
+                tokenized = _tokenize_trainer_text(text_tokenizer, text)
+                if tokenized is None:
+                    raise ValueError("prepare_data(tokenize=True) requires a tokenizer that can tokenize text.")
             if drop_oversized_examples and effective_max_length is not None:
-                if _tokenized_length(text_tokenizer, text) > effective_max_length:
+                tokenized_length = len(tokenized[0]) if tokenized is not None else _tokenized_length(text_tokenizer, text)
+                if tokenized_length > effective_max_length:
                     dropped_oversized_count += 1
                     continue
             output_batch[text_column].append(text)
             output_batch[TEICH_SUPERVISED_SPANS_COLUMN].append(_span_dicts(supervised_spans))
+            if tokenized is not None:
+                input_ids, attention_mask = tokenized
+                output_batch["input_ids"].append(input_ids)
+                output_batch["attention_mask"].append(attention_mask)
         return output_batch
 
     formatted_data = dataset.map(
@@ -973,11 +1027,8 @@ def _mask_tokenized_row(
             raise ValueError("mask_data requires a tokenizer that can return offset mappings for text tokenization.")
         full_input_ids, _, offsets = encoded
         full_labels = _labels_from_offsets(full_input_ids, offsets, supervised_spans)
-        if input_ids == full_input_ids:
-            labels = full_labels
-        elif len(input_ids) <= len(full_input_ids) and input_ids == full_input_ids[: len(input_ids)]:
-            labels = full_labels[: len(input_ids)]
-        else:
+        labels = _align_labels_to_input_ids(input_ids, full_input_ids, full_labels)
+        if labels is None:
             raise ValueError("Trainer tokenized input_ids do not align with the original Teich-rendered text.")
     else:
         text, offsets = _token_text_and_offsets(text_tokenizer, input_ids)
@@ -1229,5 +1280,3 @@ def preview_sft_example(dataset: Dataset, tokenizer: Any, *, index: int = 0) -> 
     row = dataset[index]
     text_tokenizer = _resolve_text_tokenizer(tokenizer)
     return _build_preview(text_tokenizer, row["input_ids"], row["labels"])
-
-

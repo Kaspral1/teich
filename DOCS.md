@@ -115,12 +115,14 @@ Each row looks conceptually like:
 }
 ```
 
+With `tokenize=True`, rows also include `input_ids` and `attention_mask`. Use this mode for the recommended Unsloth / TRL flow so trainer setup treats the dataset as already tokenized and preserves `teich_supervised_spans` until `mask_data()` runs.
+
 Important details:
 
-- **`text`** is what `SFTTrainer` / Unsloth tokenizes.
+- **`text`** is what `SFTTrainer` / Unsloth tokenizes when `tokenize=False`; with `tokenize=True`, it stays available for Teich span alignment and preview.
 - **`teich_supervised_spans`** are character spans telling Teich what assistant/tool tokens should become labels later.
 - **Original columns are removed** after formatting.
-- **Oversized examples are only measured and dropped** if `drop_oversized_examples=True`; token IDs are not kept by [prepare_data](cci:1://file:///c:/Users/aranr/Documents/github/agentic-datagen/v2/src/teich/prepare.py:141:0-206:5).
+- **Oversized examples are measured and dropped** if `drop_oversized_examples=True`; token IDs are kept only when `tokenize=True`.
 
 # [mask_data](cci:1://file:///c:/Users/aranr/Documents/github/agentic-datagen/v2/src/teich/formatter.py:1252:0-1360:18) Flow
 

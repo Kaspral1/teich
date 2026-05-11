@@ -58,6 +58,7 @@ train_dataset = prepare_data(
     train_on_reasoning=True,
     max_length=MAX_SEQ_LEN,
     drop_oversized_examples=True,
+    tokenize=True,
     strict=True,
 )
 
@@ -100,4 +101,3 @@ tokenizer.save_pretrained(f"{OUTPUT_DIR}/lora")
 
 if HUB_REPO_ID and HF_TOKEN:
     model.push_to_hub_merged(HUB_REPO_ID, tokenizer, save_method="merged_16bit", token=HF_TOKEN)
-

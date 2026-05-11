@@ -41,6 +41,7 @@ def test_build_traces_readme_includes_model_and_references_tools(tmp_path: Path)
     assert "dataset_text_field='text'" in readme
     assert "max_length=MAX_SEQ_LEN" in readme
     assert "max_examples=500" in readme
+    assert "tokenize=True" in readme
     assert "packing=False" in readme
     assert "trainer_stats = trainer.train(resume_from_checkpoint=False)" in readme
     assert "torch.cuda.get_device_properties(0)" in readme

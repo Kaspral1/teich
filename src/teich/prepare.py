@@ -47,6 +47,7 @@ def prepare_data(
     train_on_reasoning: bool = True,
     max_length: int | None = None,
     drop_oversized_examples: bool = True,
+    tokenize: bool = False,
     strict: bool = True,
     verbose: bool = True,
 ) -> Dataset:
@@ -72,6 +73,7 @@ def prepare_data(
                 train_on_reasoning=train_on_reasoning,
                 max_length=max_length,
                 drop_oversized_examples=drop_oversized_examples,
+                tokenize=tokenize,
                 strict=strict,
                 verbose=verbose,
             )
@@ -92,6 +94,7 @@ def prepare_data(
         train_on_reasoning=train_on_reasoning,
         max_length=max_length,
         drop_oversized_examples=drop_oversized_examples,
+        tokenize=tokenize,
         strict=strict,
         verbose=verbose,
     )

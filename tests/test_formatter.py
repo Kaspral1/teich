@@ -157,6 +157,40 @@ class TrainerStyleTokenizer(OffsetCountingTokenizer):
         return self._vocab.setdefault(token, len(self._vocab) + 1)
 
 
+class SpecialTokenWrappingTokenizer(TrainerStyleTokenizer):
+    bos_token = "<bos>"
+    eos_token = "<eos>"
+
+    def __init__(self):
+        super().__init__()
+        self._vocab[self.bos_token] = 10_001
+        self._vocab[self.eos_token] = 10_002
+        self._reverse_vocab[10_001] = self.bos_token
+        self._reverse_vocab[10_002] = self.eos_token
+
+    def __call__(
+        self,
+        text=None,
+        add_special_tokens=True,
+        return_attention_mask=True,
+        return_offsets_mapping=False,
+        **kwargs,
+    ):
+        output = super().__call__(
+            text,
+            add_special_tokens=False,
+            return_attention_mask=return_attention_mask,
+            return_offsets_mapping=return_offsets_mapping,
+        )
+        if add_special_tokens:
+            output["input_ids"] = [self._vocab[self.bos_token], *output["input_ids"], self._vocab[self.eos_token]]
+            if return_attention_mask:
+                output["attention_mask"] = [1, *output["attention_mask"], 1]
+            if return_offsets_mapping:
+                output["offset_mapping"] = [(0, 0), *output["offset_mapping"], (0, 0)]
+        return output
+
+
 class LengthFilteringTokenizer(TrainerStyleTokenizer):
     def __init__(self):
         super().__init__()
@@ -753,6 +787,37 @@ def test_prepare_data_renders_text_and_supervised_spans_for_trainer_flow():
     assert supervised_text == "<think>think</think>world</assistant>"
 
 
+def test_prepare_data_can_emit_tokenized_rows_for_trainer_skip_prepare_flow():
+    tokenizer = TrainerStyleTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world", "reasoning_content": "think"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared = prepare_data(dataset, tokenizer, tokenize=True, verbose=False)
+    trainer = SimpleNamespace(
+        train_dataset=prepared,
+        eval_dataset=None,
+        processing_class=tokenizer,
+        args=SimpleNamespace(dataset_text_field="text", packing=False),
+    )
+
+    trainer = mask_data(trainer, audit=True)
+
+    assert set(prepared.column_names) == {"text", "teich_supervised_spans", "input_ids", "attention_mask"}
+    row = trainer.train_dataset[0]
+    assert set(trainer.train_dataset.column_names) == {"input_ids", "labels"}
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    assert supervised_text == "<think>think</think>world</assistant>"
+
+
 def test_prepare_data_filters_oversized_rows_without_returning_tokens():
     tokenizer = LengthFilteringTokenizer()
     dataset = Dataset.from_list(
@@ -784,6 +849,34 @@ def test_prepare_data_filters_oversized_rows_without_returning_tokens():
     assert "ok</assistant>" in prepared[0]["text"]
     assert tokenizer.return_attention_mask_values
     assert set(tokenizer.return_attention_mask_values) == {False}
+
+
+def test_prepare_data_filters_oversized_rows_with_tokenized_mode():
+    tokenizer = LengthFilteringTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "short"},
+                    {"role": "assistant", "content": "ok"},
+                ],
+                "tools": [],
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "short"},
+                    {"role": "assistant", "content": "x" * 100},
+                ],
+                "tools": [],
+            },
+        ]
+    )
+
+    prepared = prepare_data(dataset, tokenizer, max_length=60, tokenize=True, verbose=False)
+
+    assert prepared.num_rows == 1
+    assert set(prepared.column_names) == {"text", "teich_supervised_spans", "input_ids", "attention_mask"}
+    assert "ok</assistant>" in prepared[0]["text"]
 
 
 def test_prepare_data_can_keep_oversized_rows_for_trainer_truncation():
@@ -928,6 +1021,38 @@ def test_mask_data_applies_teich_labels_after_trainer_tokenization():
     assert "<system>system rules</system>" in masked_text
     assert "<user>first request</user>" in masked_text
     assert "<tool>file_a.py</tool>" in masked_text
+
+
+def test_mask_data_aligns_trainer_added_special_tokens_to_teich_spans():
+    tokenizer = SpecialTokenWrappingTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world", "reasoning_content": "think"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+    prepared = prepare_data(dataset, tokenizer, verbose=False)
+    trainer_dataset = prepared.map(lambda row: {"input_ids": tokenizer(text=row["text"])["input_ids"]})
+    trainer = SimpleNamespace(
+        train_dataset=trainer_dataset,
+        eval_dataset=None,
+        processing_class=tokenizer,
+        args=SimpleNamespace(dataset_text_field="text", packing=False),
+    )
+
+    trainer = mask_data(trainer, audit=True)
+
+    row = trainer.train_dataset[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    masked_text = tokenizer.decode([token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100])
+    assert supervised_text == "<think>think</think>world</assistant>"
+    assert "<bos>" in masked_text
+    assert "<eos>" in masked_text
 
 
 def test_mask_data_tokenizes_prepared_text_when_trainer_has_not_tokenized():
@@ -2063,5 +2188,3 @@ def test_prepare_data_falls_back_for_gemma4_text_parts_and_tool_roles():
     assert "<tool_response" in prepared[0]["text"]
     assert "<tool_call>bash</tool_call>" in prepared[0]["text"]
     assert prepared[0]["teich_supervised_spans"]
-
-
