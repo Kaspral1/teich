@@ -16,6 +16,10 @@ _GEMMA_TURN_END = "<turn|>\n"
 _GEMMA_THOUGHT_PREFIX = "<|channel>thought\n"
 _GEMMA_TOOL_RESPONSE_START = "<|tool_response>"
 _GEMMA_TOOL_RESPONSE_END = "<tool_response|>"
+_TOOL_RESPONSE_DELIMITERS = (
+    (_GEMMA_TOOL_RESPONSE_START, _GEMMA_TOOL_RESPONSE_END),
+    ("<tool_response>", "</tool_response>"),
+)
 _ASSISTANT_BLOCK_START_TOKENS = (
     "<|im_start|>assistant\n",
     "<|start_header_id|>assistant<|end_header_id|>\n\n",
@@ -343,7 +347,7 @@ def _gemma_like_supervised_spans(text: str) -> list[tuple[int, int]]:
     turn_matches = list(_GEMMA_TURN_START_PATTERN.finditer(text))
     if not turn_matches:
         return []
-    tool_response_spans = _find_delimited_spans(text, _GEMMA_TOOL_RESPONSE_START, _GEMMA_TOOL_RESPONSE_END)
+    tool_response_spans = _tool_response_spans(text)
     supervised_spans: list[tuple[int, int]] = []
     for index, match in enumerate(turn_matches):
         if match.group(1) != "model":
@@ -357,6 +361,13 @@ def _gemma_like_supervised_spans(text: str) -> list[tuple[int, int]]:
         if supervised_start < block_end:
             supervised_spans.append((supervised_start, block_end))
     return _subtract_spans(supervised_spans, tool_response_spans)
+
+
+def _tool_response_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for start_token, end_token in _TOOL_RESPONSE_DELIMITERS:
+        spans.extend(_find_delimited_spans(text, start_token, end_token))
+    return _merge_spans(spans)
 
 
 def _marker_dict_keys(value: dict[Any, Any]) -> list[Any]:
@@ -795,6 +806,7 @@ def _infer_supervised_spans_from_rendered_text(text: str, *, train_on_reasoning:
                 supervised_spans.append((content_start, block_end))
             cursor = max(block_end, content_start + 1)
     supervised_spans = _merge_spans(supervised_spans)
+    supervised_spans = _subtract_spans(supervised_spans, _tool_response_spans(text))
     if not train_on_reasoning:
         supervised_spans = _subtract_spans(supervised_spans, _reasoning_spans(text))
     return supervised_spans
@@ -853,10 +865,7 @@ def _supervised_text_and_spans(
         assistant_prompt_prefixes,
         train_on_reasoning,
     )
-    supervised_spans = _subtract_spans(
-        supervised_spans,
-        _find_delimited_spans(formatted_text, _GEMMA_TOOL_RESPONSE_START, _GEMMA_TOOL_RESPONSE_END),
-    )
+    supervised_spans = _subtract_spans(supervised_spans, _tool_response_spans(formatted_text))
     if not train_on_reasoning:
         supervised_spans = _subtract_spans(supervised_spans, _reasoning_spans(formatted_text))
     return formatted_text, supervised_spans

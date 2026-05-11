@@ -451,6 +451,45 @@ class MarkerSensitiveOffsetTokenizer(OffsetCountingTokenizer):
         return rendered
 
 
+class EmbeddedToolResponseFallbackTokenizer(OffsetCountingTokenizer):
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize=False,
+        add_generation_prompt=False,
+        tools=None,
+        **kwargs,
+    ):
+        rendered_parts = []
+        for index, message in enumerate(messages):
+            role = message["role"]
+            if role == "user":
+                rendered_parts.append(f"<user>{message.get('content', '')}</user>")
+                continue
+            if role == "tool":
+                continue
+            if role == "assistant":
+                rendered_parts.append("<assistant>")
+                for tool_call in message.get("tool_calls") or []:
+                    rendered_parts.append(f"<tool_call>{tool_call['function']['name']}</tool_call>")
+                if index + 1 < len(messages) and messages[index + 1].get("role") == "tool":
+                    rendered_parts.append(f"<tool_response>{messages[index + 1].get('content', '')}</tool_response>")
+                if message.get("content"):
+                    rendered_parts.append(str(message["content"]))
+                rendered_parts.append("</assistant>")
+                continue
+            raise AssertionError(f"Unexpected role: {role}")
+        if add_generation_prompt:
+            rendered_parts.append("<assistant>")
+        rendered = "".join(rendered_parts)
+        if "\ue000AGD" in rendered:
+            rendered += "<marker-side-effect>"
+        if tokenize:
+            return self(rendered)
+        return rendered
+
+
 def test_prepare_and_mask_supervises_only_assistant_turns_across_multi_turn_conversation():
     tokenizer = FakeTokenizer()
     dataset = Dataset.from_list(
@@ -816,6 +855,76 @@ def test_prepare_data_can_emit_tokenized_rows_for_trainer_skip_prepare_flow():
     assert set(trainer.train_dataset.column_names) == {"input_ids", "labels"}
     supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
     assert supervised_text == "<think>think</think>world</assistant>"
+
+
+def test_tokenized_prepare_data_survives_unsloth_style_skip_prepare_columns():
+    tokenizer = TrainerStyleTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world", "reasoning_content": "think"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared = prepare_data(dataset, tokenizer, tokenize=True, verbose=False)
+    # Unsloth skips text tokenization when input_ids already exist. The important
+    # contract is that setup must not go through the text-tokenize/remove-columns path.
+    trainer_dataset = prepared
+    trainer = SimpleNamespace(
+        train_dataset=trainer_dataset,
+        eval_dataset=None,
+        processing_class=tokenizer,
+        args=SimpleNamespace(dataset_text_field="text", packing=False),
+    )
+
+    trainer = mask_data(trainer, audit=True)
+
+    row = trainer.train_dataset[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    assert supervised_text == "<think>think</think>world</assistant>"
+
+
+def test_text_only_trainer_column_drop_loses_teich_spans_and_uses_fallback():
+    class MarkerlessTokenizer(TrainerStyleTokenizer):
+        def apply_chat_template(self, messages, *, tokenize=False, add_generation_prompt=False, tools=None, **kwargs):
+            rendered = "|".join(str(message.get("content") or "") for message in messages)
+            if tokenize:
+                return self(rendered)
+            return rendered
+
+    tokenizer = MarkerlessTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+    prepared = prepare_data(dataset, tokenizer, verbose=False)
+    # Simulate the destructive standard text tokenization path used by optimized
+    # trainers: only input_ids survive, so Teich's exact spans are gone.
+    trainer_dataset = prepared.map(
+        lambda row: {"input_ids": tokenizer(text=row["text"])["input_ids"]},
+        remove_columns=prepared.column_names,
+    )
+    trainer = SimpleNamespace(
+        train_dataset=trainer_dataset,
+        eval_dataset=None,
+        processing_class=tokenizer,
+        args=SimpleNamespace(dataset_text_field="text", packing=False),
+    )
+
+    with pytest.raises(ValueError, match="fully masked"):
+        mask_data(trainer, audit=False)
 
 
 def test_prepare_data_filters_oversized_rows_without_returning_tokens():
@@ -1884,6 +1993,51 @@ def test_prepare_and_mask_strict_rejects_marker_render_mismatch():
 
     with pytest.raises(ValueError, match="Marker-injected chat template output"):
         prepare_and_mask_for_test(dataset, tokenizer, strict=True)
+
+
+def test_prepare_and_mask_fallback_masks_embedded_tool_responses():
+    tokenizer = EmbeddedToolResponseFallbackTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "inspect"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": {"command": "ls"}},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "name": "bash", "content": "SECRET_TOOL_OUTPUT"},
+                    {"role": "assistant", "content": "done"},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    training_data = prepare_and_mask_for_test(dataset, tokenizer, strict=False)
+
+    row = training_data[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    masked_text = tokenizer.decode([token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100])
+    assert "<tool_call>bash</tool_call>" in supervised_text
+    assert "done</assistant>" in supervised_text
+    assert "SECRET_TOOL_OUTPUT" not in supervised_text
+    assert "SECRET_TOOL_OUTPUT" in masked_text
 
 
 def _real_template_tool_call_dataset():

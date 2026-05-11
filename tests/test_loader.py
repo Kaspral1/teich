@@ -301,6 +301,64 @@ def test_load_traces_rejects_negative_max_examples(tmp_path: Path):
         load_traces(tmp_path, split="train", max_examples=-1)
 
 
+def test_load_traces_filters_rows_without_assistant_training_signal(tmp_path: Path):
+    dataset_file = tmp_path / "mixed.jsonl"
+    dataset_file.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": "Hello"},
+                            {"role": "assistant", "content": ""},
+                        ],
+                        "prompt": "Hello",
+                        "response": "",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": "Hello"},
+                            {"role": "assistant", "content": "Hi"},
+                        ],
+                        "prompt": "Hello",
+                        "response": "Hi",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    dataset = load_traces(dataset_file)
+
+    assert dataset.num_rows == 1
+    assert dataset[0]["messages"][-1]["content"] == "Hi"
+
+
+def test_load_traces_raises_when_all_rows_lack_assistant_training_signal(tmp_path: Path):
+    dataset_file = tmp_path / "empty.jsonl"
+    dataset_file.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": ""},
+                ],
+                "prompt": "Hello",
+                "response": "",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="assistant training signal"):
+        load_traces(dataset_file)
+
+
 def test_dataset_from_rows_falls_back_when_on_mixed_types_is_unsupported():
     rows = [
         {

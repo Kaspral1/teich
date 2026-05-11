@@ -100,6 +100,46 @@ def _apply_tools_snapshot(rows: list[dict], tools: list[dict[str, Any]]) -> list
     return updated_rows
 
 
+def _message_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if not isinstance(value, list):
+        return ""
+    parts: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            parts.append(item.strip())
+            continue
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts).strip()
+
+
+def _row_has_training_signal(row: dict[str, Any]) -> bool:
+    messages = row.get("messages")
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") not in {"assistant", "model"}:
+            continue
+        if _message_text(message.get("content")):
+            return True
+        reasoning_content = message.get("reasoning_content")
+        if isinstance(reasoning_content, str) and reasoning_content.strip():
+            return True
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            return True
+    return False
+
+
+def _filter_rows_with_training_signal(rows: list[dict]) -> list[dict]:
+    return [row for row in rows if _row_has_training_signal(row)]
+
+
 def _resolve_hf_token(token: str | None, hf_token: str | None) -> str | None:
     if token is not None and hf_token is not None and token != hf_token:
         raise ValueError("Pass only one of token or hf_token, or pass the same value for both.")
@@ -141,6 +181,10 @@ def load_traces(
         if split and traces_dir == root and root.is_dir():
             raise ValueError(f"No trace files found in {location} for split '{split}'.")
         raise ValueError(f"No JSONL trace or training data files found in {location}.")
+    rows = _filter_rows_with_training_signal(rows)
+    if not rows:
+        location = traces_dir if traces_dir != root else root
+        raise ValueError(f"No trace or training data rows with assistant training signal found in {location}.")
     snapshot_root = root if root.is_dir() else root.parent
     rows = _apply_tools_snapshot(rows, _load_tools_snapshot(snapshot_root))
     dataset = _dataset_from_rows(rows)
