@@ -6,7 +6,7 @@ Teich is not only a dataset generator. It is a bridge between messy agent/chat d
 
 Start from any of these:
 
-- Fresh Codex or Pi traces
+- Fresh Codex, Pi, Claude Code, or Hermes traces
 - Text-only chat generations
 - Local JSONL files or folders
 - Hugging Face datasets
@@ -59,7 +59,7 @@ Use only the pieces you need:
 
 | Goal | Use |
 | --- | --- |
-| Generate coding-agent traces | `teich generate` with `agent.provider: codex` or `pi` |
+| Generate coding-agent traces | `teich generate` with `agent.provider: codex`, `pi`, `claude-code`, or `hermes` |
 | Generate text-only chat rows | `teich generate` with `agent.provider: chat` |
 | Load raw traces manually | `load_traces()` |
 | Prepare local/HF/mixed datasets for training | `prepare_data()` |
@@ -92,7 +92,7 @@ uvx teich generate -c config.yaml
 
 - **Trace-first data collection**: Run real coding agents and keep raw session traces as the source of truth.
 - **Dataset-first training**: Load existing JSONL files, folders, Hugging Face repos, or `datasets.Dataset` objects without using the generator.
-- **Multi-provider generation**: Works with Docker-backed Codex/Pi and a direct OpenAI-compatible `chat` mode.
+- **Multi-provider generation**: Works with Docker-backed Codex, Pi, Claude Code, Hermes, and a direct OpenAI-compatible `chat` mode.
 - **Structured conversion**: Converts traces into chat messages with tool calls, reasoning, tool results, metadata, and configured tool snapshots.
 - **Universal masking surface**: Supports assistant reasoning, final answers, tool calls, user/system/developer text, and tool responses as independently configurable masking targets.
 - **Multi-turn and tool-aware labels**: Avoids Unsloth-style single-span masking pitfalls by storing typed spans before tokenization and aligning them after trainer tokenization.
@@ -104,7 +104,7 @@ uvx teich generate -c config.yaml
 Requirements for agent trace generation:
 
 - Docker
-- OpenAI/OpenRouter API key (or local OpenAI-compatible endpoint)
+- API key for the configured provider, such as OpenAI, OpenRouter, or Anthropic. Local OpenAI-compatible endpoints are also supported where the selected runner can use them.
 
 `agent.provider: chat` does not require Docker.
 
@@ -170,7 +170,9 @@ teich generate -c config.yaml
 
 Outputs:
 
-- `codex` / `pi`: raw traces in `output/`, sandboxes in `sandbox/`, and a `README.md`
+- `codex` / `pi`: normalized copies of native agent session JSONL files in `output/`, sandboxes in `sandbox/`, and a `README.md`
+- `claude-code`: captured native stream output in Teich `external_*` trace JSONL files, sandboxes in `sandbox/`, and a `README.md`
+- `hermes`: one Teich `external_*` trace JSONL per Hermes native session from `state.db`, including delegated subagent sessions as separate files linked by `parent_session_id`, sandboxes in `sandbox/`, and a `README.md`
 - `chat`: text-only JSONL training rows in `output/` and a dataset `README.md`
 
 If `publish.repo_id` is configured, Teich also creates or updates the matching Hugging Face **dataset** repo.
@@ -201,7 +203,15 @@ Recommended `prompts.jsonl`:
 {"prompt":"Draft a compact project plan","follow_up_prompts":["Revise it for a solo developer","Add a risk checklist"]}
 ```
 
-`follow_up_prompts` is supported across providers. `chat` sends each follow-up as a real additional user turn in one generated training row. `codex` and `pi` keep one Docker container alive for the full prompt sequence, run the initial prompt, then resume the same saved agent session for each follow-up so workspace edits, tool caches, and in-container installs remain available across turns.
+`follow_up_prompts` is supported across providers. `chat` sends each follow-up as a real additional user turn in one generated training row. Agent runners keep one Docker container alive for the full prompt sequence, run the initial prompt, then resume or continue the same saved agent session for each follow-up so workspace edits, tool caches, and in-container installs remain available across turns.
+
+### Provider notes
+
+- `codex` copies the native Codex session JSONL out of the mounted `CODEX_HOME/sessions` directory, then normalizes known Codex event-shape edge cases.
+- `pi` copies the native Pi session JSONL out of the mounted `/home/codex/pi-sessions` directory, then normalizes and validates tool-call structure before writing output.
+- `claude-code` captures Claude Code `stream-json` output into Teich `external_*` trace events. With OpenRouter non-Claude models, Teich runs a local in-container proxy: Claude Code sees a Claude surrogate model name, while the proxy rewrites outbound requests back to the configured model. Teich metadata keeps the configured model id.
+- `hermes` runs with built-in toolsets `safe,terminal,file,skills,memory,session_search,delegation`, then exports Hermes Agent native `state.db` sessions into Teich `external_*` trace events with provider/model metadata. Delegated subagents remain separate trace files rather than being merged into the orchestrator session; child traces include `parent_session_id`.
+- `chat` calls an OpenAI-compatible API directly and writes structured training rows instead of raw agent traces.
 
 ### Generate a text-only chat dataset
 
@@ -396,7 +406,7 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 
 ```yaml
 agent:
-  provider: codex  # or pi or chat
+  provider: codex  # or pi, claude-code, hermes, or chat
 
 model:
   model: codex-mini-latest
@@ -426,7 +436,7 @@ publish:
 
 Dataset tags are auto-generated from the provider and model:
 
-- `codex` / `pi`: `agent-traces`, `<provider>`, `distillation`, `<model>`, `teich`
+- `codex` / `pi` / `claude-code` / `hermes`: `agent-traces`, `<provider>`, `distillation`, `<model>`, `teich`
 - `chat`: `conversational`, `distillation`, `teich`, `<model>`
 
 If `publish.hf_token` is omitted, Teich also accepts `HF_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, or `TEICH_HF_TOKEN` from the environment.
@@ -484,7 +494,7 @@ from teich import (
 
 ## 📦 Trace-First Workflow
 
-Teich preserves the **raw agent session** as the source of truth:
+Teich preserves the **raw or native captured agent session** as the source of truth:
 
 1. **Collect**: Run agents on real tasks → raw `.jsonl` traces
 2. **Inspect/Share**: Traces are human-readable and uploadable

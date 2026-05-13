@@ -1,5 +1,15 @@
 # Next Audit Targets
 
+Current repo verification after provider-trace updates:
+
+- `uv run ruff check src tests` -> `All checks passed!`
+- `uv run pytest -q` -> `226 passed, 20 skipped`
+
+Provider-trace follow-up:
+
+- Hermes now runs with built-in toolsets `safe,terminal,file,skills,memory,session_search,delegation`.
+- Hermes `state.db` sessions are exported as separate Teich external trace files. Delegated subagent traces are linked to their orchestrator with `parent_session_id`, rather than merged into the parent session.
+
 - [x] Exercise a real or close-to-real Unsloth `SFTTrainer` flow and inspect columns immediately before `mask_data()`.
   - Added regression coverage for the destructive text-tokenization/remove-columns path and the `tokenize=True` skip-prepare path.
 - [x] Test the recommended README flow against real Qwen/Gemma tokenizers with current TRL/Unsloth versions.

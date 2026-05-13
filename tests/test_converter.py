@@ -328,6 +328,68 @@ def test_convert_external_agent_trace(tmp_path: Path):
     ]
 
 
+def test_convert_external_agent_trace_preserves_hermes_tool_calls_and_parent_metadata(tmp_path: Path):
+    trace_file = tmp_path / "hermes-child.jsonl"
+    events = [
+        {
+            "type": "external_session_meta",
+            "payload": {
+                "id": "child-session",
+                "source": "hermes-agent",
+                "model_provider": "hermes",
+                "model": "minimax/minimax-m2.5:free",
+                "parent_session_id": "parent-session",
+                "tool_call_count": 1,
+                "input_tokens": 12,
+                "output_tokens": 5,
+            },
+        },
+        {"type": "external_message", "role": "user", "content": "Delegate a task"},
+        {
+            "type": "external_message",
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "delegate_task",
+                        "arguments": {"prompt": "sub task"},
+                    },
+                }
+            ],
+        },
+        {
+            "type": "external_message",
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "delegate_task",
+            "content": "subagent smoke ok",
+        },
+        {"type": "external_message", "role": "assistant", "content": "Done.", "reasoning_content": "Checked output."},
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.metadata["parent_session_id"] == "parent-session"
+    assert example.metadata["tool_call_count"] == 1
+    assert example.metadata["input_tokens"] == 12
+    assert example.messages[1]["tool_calls"][0]["function"] == {
+        "name": "delegate_task",
+        "arguments": {"prompt": "sub task"},
+    }
+    assert example.messages[2] == {
+        "role": "tool",
+        "content": "subagent smoke ok",
+        "tool_call_id": "call_1",
+        "name": "delegate_task",
+    }
+    assert example.messages[3]["reasoning_content"] == "Checked output."
+    assert [tool["function"]["name"] for tool in example.tools] == ["delegate_task"]
+
+
 def test_convert_trace_uses_reasoning_text_when_summary_is_empty(tmp_path: Path):
     trace_file = tmp_path / "trace.jsonl"
     events = [

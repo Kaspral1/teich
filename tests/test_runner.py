@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import io
 import json
 from pathlib import Path
+import sqlite3
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -288,6 +289,7 @@ def test_hermes_runner_uses_chat_query_and_prompt_file(tmp_path: Path):
     assert long_prompt not in command
     assert "hermes chat --provider openrouter" in command_text
     assert "--model codex-mini-latest" in command_text
+    assert "--toolsets safe,terminal,file,skills,memory,session_search,delegation" in command_text
     assert "--ignore-user-config" in command_text
     assert '--source teich -q "$(cat /workspace/.teich-prompt.txt)"' in command_text
     assert "OPENROUTER_API_KEY=sk-or-test" in command
@@ -295,6 +297,116 @@ def test_hermes_runner_uses_chat_query_and_prompt_file(tmp_path: Path):
     assert rows[0]["payload"]["source"] == "hermes-agent"
     assert rows[-1]["role"] == "assistant"
     assert rows[-1]["content"] == "done"
+
+
+def test_hermes_runner_exports_delegated_sessions_as_separate_files(tmp_path: Path):
+    config = Config(
+        agent={"provider": "hermes"},
+        api=APIConfig(provider="openrouter"),
+        model=ModelConfig(model="minimax/minimax-m2.5:free"),
+        output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"},
+    )
+    with patch.object(HermesRunner, "_ensure_image"):
+        runner = HermesRunner(config)
+
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    state_db = home_dir / "state.db"
+    connection = sqlite3.connect(state_db)
+    connection.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT,
+            model TEXT,
+            model_config TEXT,
+            system_prompt TEXT,
+            parent_session_id TEXT,
+            started_at REAL,
+            updated_at REAL,
+            last_message_at REAL,
+            message_count INTEGER,
+            tool_call_count INTEGER,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            total_tokens INTEGER,
+            total_cost REAL,
+            has_finished INTEGER
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            role TEXT,
+            content TEXT,
+            tool_call_id TEXT,
+            tool_calls TEXT,
+            tool_name TEXT,
+            timestamp REAL,
+            token_count INTEGER,
+            finish_reason TEXT,
+            reasoning TEXT,
+            reasoning_content TEXT
+        );
+        """
+    )
+    connection.executemany(
+        """
+        INSERT INTO sessions VALUES (
+            ?, 'cli', ?, '{}', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1
+        )
+        """,
+        [
+            ("parent-session", "minimax/minimax-m2.5:free", None, 1_778_672_000, 1_778_672_001, 1_778_672_001, 3, 1, 10, 4, 14, 0.0),
+            ("child-session", "minimax/minimax-m2.5:free", "parent-session", 1_778_672_002, 1_778_672_003, 1_778_672_003, 2, 0, 5, 3, 8, 0.0),
+        ],
+    )
+    connection.executemany(
+        """
+        INSERT INTO messages (
+            session_id, role, content, tool_call_id, tool_calls, tool_name,
+            timestamp, token_count, finish_reason, reasoning, reasoning_content
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            ("parent-session", "user", "delegate this", None, None, None, 1_778_672_000, None, None, None, None),
+            (
+                "parent-session",
+                "assistant",
+                "",
+                None,
+                json.dumps(
+                    [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "delegate_task", "arguments": {"prompt": "sub task"}},
+                        }
+                    ]
+                ),
+                None,
+                1_778_672_001,
+                None,
+                None,
+                None,
+                None,
+            ),
+            ("child-session", "user", "sub task", None, None, None, 1_778_672_002, None, None, None, None),
+            ("child-session", "assistant", "subagent smoke ok", None, None, None, 1_778_672_003, None, None, None, None),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    exported = runner._export_hermes_state_sessions(home_dir, tmp_path / "workspace")
+
+    assert set(exported) == {"parent-session", "child-session"}
+    parent_rows = [json.loads(line) for line in exported["parent-session"].read_text(encoding="utf-8").splitlines()]
+    child_rows = [json.loads(line) for line in exported["child-session"].read_text(encoding="utf-8").splitlines()]
+    assert exported["parent-session"] != exported["child-session"]
+    assert parent_rows[0]["payload"]["parent_session_id"] is None
+    assert child_rows[0]["payload"]["parent_session_id"] == "parent-session"
+    assert child_rows[1]["role"] == "user"
+    assert child_rows[2]["content"] == "subagent smoke ok"
 
 
 def test_run_process_removes_named_container_on_failure():

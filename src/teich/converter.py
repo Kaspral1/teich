@@ -662,6 +662,8 @@ def _convert_external_agent_trace_to_training_example(
     events: list[dict[str, Any]],
 ) -> TrainingExample:
     messages: list[dict[str, Any]] = []
+    tool_names: set[str] = set()
+    tool_argument_samples: dict[str, list[Any]] = {}
     session_meta: dict[str, Any] = {}
     prompt = ""
     for event in events:
@@ -681,8 +683,64 @@ def _convert_external_agent_trace_to_training_example(
         normalized_role = _normalize_role(role)
         if normalized_role == "user" and content.strip() and not prompt:
             prompt = content.strip()
-        if content.strip() or normalized_role == "assistant":
-            messages.append({"role": normalized_role, "content": content})
+        if normalized_role == "tool":
+            message: dict[str, Any] = {"role": "tool", "content": content}
+            tool_call_id = event.get("tool_call_id")
+            if isinstance(tool_call_id, str) and tool_call_id:
+                message["tool_call_id"] = tool_call_id
+            tool_name = event.get("name") or event.get("tool_name")
+            if isinstance(tool_name, str) and tool_name:
+                message["name"] = tool_name
+                tool_names.add(tool_name)
+            messages.append(message)
+            continue
+
+        message = {"role": normalized_role, "content": content}
+        reasoning = event.get("reasoning_content") or event.get("reasoning")
+        if isinstance(reasoning, str) and reasoning.strip():
+            message["reasoning_content"] = reasoning.strip()
+        raw_tool_calls = _normalize_json_like_value(event.get("tool_calls"))
+        tool_calls: list[dict[str, Any]] = []
+        if isinstance(raw_tool_calls, list):
+            for raw_tool_call in raw_tool_calls:
+                if not isinstance(raw_tool_call, dict):
+                    continue
+                function = raw_tool_call.get("function")
+                function_name = None
+                arguments: Any = {}
+                if isinstance(function, dict):
+                    value = function.get("name")
+                    if isinstance(value, str) and value:
+                        function_name = value
+                    arguments = _parse_function_arguments(function.get("arguments"))
+                value = raw_tool_call.get("name")
+                if function_name is None and isinstance(value, str) and value:
+                    function_name = value
+                if not function_name:
+                    continue
+                tool_call_id = raw_tool_call.get("id") or event.get("tool_call_id")
+                if not isinstance(tool_call_id, str) or not tool_call_id:
+                    tool_call_id = f"{function_name}_{len(tool_calls) + 1}"
+                tool_names.add(function_name)
+                tool_argument_samples.setdefault(function_name, []).append(arguments)
+                tool_calls.append(
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": function_name,
+                            "arguments": arguments,
+                        },
+                    }
+                )
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        if content.strip() or normalized_role == "assistant" or tool_calls or "reasoning_content" in message:
+            messages.append(message)
+    tools = [
+        _build_tool_entry(name, {"parameters": _infer_tool_parameters_schema(tool_argument_samples.get(name, []))})
+        for name in sorted(tool_names)
+    ]
     metadata = {
         "source_file": trace_file.name,
         "session_id": session_meta.get("id") or trace_file.stem,
@@ -691,13 +749,21 @@ def _convert_external_agent_trace_to_training_example(
         "model": session_meta.get("model"),
         "cwd": session_meta.get("cwd"),
         "cli_version": session_meta.get("cli_version"),
+        "parent_session_id": session_meta.get("parent_session_id"),
+        "hermes_source": session_meta.get("hermes_source"),
+        "message_count": session_meta.get("message_count"),
+        "tool_call_count": session_meta.get("tool_call_count"),
+        "input_tokens": session_meta.get("input_tokens"),
+        "output_tokens": session_meta.get("output_tokens"),
+        "total_tokens": session_meta.get("total_tokens"),
+        "total_cost": session_meta.get("total_cost"),
         "turn_count": sum(1 for message in messages if message.get("role") == "user"),
     }
     return TrainingExample(
         source_file=trace_file,
         prompt=prompt,
         messages=messages,
-        tools=[],
+        tools=tools,
         metadata=metadata,
     )
 

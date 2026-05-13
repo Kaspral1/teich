@@ -10,6 +10,7 @@ import queue
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -37,6 +38,7 @@ HERMES_HOME_IN_CONTAINER = "/home/codex/.hermes"
 PI_AGENT_DIR_IN_CONTAINER = "/home/codex/.pi/agent"
 PI_SESSIONS_DIR_IN_CONTAINER = "/home/codex/pi-sessions"
 WORKSPACE_IN_CONTAINER = "/workspace"
+HERMES_DEFAULT_TOOLSETS = "safe,terminal,file,skills,memory,session_search,delegation"
 LOCAL_PROVIDER_PROXY_SCRIPT_NAME = "local_provider_proxy.js"
 CLAUDE_OPENROUTER_PROXY_SCRIPT_NAME = "claude_openrouter_proxy.js"
 CLAUDE_OPENROUTER_PROXY_PORT = 17891
@@ -870,6 +872,15 @@ class DockerRuntimeRunner:
                             metrics.provider = provider.strip()
                         if isinstance(model, str) and model.strip() and not metrics.model:
                             metrics.model = model.strip()
+                        input_tokens = TraceMetrics._int_value(payload.get("input_tokens"))
+                        output_tokens = TraceMetrics._int_value(payload.get("output_tokens"))
+                        total_tokens = TraceMetrics._int_value(payload.get("total_tokens"))
+                        metrics.input_tokens += input_tokens
+                        metrics.output_tokens += output_tokens
+                        metrics.total_tokens += total_tokens or input_tokens + output_tokens
+                        cost = payload.get("total_cost")
+                        if isinstance(cost, int | float):
+                            metrics.total_cost += float(cost)
                     continue
 
                 if event_type == "system" and event.get("subtype") == "init":
@@ -2142,7 +2153,6 @@ class HermesRunner(ExternalCliRunner):
     default_model_provider = "hermes"
 
     def _build_shell_command(self, *, continue_session: bool = False) -> str:
-        del continue_session
         prompt_path = shlex.quote(WORKSPACE_IN_CONTAINER + "/" + TEICH_PROMPT_FILE_NAME)
         hermes_command = [
             "hermes",
@@ -2151,13 +2161,253 @@ class HermesRunner(ExternalCliRunner):
             self.config.api.provider,
             "--model",
             self.config.get_effective_model(),
+            "--toolsets",
+            HERMES_DEFAULT_TOOLSETS,
             "--quiet",
             "--yolo",
             "--ignore-user-config",
             "--source",
             "teich",
         ]
+        if continue_session:
+            hermes_command.append("--continue")
         return f"{shlex.join(hermes_command)} -q \"$(cat {prompt_path})\""
+
+    @staticmethod
+    def _hermes_state_db(home_dir: Path) -> Path:
+        return home_dir / "state.db"
+
+    @staticmethod
+    def _safe_session_file_id(session_id: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_.-]+", "-", session_id.strip()) or "session"
+
+    @staticmethod
+    def _hermes_timestamp(value: Any) -> str:
+        if isinstance(value, (int, float)):
+            timestamp = value / 1000 if value > 10_000_000_000 else value
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return ExternalCliRunner._event_timestamp()
+
+    @staticmethod
+    def _json_or_original(value: Any) -> Any:
+        if not isinstance(value, str) or not value.strip():
+            return value
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+
+    @staticmethod
+    def _sqlite_row_get(row: sqlite3.Row, key: str, default: Any = None) -> Any:
+        return row[key] if key in row.keys() else default
+
+    @staticmethod
+    def _parse_hermes_stdout_session_id(stdout: str) -> str | None:
+        for line in stdout.splitlines():
+            if line.startswith("session_id:"):
+                value = line.split(":", maxsplit=1)[1].strip()
+                if value:
+                    return value
+        return None
+
+    def _hermes_session_meta_event(self, row: sqlite3.Row, workspace: Path) -> dict[str, object]:
+        session_id = str(row["id"])
+        payload: dict[str, object] = {
+            "id": session_id,
+            "timestamp": self._hermes_timestamp(self._sqlite_row_get(row, "started_at")),
+            "cwd": str(workspace),
+            "source": self.source_name,
+            "model_provider": self.default_model_provider,
+            "model": self._sqlite_row_get(row, "model") or self.config.get_effective_model(),
+            "hermes_source": self._sqlite_row_get(row, "source"),
+            "parent_session_id": self._sqlite_row_get(row, "parent_session_id"),
+            "message_count": self._sqlite_row_get(row, "message_count"),
+            "tool_call_count": self._sqlite_row_get(row, "tool_call_count"),
+            "input_tokens": self._sqlite_row_get(row, "input_tokens"),
+            "output_tokens": self._sqlite_row_get(row, "output_tokens"),
+            "total_tokens": self._sqlite_row_get(row, "total_tokens"),
+            "total_cost": self._sqlite_row_get(row, "total_cost"),
+            "has_finished": bool(self._sqlite_row_get(row, "has_finished")),
+        }
+        model_config = self._json_or_original(self._sqlite_row_get(row, "model_config"))
+        if model_config:
+            payload["model_config"] = model_config
+        system_prompt = self._sqlite_row_get(row, "system_prompt")
+        if isinstance(system_prompt, str) and system_prompt.strip():
+            payload["system_prompt"] = system_prompt
+        return {
+            "timestamp": self._hermes_timestamp(self._sqlite_row_get(row, "started_at")),
+            "type": "external_session_meta",
+            "payload": payload,
+        }
+
+    def _hermes_message_event(self, row: sqlite3.Row) -> dict[str, object]:
+        event: dict[str, object] = {
+            "timestamp": self._hermes_timestamp(self._sqlite_row_get(row, "timestamp")),
+            "type": "external_message",
+            "role": self._sqlite_row_get(row, "role") or "assistant",
+            "hermes_session_id": self._sqlite_row_get(row, "session_id"),
+            "content": self._sqlite_row_get(row, "content") or "",
+        }
+        for source_key, event_key in (
+            ("tool_call_id", "tool_call_id"),
+            ("tool_name", "name"),
+            ("finish_reason", "finish_reason"),
+            ("token_count", "token_count"),
+        ):
+            value = self._sqlite_row_get(row, source_key)
+            if value is not None and value != "":
+                event[event_key] = value
+        tool_calls = self._json_or_original(self._sqlite_row_get(row, "tool_calls"))
+        if tool_calls:
+            event["tool_calls"] = tool_calls
+        reasoning = self._sqlite_row_get(row, "reasoning_content") or self._sqlite_row_get(row, "reasoning")
+        if isinstance(reasoning, str) and reasoning.strip():
+            event["reasoning_content"] = reasoning
+        return event
+
+    def _export_hermes_state_sessions(self, home_dir: Path, workspace: Path) -> dict[str, Path]:
+        state_db = self._hermes_state_db(home_dir)
+        if not state_db.exists():
+            return {}
+        exported: dict[str, Path] = {}
+        connection = sqlite3.connect(state_db)
+        connection.row_factory = sqlite3.Row
+        try:
+            sessions = connection.execute("SELECT * FROM sessions ORDER BY started_at ASC, id ASC").fetchall()
+            for session_row in sessions:
+                session_id = str(session_row["id"])
+                destination = self._resolve_output_path(
+                    f"{self.source_name}-{self._safe_session_file_id(session_id)}.jsonl"
+                )
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                events = [self._hermes_session_meta_event(session_row, workspace)]
+                messages = connection.execute(
+                    "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp ASC, id ASC",
+                    (session_id,),
+                ).fetchall()
+                events.extend(self._hermes_message_event(message_row) for message_row in messages)
+                self._write_events(destination, events)
+                exported[session_id] = destination
+        finally:
+            connection.close()
+        return exported
+
+    def run_session(
+        self,
+        prompt: str,
+        session_id: str | None = None,
+        progress_callback: SessionProgressCallback | None = None,
+        progress_base: SessionProgressUpdate | None = None,
+        prompt_input: PromptInput | None = None,
+    ) -> Path:
+        if session_id is None:
+            session_id = str(uuid.uuid4())
+        workspace_root, workspace = self._prepare_workspace(session_id, prompt_input, self.container_kind)
+        home_dir = Path(tempfile.mkdtemp(prefix=f"{self.container_kind}-home-{session_id}-"))
+        home_dir.chmod(0o777)
+        started_at = datetime.now(timezone.utc)
+        container_name = self._container_name(self.container_kind, session_id)
+        turn_prompts = _agent_turn_prompts(prompt, prompt_input)
+        fallback_destination = self._resolve_output_path(f"{self.source_name}-{session_id}.jsonl")
+        fallback_destination.parent.mkdir(parents=True, exist_ok=True)
+        stdout_parts: list[str] = []
+        try:
+            workspace.mkdir(parents=True, exist_ok=True)
+            if len(turn_prompts) > 1:
+                self._start_container(self._build_external_persistent_container_command(workspace, home_dir, container_name))
+            for turn_index, turn_prompt in enumerate(turn_prompts):
+                (workspace / TEICH_PROMPT_FILE_NAME).write_text(turn_prompt, encoding="utf-8")
+                (workspace / TEICH_PROMPT_FILE_NAME).chmod(0o666)
+                if len(turn_prompts) > 1:
+                    command = self._build_external_exec_command(container_name, continue_session=turn_index > 0)
+                else:
+                    command = self._build_external_command(
+                        workspace,
+                        home_dir,
+                        container_name,
+                        continue_session=turn_index > 0,
+                    )
+                try:
+                    stdout, stderr = self._run_external_process(command, container_name)
+                except subprocess.CalledProcessError as exc:
+                    stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or "")
+                    stdout = exc.output if isinstance(exc.output, str) else (exc.output or "")
+                    self._export_hermes_state_sessions(home_dir, workspace)
+                    details = stderr.strip() or stdout.strip()
+                    raise RuntimeError(f"Session {session_id[:8]} failed: {details}") from exc
+                except RuntimeError:
+                    self._export_hermes_state_sessions(home_dir, workspace)
+                    raise
+                stdout_parts.append(stdout)
+                if not self._hermes_state_db(home_dir).exists():
+                    if not fallback_destination.exists():
+                        self._write_events(
+                            fallback_destination,
+                            [self._session_meta_event(session_id, started_at, workspace)],
+                        )
+                    self._write_events(
+                        fallback_destination,
+                        self._events_from_turn_output(turn_prompt, stdout, stderr, turn_index=turn_index),
+                    )
+                if progress_callback and progress_base:
+                    progress_callback(
+                        SessionProgressUpdate(
+                            prompt_id=progress_base.prompt_id,
+                            prompt_index=progress_base.prompt_index,
+                            total_prompts=progress_base.total_prompts,
+                            prompt=progress_base.prompt,
+                            prompt_preview=progress_base.prompt_preview,
+                            status="running",
+                            session_id=session_id,
+                            started_at=progress_base.started_at,
+                            trace_path=fallback_destination,
+                            metrics=self._summarize_trace_file(fallback_destination)
+                            if fallback_destination.exists()
+                            else TraceMetrics(),
+                        )
+                    )
+            final_exports = self._export_hermes_state_sessions(home_dir, workspace)
+            parsed_session_id = self._parse_hermes_stdout_session_id("\n".join(stdout_parts))
+            destination = (
+                final_exports.get(parsed_session_id)
+                or next((path for sid, path in final_exports.items() if sid.startswith(session_id)), None)
+                or next(
+                    (path for sid, path in final_exports.items() if self._trace_has_no_parent(path)),
+                    None,
+                )
+                or next(iter(final_exports.values()), fallback_destination)
+            )
+            if not final_exports and not fallback_destination.exists():
+                self._write_events(fallback_destination, [self._session_meta_event(session_id, started_at, workspace)])
+                destination = fallback_destination
+            self._copy_workspace_snapshot(workspace, self._sandbox_destination(destination))
+            return destination
+        except BaseException:
+            raise
+        finally:
+            if len(turn_prompts) > 1:
+                self._remove_container(container_name)
+            shutil.rmtree(workspace_root, ignore_errors=True)
+            shutil.rmtree(home_dir, ignore_errors=True)
+
+    @staticmethod
+    def _trace_has_no_parent(trace_path: Path) -> bool:
+        try:
+            with trace_path.open("r", encoding="utf-8") as handle:
+                first_line = handle.readline()
+        except OSError:
+            return False
+        if not first_line.strip():
+            return False
+        try:
+            event = json.loads(first_line)
+        except json.JSONDecodeError:
+            return False
+        payload = event.get("payload") if isinstance(event, dict) else None
+        return isinstance(payload, dict) and payload.get("parent_session_id") in {None, ""}
 
 
 class ChatRunner(DockerRuntimeRunner):

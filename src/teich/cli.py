@@ -64,6 +64,15 @@ def _write_output_metadata(cfg: Config) -> Path:
     )
 
 
+def _new_jsonl_outputs(traces_dir: Path, started_at: datetime, results: list[Path]) -> list[Path]:
+    output_paths = {path.resolve() for path in results if path.exists()}
+    threshold = started_at.timestamp() - 1
+    for path in traces_dir.glob("*.jsonl"):
+        if path.is_file() and path.stat().st_mtime >= threshold:
+            output_paths.add(path.resolve())
+    return sorted(output_paths)
+
+
 def _try_write_partial_output_metadata(cfg: Config) -> Path | None:
     if not _has_non_empty_trace_outputs(cfg.output.traces_dir):
         return None
@@ -226,6 +235,7 @@ def generate(
             )
             raise typer.Exit(1)
 
+        generation_started_at = datetime.now(timezone.utc)
         with BatchProgressReporter(console) as reporter:
             results = runner.run_all(
                 max_concurrency=cfg.max_concurrency,
@@ -235,9 +245,10 @@ def generate(
             )
         readme_path = _write_output_metadata(cfg)
         totals = reporter.snapshot_totals()
+        generated_files = _new_jsonl_outputs(cfg.output.traces_dir, generation_started_at, results)
 
-        console.print(f"\n[bold green]Success! Generated {len(results)} JSONL files:[/bold green]")
-        for r in results:
+        console.print(f"\n[bold green]Success! Generated {len(generated_files)} JSONL files:[/bold green]")
+        for r in generated_files:
             console.print(f"  - {r}")
         console.print(
             "\n[cyan]Usage:[/cyan] "
@@ -460,6 +471,8 @@ model:
   # - Codex: forwarded as model_reasoning_effort
   # - Pi: normalized to low / medium / high when supported
   # - Claude Code / Hermes: model/provider specific
+  # Hermes also enables built-in toolsets:
+  # safe,terminal,file,skills,memory,session_search,delegation
   reasoning_effort: medium
 
   # Optional Pi-specific provider overrides.
@@ -513,7 +526,9 @@ prompts: []
 
 output:
   # Where generated .jsonl files are written.
-  # - codex / pi: raw normalized agent traces
+  # - codex / pi: normalized copies of native agent session traces
+  # - claude-code: captured external agent stream traces
+  # - hermes: one external trace per native Hermes session, including delegated subagents
   # - chat: text-only training rows with messages/prompt/response/thinking fields
   traces_dir: ./output
 

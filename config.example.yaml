@@ -29,6 +29,8 @@ model:
   # - Codex: forwarded as model_reasoning_effort
   # - Pi: normalized to low / medium / high when supported
   # - Claude Code / Hermes: model/provider specific
+  # Hermes also enables built-in toolsets:
+  # safe,terminal,file,skills,memory,session_search,delegation
   reasoning_effort: medium
 
   # Optional Pi-specific provider overrides.
@@ -82,7 +84,9 @@ prompts: []
 
 output:
   # Where generated .jsonl files are written.
-  # - codex / pi: raw normalized agent traces
+  # - codex / pi: normalized copies of native agent session traces
+  # - claude-code: captured external agent stream traces
+  # - hermes: one external trace per native Hermes session, including delegated subagents
   # - chat: text-only training rows with messages/prompt/response/thinking fields
   traces_dir: ./output
 

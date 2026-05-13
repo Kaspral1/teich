@@ -20,12 +20,18 @@ flowchart TD
     G --> H{"agent.provider"}
     H -->|"codex"| I["Run Codex CLI in Docker<br/>keep one container and resume same session for follow-ups"]
     H -->|"pi"| J["Run Pi agent in Docker<br/>keep one container and continue same session for follow-ups"]
+    H -->|"claude-code"| Cc["Run Claude Code in Docker<br/>capture stream-json output"]
+    H -->|"hermes"| He["Run Hermes Agent in Docker<br/>enable built-in toolsets + delegation"]
     H -->|"chat"| K["Call OpenAI-compatible API directly"]
 
-    I --> I1["Write normalized raw JSONL trace"]
-    J --> J1["Write normalized raw JSONL trace"]
+    I --> I1["Copy and normalize native Codex session JSONL"]
+    J --> J1["Copy and normalize native Pi session JSONL"]
+    Cc --> Cc1["Write Teich external trace JSONL"]
+    He --> He1["Export each Hermes state.db session<br/>as separate Teich external trace JSONL"]
     I1 --> I2["Copy workspace snapshot to sandbox"]
     J1 --> J2["Copy workspace snapshot to sandbox"]
+    Cc1 --> Cc2["Copy workspace snapshot to sandbox"]
+    He1 --> He2["Copy workspace snapshot to sandbox"]
 
     K --> K1{"follow_up_prompts present?"}
     K1 -->|"no"| K2["Request one assistant turn"]
@@ -35,6 +41,8 @@ flowchart TD
 
     I2 --> L["Write dataset README"]
     J2 --> L
+    Cc2 --> L
+    He2 --> L
     K4 --> L
     L --> L1["Embed tool schema snapshot in README when available"]
     L1 --> M{"publish.repo_id set?"}
@@ -56,8 +64,16 @@ Prefer JSONL or NDJSON prompt files for new datasets:
 Each row accepts:
 
 - **`prompt`**: required initial user prompt.
-- **`github_repo`**: optional `owner/repo` checkout for `codex` and `pi` runs.
-- **`follow_up_prompts`**: optional list of additional user turns. `agent.provider: chat` generates them as real multi-turn data. `codex` and `pi` keep one Docker container alive for the prompt sequence, then resume or continue the same saved agent session for each follow-up.
+- **`github_repo`**: optional `owner/repo` checkout for Docker-backed agent runs.
+- **`follow_up_prompts`**: optional list of additional user turns. `agent.provider: chat` generates them as real multi-turn data. Agent runners keep one Docker container alive for the prompt sequence, then resume or continue the same saved agent session for each follow-up.
+
+Provider output behavior:
+
+- `codex`: copies the native Codex session JSONL from mounted `CODEX_HOME/sessions` and normalizes Codex event-shape edge cases.
+- `pi`: copies the native Pi session JSONL from mounted `/home/codex/pi-sessions`, then normalizes and validates event structure.
+- `claude-code`: captures Claude Code `stream-json` into Teich `external_*` events. For OpenRouter non-Claude models, a local proxy gives Claude Code a Claude surrogate model while forwarding the configured model to OpenRouter.
+- `hermes`: enables Hermes built-in toolsets `safe,terminal,file,skills,memory,session_search,delegation`, reads Hermes `state.db`, and writes each native Hermes session as its own Teich `external_*` trace. Delegated subagent sessions are separate files linked to the orchestrator by `parent_session_id`.
+- `chat`: writes structured training rows directly, without Docker or raw session capture.
 
 CSV and plain text prompt files still load, but JSONL is the recommended format because prompts often contain commas, code fences, and newlines.
 

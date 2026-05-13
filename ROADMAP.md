@@ -4,7 +4,8 @@
 
 Teich now has a usable trace-first generation and SFT preparation flow:
 
-- Docker-backed Codex and Pi runners with concurrent prompt execution.
+- Docker-backed Codex, Pi, Claude Code, and Hermes runners with concurrent prompt execution.
+- Hermes runs with built-in toolsets including delegation, and exported delegated subagent sessions stay as separate trace files linked by `parent_session_id`.
 - Text-only `chat` provider for structured training rows without Docker.
 - YAML configuration with provider, model, prompt-file, output, MCP, and publish settings.
 - CLI `init` / `generate` commands with resume support and Rich progress reporting.
@@ -12,7 +13,7 @@ Teich now has a usable trace-first generation and SFT preparation flow:
 - Structured conversion to `messages` / `tools` / `metadata` rows.
 - Embedded configured tool-schema snapshots in generated dataset READMEs.
 - JSONL/NDJSON prompt files as the recommended generation input format.
-- Multi-turn `follow_up_prompts` for text-only `chat` dataset generation.
+- Multi-turn `follow_up_prompts` for chat and Docker-backed agent generation.
 - `prepare_data()` + `mask_data()` as the supported trainer-first SFT path.
 - `load_traces()` for fallback/manual workflows where users own chat-template rendering, filtering, tokenization, and masking.
 - Generated dataset README cards that show the current Teich SFT path.
@@ -24,8 +25,8 @@ Teich now has a usable trace-first generation and SFT preparation flow:
 ### 1.1 Integration Testing
 
 - [x] Test actual Docker image build
-- [ ] Validate live `codex exec` end-to-end against installed Codex CLI versions
-- [ ] Verify session files are extracted correctly with real sessions
+- [x] Validate live provider smoke tests for Codex/Pi-style native extraction plus Claude Code/Hermes external traces, including Hermes delegated child-session export
+- [x] Verify session files are extracted correctly with real or provider-native sessions
 - [x] Verify trace format matches HF expectations on generated trace examples
 - [ ] Test MCP server configuration with real servers
 - [ ] Validate LM Studio / Ollama local-provider runs through Codex OSS mode
@@ -148,7 +149,7 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 - [x] Stop claiming new prompts after an individual prompt fails while preserving completed outputs
 - [x] JSONL/NDJSON prompt files with prompt metadata
 - [x] `follow_up_prompts` list support for `agent.provider: chat`
-- [ ] Native interactive follow-up prompt support for Codex and Pi runners
+- [x] Container-persistent follow-up support for Codex, Pi, Claude Code, and Hermes runners
 
 ### 3.2 Session Resumption
 
@@ -183,8 +184,9 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 
 - [x] OpenRouter/config override path in current Codex runner
 - [x] Text-only OpenAI-compatible `chat` provider path
-- [ ] Harden compatibility for non-OpenAI endpoints under real runs
-- [ ] Research additional coding-agent runners beyond Codex/Pi
+- [x] Harden OpenRouter compatibility for Claude Code non-Claude models through an in-container model-rewrite proxy
+- [x] Add external coding-agent runners beyond Codex/Pi
+- [ ] Harden compatibility for more non-OpenAI endpoints under real runs
 
 ### 4.2 Multi-Provider Support
 
@@ -192,8 +194,8 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 - [x] Codex runner
 - [x] Pi runner
 - [x] Chat runner
-- [ ] Anthropic Claude Code runner
-- [ ] Hermes agent runner
+- [x] Anthropic Claude Code runner
+- [x] Hermes agent runner with built-in toolsets and separate delegated subagent trace export
 - [ ] Ollama/local model runner beyond Codex OSS mode
 
 ### 4.3 Chat Template Masking Coverage
@@ -223,7 +225,8 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 - [ ] Full API reference
 - [ ] Tutorial: Creating your first dataset
 - [ ] Tutorial: Fine-tuning with generated data
-- [ ] Example configs for common use cases
+- [x] Example config covers Codex, Pi, Claude Code, Hermes, chat, OpenRouter, and local OpenAI-compatible endpoints
+- [ ] More task-specific example configs for common use cases
 
 ### 5.2 CLI Improvements
 
@@ -237,6 +240,7 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 - [x] Unit tests for config, CLI, runner, converter, loader, formatter, audit, collator, and SFT preparation
 - [x] Format validation tests
 - [x] End-to-end non-integration test pass excluding Docker/API integration
+- [x] Unit coverage for provider command/env construction and native/external trace extraction
 - [ ] Integration tests with real API calls mocked at provider boundary
 - [ ] Docker build tests in CI
 
@@ -244,7 +248,7 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 
 ## Immediate Next Steps
 
-1. **Run a small real generation smoke test** for Codex, Pi, and chat with 1-2 prompts each.
+1. **Run small real generation smoke tests** periodically for Codex, Pi, Claude Code, Hermes, and chat with 1-2 prompts each.
 2. **Run a small real `prepare_data()` + `mask_data()` smoke test** against the newly generated output and the intended tokenizer.
 3. **Audit generated examples manually** for tool-call rendering, reasoning supervision, follow-up turns, and empty/error sessions.
 4. **Decide quality-filter policy** for failed sessions and low-value traces.
@@ -258,5 +262,5 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 2. Should LM Studio and Ollama stay routed through Codex OSS mode, or get their own non-Codex runner?
 3. What quality metrics should Teich filter on before training?
 4. Should Teich eventually offer optional model/template presets, or keep explicit `chat_template_kwargs` only?
-5. How should native interactive follow-up prompting work for non-interactive Codex/Pi runners?
+5. Should Claude Code's OpenRouter surrogate model be configurable, or stay fixed to a known Claude allowlist value?
 6. How should Parquet and train/validation split generation fit into the trace-first workflow?
