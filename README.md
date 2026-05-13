@@ -177,6 +177,8 @@ Outputs:
 
 Only completed runs are kept at the top level of `output/`. Failed or interrupted agent traces are preserved under `output/partials/` for debugging, and Teich excludes that directory from resume detection, conversion, README generation, and Hugging Face uploads.
 
+Generation progress reports provider/model usage when native traces expose it. If the configured provider or agent does not return token or cost metadata, Teich prints `N/A` instead of treating the missing value as zero.
+
 If `publish.repo_id` is configured, Teich also creates or updates the matching Hugging Face **dataset** repo.
 
 Uploaded artifacts include:

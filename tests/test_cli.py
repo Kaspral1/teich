@@ -1,6 +1,7 @@
 """Tests for CLI module."""
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -526,3 +527,51 @@ def test_batch_progress_reporter_only_shows_queued_and_running_rows():
     assert "Completed prompt" not in output
     assert "api tokens" not in output
     assert "est. total" not in output
+
+
+def test_batch_progress_reporter_marks_unknown_usage_as_na():
+    console = Console(record=True, width=160)
+    reporter = BatchProgressReporter(console)
+
+    reporter.update(
+        SessionProgressUpdate(
+            prompt_id="running-1",
+            prompt_index=1,
+            total_prompts=1,
+            prompt="Running prompt",
+            prompt_preview="Running prompt",
+            status="running",
+            metrics=TraceMetrics(model="minimax/minimax-m2.5:free"),
+        )
+    )
+
+    console.print(reporter._render())
+    output = console.export_text()
+
+    assert "tokens=N/A cost=N/A" in output
+    assert "minimax/minimax-m2.5:free" in output
+
+
+def test_batch_progress_reporter_refreshes_elapsed_without_status_update():
+    reporter = BatchProgressReporter(Console(record=True, width=160))
+    fake_live = MagicMock()
+    reporter._live = fake_live
+    reporter.update(
+        SessionProgressUpdate(
+            prompt_id="running-1",
+            prompt_index=1,
+            total_prompts=1,
+            prompt="Running prompt",
+            prompt_preview="Running prompt",
+            status="running",
+            started_at=datetime.now(timezone.utc) - timedelta(seconds=65),
+        )
+    )
+
+    reporter._refresh_live_once()
+
+    assert fake_live.update.call_count >= 2
+    refreshed_renderable = fake_live.update.call_args.args[0]
+    console = Console(record=True, width=160)
+    console.print(refreshed_renderable)
+    assert "01:05" in console.export_text()

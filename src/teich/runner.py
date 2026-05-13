@@ -229,6 +229,22 @@ class TraceMetrics:
     total_tokens: int = 0
     est_total_tokens: int = 0
     total_cost: float = 0.0
+    has_token_usage: bool = False
+    has_cost: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            self.input_tokens
+            or self.output_tokens
+            or self.reasoning_tokens
+            or self.cache_read_tokens
+            or self.cache_write_tokens
+            or self.total_tokens
+            or self.est_total_tokens
+        ):
+            self.has_token_usage = True
+        if self.total_cost:
+            self.has_cost = True
 
     @staticmethod
     def _int_value(value: Any) -> int:
@@ -246,7 +262,16 @@ class TraceMetrics:
             return float(value)
         return 0.0
 
+    @staticmethod
+    def _has_any_key(mapping: dict[str, Any], keys: tuple[str, ...]) -> bool:
+        return any(key in mapping and mapping.get(key) is not None for key in keys)
+
     def add_pi_usage(self, usage: dict[str, Any]) -> None:
+        if self._has_any_key(
+            usage,
+            ("input", "output", "cacheRead", "cacheWrite", "totalTokens"),
+        ):
+            self.has_token_usage = True
         self.input_tokens += self._int_value(usage.get("input"))
         self.output_tokens += self._int_value(usage.get("output"))
         self.cache_read_tokens += self._int_value(usage.get("cacheRead"))
@@ -256,9 +281,31 @@ class TraceMetrics:
         self.est_total_tokens += total_tokens
         cost = usage.get("cost")
         if isinstance(cost, dict):
+            if "total" in cost and cost.get("total") is not None:
+                self.has_cost = True
             self.total_cost += self._float_value(cost.get("total"))
 
     def add_structured_usage(self, usage: dict[str, Any]) -> None:
+        if self._has_any_key(
+            usage,
+            (
+                "input",
+                "prompt_tokens",
+                "input_tokens",
+                "output",
+                "completion_tokens",
+                "output_tokens",
+                "reasoning",
+                "reasoning_tokens",
+                "reasoning_output_tokens",
+                "cacheRead",
+                "cached_input_tokens",
+                "cacheWrite",
+                "totalTokens",
+                "total_tokens",
+            ),
+        ):
+            self.has_token_usage = True
         self.input_tokens += self._int_value(usage.get("input") or usage.get("prompt_tokens") or usage.get("input_tokens"))
         self.output_tokens += self._int_value(usage.get("output") or usage.get("completion_tokens") or usage.get("output_tokens"))
         self.reasoning_tokens += self._int_value(
@@ -274,9 +321,22 @@ class TraceMetrics:
             self.est_total_tokens += total_tokens
         cost = usage.get("cost")
         if isinstance(cost, dict):
+            if "total" in cost and cost.get("total") is not None:
+                self.has_cost = True
             self.total_cost += self._float_value(cost.get("total"))
 
     def add_codex_last_usage(self, usage: dict[str, Any]) -> None:
+        if self._has_any_key(
+            usage,
+            (
+                "input_tokens",
+                "output_tokens",
+                "reasoning_output_tokens",
+                "cached_input_tokens",
+                "total_tokens",
+            ),
+        ):
+            self.has_token_usage = True
         self.input_tokens += self._int_value(usage.get("input_tokens"))
         self.output_tokens += self._int_value(usage.get("output_tokens"))
         self.reasoning_tokens += self._int_value(usage.get("reasoning_output_tokens"))
@@ -286,6 +346,17 @@ class TraceMetrics:
             self.total_tokens += total_tokens
 
     def apply_codex_total_usage(self, usage: dict[str, Any]) -> None:
+        if self._has_any_key(
+            usage,
+            (
+                "input_tokens",
+                "output_tokens",
+                "reasoning_output_tokens",
+                "cached_input_tokens",
+                "total_tokens",
+            ),
+        ):
+            self.has_token_usage = True
         self.input_tokens = self._int_value(usage.get("input_tokens"))
         self.output_tokens = self._int_value(usage.get("output_tokens"))
         self.reasoning_tokens = self._int_value(usage.get("reasoning_output_tokens"))
@@ -295,6 +366,17 @@ class TraceMetrics:
             self.total_tokens = total_tokens
 
     def apply_codex_estimated_usage(self, usage: dict[str, Any]) -> None:
+        if self._has_any_key(
+            usage,
+            (
+                "input_tokens",
+                "output_tokens",
+                "reasoning_output_tokens",
+                "cached_input_tokens",
+                "total_tokens",
+            ),
+        ):
+            self.has_token_usage = True
         total_tokens = self._int_value(usage.get("total_tokens"))
         if total_tokens:
             self.est_total_tokens = total_tokens
@@ -307,7 +389,7 @@ class TraceMetrics:
         )
 
     def finalize(self) -> None:
-        if not self.total_tokens:
+        if self.has_token_usage and not self.total_tokens:
             self.total_tokens = (
                 self.input_tokens
                 + self.output_tokens
@@ -315,7 +397,7 @@ class TraceMetrics:
                 + self.cache_read_tokens
                 + self.cache_write_tokens
             )
-        if not self.est_total_tokens:
+        if self.has_token_usage and not self.est_total_tokens:
             self.est_total_tokens = self.total_tokens
 
 
@@ -910,11 +992,14 @@ class DockerRuntimeRunner:
                         input_tokens = TraceMetrics._int_value(payload.get("input_tokens"))
                         output_tokens = TraceMetrics._int_value(payload.get("output_tokens"))
                         total_tokens = TraceMetrics._int_value(payload.get("total_tokens"))
+                        if TraceMetrics._has_any_key(payload, ("input_tokens", "output_tokens", "total_tokens")):
+                            metrics.has_token_usage = True
                         metrics.input_tokens += input_tokens
                         metrics.output_tokens += output_tokens
                         metrics.total_tokens += total_tokens or input_tokens + output_tokens
                         cost = payload.get("total_cost")
-                        if isinstance(cost, int | float):
+                        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+                            metrics.has_cost = True
                             metrics.total_cost += float(cost)
                     continue
 
@@ -941,6 +1026,7 @@ class DockerRuntimeRunner:
                         metrics.add_structured_usage(usage)
                     total_cost = event.get("total_cost_usd")
                     if isinstance(total_cost, (int, float)) and not isinstance(total_cost, bool):
+                        metrics.has_cost = True
                         metrics.total_cost += float(total_cost)
                     continue
 
@@ -1870,7 +1956,7 @@ class ExternalCliRunner(DockerRuntimeRunner):
                 "timestamp": started_at.isoformat().replace("+00:00", "Z"),
                 "cwd": str(workspace),
                 "source": self.source_name,
-                "model_provider": self.default_model_provider,
+                "model_provider": self.config.api.provider or self.default_model_provider,
                 "model": self.config.get_effective_model(),
             },
         }
@@ -2255,7 +2341,7 @@ class HermesRunner(ExternalCliRunner):
             "timestamp": self._hermes_timestamp(self._sqlite_row_get(row, "started_at")),
             "cwd": str(workspace),
             "source": self.source_name,
-            "model_provider": self.default_model_provider,
+            "model_provider": self.config.api.provider or self.default_model_provider,
             "model": self._sqlite_row_get(row, "model") or self.config.get_effective_model(),
             "hermes_source": self._sqlite_row_get(row, "source"),
             "parent_session_id": self._sqlite_row_get(row, "parent_session_id"),

@@ -245,6 +245,7 @@ def test_claude_code_runner_uses_openrouter_anthropic_skin_auth(tmp_path: Path):
     assert "--model minimax/minimax-m2.5:free" not in command_text
     assert "node /home/codex/.claude/claude_openrouter_proxy.js" in command_text
     rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["payload"]["model_provider"] == "openrouter"
     assert rows[0]["payload"]["model"] == "minimax/minimax-m2.5:free"
 
 
@@ -296,6 +297,7 @@ def test_hermes_runner_uses_chat_query_and_prompt_file(tmp_path: Path):
     assert "OPENROUTER_API_KEY=sk-or-test" in command
     rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
     assert rows[0]["payload"]["source"] == "hermes-agent"
+    assert rows[0]["payload"]["model_provider"] == "openrouter"
     assert rows[-1]["role"] == "assistant"
     assert rows[-1]["content"] == "done"
 
@@ -789,6 +791,8 @@ def test_run_all_reports_progress_and_preserves_prompt_order(tmp_path: Path):
     completed = [update for update in updates if update.status == "completed"]
     assert len(completed) == 2
     assert all(update.metrics is not None for update in completed)
+    assert completed[0].metrics.has_token_usage is True
+    assert completed[0].metrics.has_cost is True
     assert completed[0].metrics.total_tokens == 17
     assert completed[0].metrics.total_cost == 0.25
 
@@ -950,6 +954,8 @@ def test_summarize_trace_file_uses_pi_usage_payload(tmp_path: Path):
     assert metrics.total_tokens == 24
     assert metrics.est_total_tokens == 24
     assert metrics.total_cost == 0.5
+    assert metrics.has_token_usage is True
+    assert metrics.has_cost is True
 
 
 def test_summarize_trace_file_reads_structured_chat_usage(tmp_path: Path):
@@ -981,6 +987,34 @@ def test_summarize_trace_file_reads_structured_chat_usage(tmp_path: Path):
     assert metrics.output_tokens == 3
     assert metrics.total_tokens == 7
     assert metrics.est_total_tokens == 7
+    assert metrics.has_token_usage is True
+    assert metrics.has_cost is False
+
+
+def test_summarize_trace_file_keeps_missing_provider_usage_unknown(tmp_path: Path):
+    trace_file = tmp_path / "claude-trace.jsonl"
+    trace_file.write_text(
+        json.dumps(
+            {
+                "type": "external_session_meta",
+                "payload": {
+                    "model_provider": "openrouter",
+                    "model": "minimax/minimax-m2.5:free",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    metrics = CodexRunner._summarize_trace_file(trace_file)
+
+    assert metrics.provider == "openrouter"
+    assert metrics.model == "minimax/minimax-m2.5:free"
+    assert metrics.total_tokens == 0
+    assert metrics.total_cost == 0.0
+    assert metrics.has_token_usage is False
+    assert metrics.has_cost is False
 
 
 def test_summarize_trace_file_prefers_codex_total_usage(tmp_path: Path):

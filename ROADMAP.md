@@ -146,6 +146,8 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 - [x] Run multiple prompts concurrently
 - [x] Configurable concurrency
 - [x] Progress tracking for batch jobs
+- [x] Live elapsed-time refresh for long-running external provider calls
+- [x] Provider-reported token/cost display with `N/A` for unavailable usage metadata
 - [x] Stop claiming new prompts after an individual prompt fails while preserving completed outputs
 - [x] JSONL/NDJSON prompt files with prompt metadata
 - [x] `follow_up_prompts` list support for `agent.provider: chat`

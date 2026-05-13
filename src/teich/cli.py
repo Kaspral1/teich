@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock, Thread
 
 import typer
 from huggingface_hub import HfApi
@@ -252,11 +252,12 @@ def generate(
             console.print(f"  - {r}")
         console.print(
             "\n[cyan]Usage:[/cyan] "
-            f"tokens={totals['total_tokens']} input={totals['input_tokens']} "
-            f"output={totals['output_tokens']} reasoning={totals['reasoning_tokens']} "
-            f"cache_read={totals['cache_read_tokens']}"
+            f"tokens={_format_total_tokens(totals)} input={_format_total_token_field(totals, 'input_tokens')} "
+            f"output={_format_total_token_field(totals, 'output_tokens')} "
+            f"reasoning={_format_total_token_field(totals, 'reasoning_tokens')} "
+            f"cache_read={_format_total_token_field(totals, 'cache_read_tokens')}"
         )
-        console.print(f"[cyan]API cost:[/cyan] ${totals['total_cost']:.6f}")
+        console.print(f"[cyan]API cost:[/cyan] {_format_total_cost(totals)}")
         if agent_provider != "chat":
             console.print(f"[green]Saved sandboxes: {cfg.output.sandbox_dir}[/green]")
         console.print(f"\n[green]Wrote README: {readme_path}[/green]")
@@ -293,15 +294,37 @@ def _format_elapsed(update: SessionProgressUpdate) -> str:
 
 
 def _format_api_tokens(metrics: TraceMetrics | None) -> str:
-    if not metrics or not metrics.total_tokens:
+    if not metrics:
         return "--"
+    if not metrics.has_token_usage:
+        return "N/A"
     return str(metrics.total_tokens)
 
 
 def _format_cost(metrics: TraceMetrics | None) -> str:
     if not metrics:
         return "--"
+    if not metrics.has_cost:
+        return "N/A"
     return f"${metrics.total_cost:.6f}"
+
+
+def _format_total_tokens(totals: dict[str, float | int | bool]) -> str:
+    if not totals.get("has_token_usage"):
+        return "N/A"
+    return str(totals["total_tokens"])
+
+
+def _format_total_token_field(totals: dict[str, float | int | bool], key: str) -> str:
+    if not totals.get("has_token_usage"):
+        return "N/A"
+    return str(totals[key])
+
+
+def _format_total_cost(totals: dict[str, float | int | bool]) -> str:
+    if not totals.get("has_cost"):
+        return "N/A"
+    return f"${float(totals['total_cost']):.6f}"
 
 
 class BatchProgressReporter:
@@ -311,17 +334,42 @@ class BatchProgressReporter:
         self._lock = RLock()
         self._updates: dict[str, SessionProgressUpdate] = {}
         self._live: Live | None = None
+        self._refresh_stop: Event | None = None
+        self._refresh_thread: Thread | None = None
 
     def __enter__(self) -> BatchProgressReporter:
         if self.enabled:
             self._live = Live(self._render(), console=self.console, refresh_per_second=4)
             self._live.__enter__()
+            self._refresh_stop = Event()
+            self._refresh_thread = Thread(
+                target=self._refresh_live_loop,
+                name="teich-progress-refresh",
+                daemon=True,
+            )
+            self._refresh_thread.start()
         return self
 
     def __exit__(self, exc_type, exc, exc_tb) -> None:
+        if self._refresh_stop is not None:
+            self._refresh_stop.set()
+        if self._refresh_thread is not None:
+            self._refresh_thread.join(timeout=2)
+            self._refresh_thread = None
+        self._refresh_stop = None
         if self._live is not None:
             self._live.__exit__(exc_type, exc, exc_tb)
             self._live = None
+
+    def _refresh_live_loop(self) -> None:
+        while self._refresh_stop is not None and not self._refresh_stop.wait(1):
+            self._refresh_live_once()
+
+    def _refresh_live_once(self) -> None:
+        with self._lock:
+            live = self._live
+        if live is not None:
+            live.update(self._render(), refresh=True)
 
     def update(self, update: SessionProgressUpdate) -> None:
         with self._lock:
@@ -343,11 +391,15 @@ class BatchProgressReporter:
                 "total_tokens": 0,
                 "est_total_tokens": 0,
                 "total_cost": 0.0,
+                "has_token_usage": False,
+                "has_cost": False,
             }
             for update in self._updates.values():
                 metrics = update.metrics
                 if not metrics:
                     continue
+                if metrics.has_token_usage:
+                    totals["has_token_usage"] = True
                 totals["input_tokens"] += metrics.input_tokens
                 totals["output_tokens"] += metrics.output_tokens
                 totals["reasoning_tokens"] += metrics.reasoning_tokens
@@ -355,6 +407,8 @@ class BatchProgressReporter:
                 totals["cache_write_tokens"] += metrics.cache_write_tokens
                 totals["total_tokens"] += metrics.total_tokens
                 totals["est_total_tokens"] += metrics.est_total_tokens
+                if metrics.has_cost:
+                    totals["has_cost"] = True
                 totals["total_cost"] += metrics.total_cost
             return totals
 
@@ -370,7 +424,7 @@ class BatchProgressReporter:
             totals = self.snapshot_totals()
             summary.add_row(
                 f"queued={queued} running={running} completed={completed} failed={failed}",
-                f"tokens={totals['total_tokens']} cost=${totals['total_cost']:.6f}",
+                f"tokens={_format_total_tokens(totals)} cost={_format_total_cost(totals)}",
             )
 
             table = Table(title="Generation Progress")
