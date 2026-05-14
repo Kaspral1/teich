@@ -297,7 +297,12 @@ def test_convert_claude_code_stream_json_trace(tmp_path: Path):
         "content": "README.md\nsrc",
     }
     assert example.messages[3] == {"role": "assistant", "content": "Done."}
-    assert {tool["function"]["name"] for tool in example.tools} == {"Bash", "Edit"}
+    tool_names = {tool["function"]["name"] for tool in example.tools}
+    assert {"Bash", "Edit", "TodoWrite"}.issubset(tool_names)
+    bash_tool = next(tool for tool in example.tools if tool["function"]["name"] == "Bash")
+    assert bash_tool["function"]["parameters"]["properties"]["command"]["type"] == "string"
+    todo_tool = next(tool for tool in example.tools if tool["function"]["name"] == "TodoWrite")
+    assert todo_tool["function"]["parameters"]["properties"]["todos"]["type"] == "array"
 
 
 def test_convert_native_claude_code_transcript_with_camel_session_id(tmp_path: Path):
@@ -355,6 +360,8 @@ def test_convert_native_claude_code_transcript_with_camel_session_id(tmp_path: P
     assert example.messages[1]["tool_calls"][0]["function"] == {"name": "Bash", "arguments": {"command": "ls"}}
     assert example.messages[2]["role"] == "tool"
     assert example.messages[3] == {"role": "assistant", "content": "Done."}
+    tool_names = {tool["function"]["name"] for tool in example.tools}
+    assert {"Bash", "Read", "Edit", "TodoWrite"}.issubset(tool_names)
 
 
 def test_convert_native_claude_code_merges_fragmented_assistant_turns(tmp_path: Path):

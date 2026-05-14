@@ -2,12 +2,240 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
 _INLINE_THINKING_BLOCK_PATTERN = re.compile(r"<(think|thinking)>(.*?)</\1>", re.DOTALL)
+
+_CLAUDE_CODE_BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    "Task": {
+        "description": "Launch a subagent to complete a delegated task.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+                "prompt": {"type": "string"},
+                "subagent_type": {"type": "string"},
+            },
+            "required": ["prompt"],
+            "additionalProperties": True,
+        },
+    },
+    "Bash": {
+        "description": "Run a shell command.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "description": {"type": "string"},
+                "timeout": {"type": "integer"},
+            },
+            "required": ["command"],
+            "additionalProperties": True,
+        },
+    },
+    "BashOutput": {
+        "description": "Read output from a running background shell command.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "bash_id": {"type": "string"},
+                "filter": {"type": "string"},
+            },
+            "required": ["bash_id"],
+            "additionalProperties": True,
+        },
+    },
+    "Edit": {
+        "description": "Replace text in an existing file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+                "replace_all": {"type": "boolean"},
+            },
+            "required": ["file_path", "old_string", "new_string"],
+            "additionalProperties": True,
+        },
+    },
+    "Glob": {
+        "description": "Find files by glob pattern.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "path": {"type": "string"},
+            },
+            "required": ["pattern"],
+            "additionalProperties": True,
+        },
+    },
+    "Grep": {
+        "description": "Search file contents by pattern.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "path": {"type": "string"},
+                "include": {"type": "string"},
+            },
+            "required": ["pattern"],
+            "additionalProperties": True,
+        },
+    },
+    "KillBash": {
+        "description": "Stop a running background shell command.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "shell_id": {"type": "string"},
+            },
+            "required": ["shell_id"],
+            "additionalProperties": True,
+        },
+    },
+    "LS": {
+        "description": "List files and directories.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "ignore": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["path"],
+            "additionalProperties": True,
+        },
+    },
+    "MultiEdit": {
+        "description": "Apply multiple text replacements to one file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                            "replace_all": {"type": "boolean"},
+                        },
+                        "required": ["old_string", "new_string"],
+                        "additionalProperties": True,
+                    },
+                },
+            },
+            "required": ["file_path", "edits"],
+            "additionalProperties": True,
+        },
+    },
+    "NotebookEdit": {
+        "description": "Edit a Jupyter notebook cell.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "notebook_path": {"type": "string"},
+                "cell_id": {"type": "string"},
+                "new_source": {"type": "string"},
+                "cell_type": {"type": "string"},
+                "edit_mode": {"type": "string"},
+            },
+            "required": ["notebook_path", "new_source"],
+            "additionalProperties": True,
+        },
+    },
+    "NotebookRead": {
+        "description": "Read a Jupyter notebook.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "notebook_path": {"type": "string"},
+            },
+            "required": ["notebook_path"],
+            "additionalProperties": True,
+        },
+    },
+    "Read": {
+        "description": "Read a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "offset": {"type": "integer"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["file_path"],
+            "additionalProperties": True,
+        },
+    },
+    "TodoWrite": {
+        "description": "Create or update the task list.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "status": {"type": "string"},
+                            "priority": {"type": "string"},
+                            "id": {"type": "string"},
+                        },
+                        "required": ["content", "status", "priority", "id"],
+                        "additionalProperties": True,
+                    },
+                },
+            },
+            "required": ["todos"],
+            "additionalProperties": True,
+        },
+    },
+    "WebFetch": {
+        "description": "Fetch web content from a URL.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "prompt": {"type": "string"},
+            },
+            "required": ["url", "prompt"],
+            "additionalProperties": True,
+        },
+    },
+    "WebSearch": {
+        "description": "Search the web.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "allowed_domains": {"type": "array", "items": {"type": "string"}},
+                "blocked_domains": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["query"],
+            "additionalProperties": True,
+        },
+    },
+    "Write": {
+        "description": "Write a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["file_path", "content"],
+            "additionalProperties": True,
+        },
+    },
+}
 
 
 @dataclass(slots=True)
@@ -414,6 +642,30 @@ def _build_tool_entry(name: str, schema: dict[str, Any] | None = None) -> dict[s
     return {"type": "function", "function": function}
 
 
+def _claude_code_tool_schema_from_definition(tool: dict[str, Any]) -> dict[str, Any]:
+    schema: dict[str, Any] = {}
+    description = tool.get("description")
+    if isinstance(description, str) and description.strip():
+        schema["description"] = description.strip()
+
+    parameters = tool.get("parameters")
+    if not isinstance(parameters, dict):
+        parameters = tool.get("input_schema")
+    if not isinstance(parameters, dict):
+        parameters = tool.get("inputSchema")
+    if not isinstance(parameters, dict):
+        raw_schema = tool.get("schema")
+        if isinstance(raw_schema, dict):
+            parameters = raw_schema.get("parameters") if isinstance(raw_schema.get("parameters"), dict) else raw_schema
+    if not isinstance(parameters, dict):
+        function = tool.get("function")
+        if isinstance(function, dict):
+            parameters = function.get("parameters")
+    if isinstance(parameters, dict):
+        schema["parameters"] = parameters
+    return schema
+
+
 def _detect_trace_type(events: list[dict[str, Any]]) -> str:
     for event in events:
         if not isinstance(event, dict):
@@ -529,7 +781,8 @@ def _convert_claude_code_trace_to_training_example(
     events: list[dict[str, Any]],
 ) -> TrainingExample:
     messages: list[dict[str, Any]] = []
-    tool_names: set[str] = set()
+    tool_names: set[str] = set(_CLAUDE_CODE_BUILTIN_TOOL_SCHEMAS)
+    tool_schemas: dict[str, dict[str, Any]] = deepcopy(_CLAUDE_CODE_BUILTIN_TOOL_SCHEMAS)
     tool_argument_samples: dict[str, list[Any]] = {}
     session_meta: dict[str, Any] = {}
     session_id: str | None = None
@@ -580,7 +833,11 @@ def _convert_claude_code_trace_to_training_example(
                         elif isinstance(tool, dict):
                             name = tool.get("name")
                             if isinstance(name, str) and name.strip():
-                                tool_names.add(name.strip())
+                                tool_name = name.strip()
+                                tool_names.add(tool_name)
+                                schema = _claude_code_tool_schema_from_definition(tool)
+                                if schema:
+                                    tool_schemas[tool_name] = {**tool_schemas.get(tool_name, {}), **schema}
             continue
         if event_type in {"user", "assistant"}:
             if isinstance(event.get("session_id"), str):
@@ -682,10 +939,12 @@ def _convert_claude_code_trace_to_training_example(
                 if last_content != result.strip():
                     messages.append({"role": "assistant", "content": result.strip()})
 
-    tools = [
-        _build_tool_entry(name, {"parameters": _infer_tool_parameters_schema(tool_argument_samples.get(name, []))})
-        for name in sorted(tool_names)
-    ]
+    tools = []
+    for name in sorted(tool_names):
+        schema = deepcopy(tool_schemas.get(name) or {})
+        if "parameters" not in schema:
+            schema["parameters"] = _infer_tool_parameters_schema(tool_argument_samples.get(name, []))
+        tools.append(_build_tool_entry(name, schema))
     if not prompt:
         prompt = next(
             (

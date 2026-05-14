@@ -89,6 +89,29 @@ def test_write_traces_readme_embeds_tools_snapshot_in_readme(tmp_path: Path):
     assert '"additionalProperties": false' in readme
 
 
+def test_write_traces_readme_embeds_claude_code_builtin_tools(tmp_path: Path):
+    trace_file = tmp_path / "claude-code.jsonl"
+    trace_file.write_text(
+        '{"type":"user","message":{"role":"user","content":"Inspect repo"},"sessionId":"claude-session"}\n'
+        '{"type":"assistant","message":{"role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"text","text":"I will inspect it."}]},"sessionId":"claude-session"}\n',
+        encoding="utf-8",
+    )
+
+    readme_path = write_traces_readme(
+        tmp_path,
+        pretty_name="Claude Code Traces",
+        tags=["claude-code"],
+        model_id="claude-sonnet-4-6",
+    )
+
+    readme = readme_path.read_text(encoding="utf-8")
+    assert "## Training-ready tools" in readme
+    assert '"name": "Bash"' in readme
+    assert '"name": "TodoWrite"' in readme
+    assert '"command"' in readme
+    assert '"todos"' in readme
+
+
 def test_write_traces_readme_for_structured_chat_dataset_skips_tools_json(tmp_path: Path):
     trace_file = tmp_path / "chat.jsonl"
     trace_file.write_text(
