@@ -4438,7 +4438,7 @@ class PiRunner(DockerRuntimeRunner):
 
     def _runtime_trace_guard_error(self, trace_path: Path) -> str | None:
         try:
-            self._normalized_pi_trace_events(trace_path)
+            self._normalized_pi_trace_events(trace_path, reject_terminal_runtime_error=False)
         except RuntimeError as exc:
             return str(exc).replace("This trace was not exported because ", "")
         return None
@@ -4812,10 +4812,15 @@ class PiRunner(DockerRuntimeRunner):
         return ""
 
     @classmethod
-    def _validate_pi_trace_events(cls, events: list[dict[str, object]]) -> None:
+    def _validate_pi_trace_events(
+        cls,
+        events: list[dict[str, object]],
+        *,
+        reject_terminal_runtime_error: bool = True,
+    ) -> None:
         empty_tool_calls = 0
         empty_tool_results = 0
-        runtime_errors: list[str] = []
+        terminal_runtime_error: str | None = None
         for event in events:
             if event.get("type") != "message":
                 continue
@@ -4826,9 +4831,11 @@ class PiRunner(DockerRuntimeRunner):
             error_message = payload.get("errorMessage")
             if stop_reason == "error" or (isinstance(error_message, str) and error_message.strip()):
                 if isinstance(error_message, str) and error_message.strip():
-                    runtime_errors.append(error_message.strip())
+                    terminal_runtime_error = error_message.strip()
                 else:
-                    runtime_errors.append("model/provider returned stopReason=error")
+                    terminal_runtime_error = "model/provider returned stopReason=error"
+            elif payload.get("role") == "assistant" and cls._pi_assistant_has_content(payload):
+                terminal_runtime_error = None
             role = payload.get("role")
             if role == "assistant":
                 content = payload.get("content")
@@ -4849,10 +4856,10 @@ class PiRunner(DockerRuntimeRunner):
                 text = cls._pi_message_text(payload).strip()
                 if not tool_name.strip() or not tool_call_id.strip() or text == PI_EMPTY_TOOL_NOT_FOUND_TEXT:
                     empty_tool_results += 1
-        if runtime_errors:
+        if reject_terminal_runtime_error and terminal_runtime_error:
             raise RuntimeError(
                 "Pi session ended with model/provider error: "
-                f"{runtime_errors[0]}. "
+                f"{terminal_runtime_error}. "
                 "This trace was not exported because the model/provider did not produce a successful assistant response."
             )
         if not empty_tool_calls and not empty_tool_results:
@@ -4863,7 +4870,30 @@ class PiRunner(DockerRuntimeRunner):
             "This trace was not exported because the model/provider emitted corrupted tool invocations."
         )
 
-    def _normalized_pi_trace_events(self, source_path: Path) -> list[dict[str, object]]:
+    @classmethod
+    def _pi_assistant_has_content(cls, payload: dict[str, object]) -> bool:
+        content = payload.get("content")
+        if not isinstance(content, list):
+            return False
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text" and isinstance(block.get("text"), str) and block["text"].strip():
+                return True
+            if block_type == "toolCall":
+                tool_id = block.get("id")
+                tool_name = block.get("name")
+                if isinstance(tool_id, str) and tool_id.strip() and isinstance(tool_name, str) and tool_name.strip():
+                    return True
+        return False
+
+    def _normalized_pi_trace_events(
+        self,
+        source_path: Path,
+        *,
+        reject_terminal_runtime_error: bool = True,
+    ) -> list[dict[str, object]]:
         normalized_events: list[dict[str, object]] = []
         system_prompt: str | None = None
         system_prompt_timestamp: str | None = None
@@ -4886,7 +4916,10 @@ class PiRunner(DockerRuntimeRunner):
             system_message = self._pi_system_message_event(system_prompt, system_prompt_timestamp)
             insert_at = 1 if normalized_events and normalized_events[0].get("type") == "session" else 0
             normalized_events.insert(insert_at, system_message)
-        self._validate_pi_trace_events(normalized_events)
+        self._validate_pi_trace_events(
+            normalized_events,
+            reject_terminal_runtime_error=reject_terminal_runtime_error,
+        )
         return normalized_events
 
     def _copy_normalized_session_file(self, source_path: Path, destination: Path) -> None:

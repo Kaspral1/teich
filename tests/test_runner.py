@@ -1923,6 +1923,57 @@ def test_monitor_process_fails_fast_on_live_pi_tool_call_corruption(tmp_path: Pa
     process.wait.assert_called_once()
 
 
+def test_monitor_process_does_not_kill_live_pi_provider_error(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output"})
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(config)
+
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir(parents=True)
+    trace_file = session_dir / "session.jsonl"
+    trace_file.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session", "id": "pi-session"}),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "assistant-error",
+                        "message": {
+                            "role": "assistant",
+                            "content": [],
+                            "stopReason": "error",
+                            "errorMessage": "OpenRouter upstream request failed.",
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    process = MagicMock()
+    process.poll.side_effect = [None, 0]
+    process.args = ["docker", "run"]
+    stdout_handle = io.StringIO()
+    stderr_handle = io.StringIO()
+
+    runner._monitor_process(
+        process,
+        "session-id",
+        datetime.fromtimestamp(0, tz=timezone.utc),
+        session_dir,
+        None,
+        None,
+        stdout_handle,
+        stderr_handle,
+    )
+
+    process.kill.assert_not_called()
+    process.wait.assert_not_called()
+
+
 def test_pi_trace_with_model_error_is_rejected_before_export(tmp_path: Path):
     config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output"})
     with patch.object(PiRunner, '_ensure_image'):
@@ -1960,6 +2011,57 @@ def test_pi_trace_with_model_error_is_rejected_before_export(tmp_path: Path):
         runner._copy_normalized_session_file(source, destination)
 
     assert not destination.exists()
+
+
+def test_pi_trace_preserves_recovered_provider_error(tmp_path: Path):
+    config = Config(agent={"provider": "pi"}, output={"traces_dir": tmp_path / "output"})
+    with patch.object(PiRunner, '_ensure_image'):
+        runner = PiRunner(config)
+
+    source = tmp_path / "recovered-session.jsonl"
+    source.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session", "id": "pi-session"}),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "assistant-error",
+                        "message": {
+                            "role": "assistant",
+                            "content": [],
+                            "api": "openai-completions",
+                            "model": "qwen/qwen3.7-max",
+                            "usage": {"input": 0, "output": 0, "totalTokens": 0},
+                            "stopReason": "error",
+                            "errorMessage": "OpenRouter upstream request failed.",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "assistant-recovered",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Recovered and continuing."}],
+                            "model": "qwen/qwen3.7-max",
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "output" / "recovered-session.jsonl"
+    destination.parent.mkdir(parents=True)
+
+    runner._copy_normalized_session_file(source, destination)
+
+    exported = [json.loads(line) for line in destination.read_text(encoding="utf-8").splitlines()]
+    assert exported[1]["message"]["errorMessage"] == "OpenRouter upstream request failed."
+    assert exported[2]["message"]["content"][0]["text"] == "Recovered and continuing."
 
 
 def test_custom_api_provider_command():
