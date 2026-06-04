@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 from datasets import Dataset
 
-from teich import load_traces
+from teich import load_traces, trace_is_complete
 from teich.loader import _dataset_from_rows
 
 
@@ -451,6 +451,48 @@ def test_load_traces_raises_when_all_rows_lack_assistant_training_signal(tmp_pat
 
     with pytest.raises(ValueError, match="assistant training signal"):
         load_traces(dataset_file)
+
+
+def test_load_traces_drops_rows_ending_on_tool_result_by_default(tmp_path: Path):
+    dataset_file = tmp_path / "tool-final.jsonl"
+    incomplete_row = {
+        "messages": [
+            {"role": "user", "content": "List files"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": {"command": "ls"}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "name": "bash", "content": "README.md"},
+        ],
+        "prompt": "List files",
+    }
+    complete_row = {
+        "messages": [
+            *incomplete_row["messages"],
+            {"role": "assistant", "content": "Found README.md."},
+        ],
+        "prompt": "List files",
+    }
+    dataset_file.write_text(
+        "\n".join(json.dumps(row) for row in [incomplete_row, complete_row]) + "\n",
+        encoding="utf-8",
+    )
+
+    dataset = load_traces(dataset_file)
+    unfiltered = load_traces(dataset_file, drop_incomplete_traces=False)
+
+    assert trace_is_complete(incomplete_row) is False
+    assert trace_is_complete(complete_row) is True
+    assert dataset.num_rows == 1
+    assert dataset[0]["messages"][-1]["role"] == "assistant"
+    assert unfiltered.num_rows == 2
 
 
 def test_dataset_from_rows_falls_back_when_on_mixed_types_is_unsupported():

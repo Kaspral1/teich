@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -100,6 +101,17 @@ PI_BUILTIN_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+@dataclass
+class ToolCallValidationReport:
+    ok: bool
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def raise_for_errors(self) -> None:
+        if not self.ok:
+            raise ValueError("Tool-call validation failed:\n" + "\n".join(f"- {error}" for error in self.errors))
+
+
 def _tool_identity(tool: dict[str, Any]) -> str:
     function = tool.get("function") if isinstance(tool, dict) else None
     name = function.get("name") if isinstance(function, dict) else None
@@ -113,6 +125,163 @@ def _dedupe_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if name:
             by_name[name] = tool
     return [by_name[name] for name in sorted(by_name)]
+
+
+def _tool_parameter_schema(tool: dict[str, Any]) -> dict[str, Any]:
+    function = tool.get("function") if isinstance(tool, dict) else None
+    if not isinstance(function, dict):
+        return {"type": "object", "properties": {}, "additionalProperties": True}
+    parameters = function.get("parameters")
+    if isinstance(parameters, dict):
+        return parameters
+    return {"type": "object", "properties": {}, "additionalProperties": True}
+
+
+def _parse_tool_call_arguments(arguments: Any) -> Any:
+    if arguments is None:
+        return {}
+    if isinstance(arguments, str):
+        stripped = arguments.strip()
+        if not stripped:
+            return {}
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return arguments
+    return arguments
+
+
+def _json_schema_type_matches(value: Any, expected_type: str) -> bool:
+    if expected_type == "object":
+        return isinstance(value, dict)
+    if expected_type == "array":
+        return isinstance(value, list)
+    if expected_type == "string":
+        return isinstance(value, str)
+    if expected_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type == "number":
+        return isinstance(value, int | float) and not isinstance(value, bool)
+    if expected_type == "boolean":
+        return isinstance(value, bool)
+    if expected_type == "null":
+        return value is None
+    return True
+
+
+def _validate_argument_schema(
+    value: Any,
+    schema: dict[str, Any],
+    *,
+    path: str,
+) -> list[str]:
+    errors: list[str] = []
+    schema_type = schema.get("type")
+    if isinstance(schema_type, str) and not _json_schema_type_matches(value, schema_type):
+        errors.append(f"{path}: expected {schema_type}, got {type(value).__name__}")
+        return errors
+    if isinstance(schema_type, list) and not any(
+        isinstance(item, str) and _json_schema_type_matches(value, item)
+        for item in schema_type
+    ):
+        expected = "|".join(item for item in schema_type if isinstance(item, str))
+        errors.append(f"{path}: expected {expected}, got {type(value).__name__}")
+        return errors
+    enum = schema.get("enum")
+    if isinstance(enum, list) and value not in enum:
+        errors.append(f"{path}: value {value!r} is not in enum {enum!r}")
+    if not isinstance(value, dict):
+        return errors
+    required = schema.get("required")
+    if isinstance(required, list):
+        for required_name in required:
+            if isinstance(required_name, str) and required_name not in value:
+                errors.append(f"{path}: missing required argument {required_name!r}")
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        for name, item in value.items():
+            property_schema = properties.get(name)
+            if isinstance(property_schema, dict):
+                errors.extend(_validate_argument_schema(item, property_schema, path=f"{path}.{name}"))
+        if schema.get("additionalProperties", True) is False:
+            extra_keys = sorted(key for key in value if key not in properties)
+            for key in extra_keys:
+                errors.append(f"{path}: unexpected argument {key!r}")
+    return errors
+
+
+def _row_id(row: dict[str, Any], explicit_row_id: Any) -> Any:
+    if explicit_row_id is not None:
+        return explicit_row_id
+    for key in ("row_id", "id", "source_key", "raw_index"):
+        value = row.get(key)
+        if value is not None:
+            return value
+    metadata = row.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("session_id", "id", "source_file"):
+            value = metadata.get(key)
+            if value is not None:
+                return value
+    return None
+
+
+def validate_tool_calls(
+    row: dict[str, Any],
+    *,
+    row_id: Any = None,
+) -> ToolCallValidationReport:
+    if not isinstance(row, dict):
+        return ToolCallValidationReport(ok=False, errors=["row must be a mapping"])
+    messages = row.get("messages")
+    if not isinstance(messages, list):
+        return ToolCallValidationReport(ok=False, errors=["row is missing list-valued 'messages'"])
+    tools = row.get("tools") or []
+    if not isinstance(tools, list):
+        return ToolCallValidationReport(ok=False, errors=["row has non-list 'tools'"])
+
+    tool_schemas: dict[str, dict[str, Any]] = {}
+    for tool in tools:
+        name = _tool_identity(tool)
+        if name:
+            tool_schemas[name] = _tool_parameter_schema(tool)
+
+    errors: list[str] = []
+    label = _row_id(row, row_id)
+    row_prefix = f"row {label}: " if label is not None else ""
+    for message_index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") not in {"assistant", "model"}:
+            continue
+        tool_calls = message.get("tool_calls")
+        if tool_calls is None:
+            continue
+        if not isinstance(tool_calls, list):
+            errors.append(f"{row_prefix}message {message_index}: tool_calls must be a list")
+            continue
+        for tool_call_index, tool_call in enumerate(tool_calls):
+            if not isinstance(tool_call, dict):
+                errors.append(f"{row_prefix}message {message_index} tool_call {tool_call_index}: tool call must be an object")
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                errors.append(f"{row_prefix}message {message_index} tool_call {tool_call_index}: missing function object")
+                continue
+            name = function.get("name")
+            if not isinstance(name, str) or not name:
+                errors.append(f"{row_prefix}message {message_index} tool_call {tool_call_index}: missing function name")
+                continue
+            if name not in tool_schemas:
+                errors.append(f"{row_prefix}message {message_index} tool_call {tool_call_index}: undeclared tool {name!r}")
+                continue
+            arguments = _parse_tool_call_arguments(function.get("arguments"))
+            if not isinstance(arguments, dict):
+                errors.append(f"{row_prefix}message {message_index} tool_call {tool_call_index}: arguments must be a JSON object")
+                continue
+            errors.extend(
+                f"{row_prefix}message {message_index} tool_call {tool_call_index} {error}"
+                for error in _validate_argument_schema(arguments, tool_schemas[name], path=name)
+            )
+    return ToolCallValidationReport(ok=not errors, errors=errors)
 
 
 def _mcp_tool_to_openai_tool(server_name: str, tool: dict[str, Any]) -> dict[str, Any] | None:

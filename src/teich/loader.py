@@ -140,6 +140,24 @@ def _filter_rows_with_training_signal(rows: list[dict]) -> list[dict]:
     return [row for row in rows if _row_has_training_signal(row)]
 
 
+def trace_is_complete(row: dict[str, Any]) -> bool:
+    messages = row.get("messages") if isinstance(row, dict) else None
+    if not isinstance(messages, list):
+        return False
+    relevant_roles = [
+        message.get("role")
+        for message in messages
+        if isinstance(message, dict) and message.get("role") in {"assistant", "model", "tool"}
+    ]
+    if not relevant_roles:
+        return False
+    return relevant_roles[-1] != "tool"
+
+
+def _filter_complete_trace_rows(rows: list[dict]) -> list[dict]:
+    return [row for row in rows if trace_is_complete(row)]
+
+
 def _resolve_hf_token(token: str | None, hf_token: str | None) -> str | None:
     if token is not None and hf_token is not None and token != hf_token:
         raise ValueError("Pass only one of token or hf_token, or pass the same value for both.")
@@ -155,6 +173,7 @@ def load_traces(
     cache_dir: str | Path | None = None,
     local_dir: str | Path | None = None,
     max_examples: int | None = None,
+    drop_incomplete_traces: bool = True,
 ) -> Dataset:
     if max_examples is not None and max_examples < 0:
         raise ValueError("max_examples must be non-negative.")
@@ -185,6 +204,11 @@ def load_traces(
     if not rows:
         location = traces_dir if traces_dir != root else root
         raise ValueError(f"No trace or training data rows with assistant training signal found in {location}.")
+    if drop_incomplete_traces:
+        rows = _filter_complete_trace_rows(rows)
+        if not rows:
+            location = traces_dir if traces_dir != root else root
+            raise ValueError(f"No complete trace or training data rows found in {location}.")
     snapshot_root = root if root.is_dir() else root.parent
     rows = _apply_tools_snapshot(rows, _load_tools_snapshot(snapshot_root))
     dataset = _dataset_from_rows(rows)

@@ -27,6 +27,9 @@ That means the same package can:
 - Preserve raw traces as source-of-truth artifacts.
 - Render with arbitrary tokenizer chat templates.
 - Mask assistant reasoning, final answers, and tool calls while keeping prompts/tool responses ignored.
+- Report dropped, oversized, and trimmed rows without rerunning audits.
+- Preserve provenance columns like `metadata`, `raw_index`, and `source_key` when requested.
+- Validate tool-call names and required arguments against each row's declared tools.
 - Audit labels before training so fully masked or misaligned rows fail early.
 
 ## Mental Model
@@ -127,14 +130,30 @@ train_dataset = prepare_data(
     "TeichAI/Claude-Opus-4.6-Reasoning-887x",
     tokenizer,
     max_length=32768,
-    drop_oversized_examples=True,
-    trim_oversized_followups=True,
+    oversized_policy="trim_followups",
     tokenize=True,
     chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True},
 )
 ```
 
-`prepare_data()` returns rendered `text`, Teich span metadata, and optionally `input_ids` / `attention_mask`. With `trim_oversized_followups=True`, multi-turn rows that exceed `max_length` can drop the final user follow-up and everything after it before the whole row is discarded. Call `mask_data()` after constructing your trainer to convert those spans into labels.
+`prepare_data()` returns rendered `text`, Teich span metadata, and optionally `input_ids` / `attention_mask`. With `oversized_policy="trim_followups"`, multi-turn rows that exceed `max_length` can drop the final user follow-up and everything after it before the whole row is discarded. Call `mask_data()` after constructing your trainer to convert those spans into labels.
+
+For audit-friendly preparation, request a report and provenance columns:
+
+```python
+train_dataset, prep_report = prepare_data(
+    "TeichAI/Claude-Opus-4.6-Reasoning-887x",
+    tokenizer,
+    max_length=32768,
+    oversized_policy="drop",
+    preserve_columns=True,
+    return_report=True,
+    tokenize=True,
+)
+
+print(prep_report.max_token_length)
+print(prep_report.oversized_rows[:3])
+```
 
 ### Mix agent and chat datasets
 
@@ -155,8 +174,7 @@ train_dataset = prepare_data(
     },
     tokenizer,
     max_length=32768,
-    drop_oversized_examples=True,
-    trim_oversized_followups=True,
+    oversized_policy="trim_followups",
     tokenize=True,
     chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True},
 )
@@ -309,8 +327,7 @@ train_dataset = prepare_data(
     max_examples=500,
     chat_template_kwargs=CHAT_TEMPLATE_KWARGS,
     max_length=MAX_SEQ_LEN,
-    drop_oversized_examples=True,
-    trim_oversized_followups=True,
+    oversized_policy="trim_followups",
     tokenize=True,
     strict=True,
 )
@@ -358,9 +375,11 @@ model.push_to_hub_merged(PUSH_TO_HUB_REPO_ID, tokenizer, save_method="merged_16b
 
 - Loads local folders, local files, Hugging Face datasets, source mixes, or `datasets.Dataset` objects.
 - Applies the tokenizer chat template.
-- Optionally tokenizes only to drop rows above `max_length`.
-- Optionally trims final follow-up turns from multi-turn rows before dropping them for exceeding `max_length`.
+- Applies `oversized_policy="drop"`, `"trim_followups"`, or `"error"` when `max_length` is set. The older `drop_oversized_examples` and `trim_oversized_followups` flags are still accepted as compatibility aliases.
 - Returns trainer-friendly `text` rows with typed Teich span metadata.
+- Can return a `PrepareReport` with dropped rows, oversized rows, trimmed rows, token lengths, and row ids via `return_report=True`.
+- Can preserve source provenance columns with `preserve_columns=True` or an explicit list like `["metadata", "raw_index", "source_key"]`.
+- Can fail early on undeclared or malformed tool calls with `validate_tools=True`.
 - Supports `teich_masking=False` for plain next-token training without Teich response-only labels.
 
 For Unsloth / TRL, pass `tokenize=True` so trainer setup treats the dataset as already tokenized and preserves Teich span metadata until `mask_data()` runs.
@@ -384,8 +403,7 @@ train_dataset = prepare_data(
     ["username/chat-traces", "username/tool-traces"],
     tokenizer,
     max_length=MAX_SEQ_LEN,
-    drop_oversized_examples=True,
-    trim_oversized_followups=True,
+    oversized_policy="trim_followups",
     tokenize=True,
     chat_template_kwargs=CHAT_TEMPLATE_KWARGS,
 )
@@ -407,10 +425,14 @@ Use `load_traces` directly when you want to own the rest of the training pipelin
 - Auditing
 
 ```python
-from teich import load_traces
+from teich import load_traces, row_fits_context, validate_tool_calls
 
 dataset = load_traces("./output")
 example = dataset[0]
+
+validate_tool_calls(example).raise_for_errors()
+if not row_fits_context(example, tokenizer, 32768, {"enable_thinking": True}):
+    raise ValueError("example does not fit the target context window")
 
 rendered = tokenizer.apply_chat_template(
     example["messages"],
@@ -421,6 +443,8 @@ rendered = tokenizer.apply_chat_template(
 )
 tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 ```
+
+`load_traces()` drops rows that end on a tool result by default, because those traces are incomplete without a follow-up assistant turn. Pass `drop_incomplete_traces=False` only when you intentionally want to inspect or repair those rows.
 
 ## 📋 Configuration
 
@@ -507,6 +531,9 @@ from teich import (
     prepare_data,        # Recommended: render trainer-friendly text rows
     mask_data,           # Recommended: apply Teich labels after SFTTrainer tokenization
     load_traces,         # Fallback: load rows for fully manual processing
+    row_fits_context,    # Public chat-template render + token fit check for one row
+    validate_tool_calls, # Validate tool-call names and required arguments
+    trace_is_complete,   # Check that a row does not end on a tool result
     preview_sft_example, # Preview supervised vs masked tokens
     Config,              # Load config.yaml
     TrainingExample,     # Typed training example

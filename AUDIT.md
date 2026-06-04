@@ -101,11 +101,11 @@ Likely fix: make the masking audit template-aware by checking rendered masked/su
 
 ### P1 - Truncation handling is split across Teich and trainer collators
 
-The recommended `drop_oversized_examples=True` path is safe because Teich drops rows above `max_length` before training. But if users set `drop_oversized_examples=False`, Teich computes and audits labels on the full row, while the current TRL collator truncates later at batch collation time. Current TRL's `DataCollatorForLanguageModeling` supports both `keep_start` and `keep_end` truncation, and applies truncation to labels inside the collator.
+The recommended explicit policy is now `oversized_policy="drop"` or `oversized_policy="trim_followups"` so Teich handles rows above `max_length` before training. The older `drop_oversized_examples` / `trim_oversized_followups` flags remain compatibility aliases. If users intentionally keep oversized rows through the legacy `drop_oversized_examples=False` path, Teich computes and audits labels on the full row while the current TRL collator truncates later at batch collation time. Current TRL's `DataCollatorForLanguageModeling` supports both `keep_start` and `keep_end` truncation, and applies truncation to labels inside the collator.
 
 Impact: Teich's audit can pass a full row that later becomes fully masked or loses critical assistant spans after collator truncation. `_align_labels_to_input_ids()` also only directly supports prefix truncation when trainer-provided `input_ids` are shorter than the full rendered tokenization; it does not align suffix/interior slices.
 
-Likely fix: keep the documented default as `drop_oversized_examples=True`, and either reject `drop_oversized_examples=False` for trainer flows or simulate the trainer collator truncation mode before auditing. Add keep-end and assistant-after-window tests.
+Likely fix: keep documented examples on `oversized_policy`, and either reject the legacy keep-oversized path for trainer flows or simulate the trainer collator truncation mode before auditing. Add keep-end and assistant-after-window tests.
 
 ### P1 - Codex converter overwrites multiple pending reasoning events
 

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from datasets import Dataset
 import pytest
 
-from teich import load_traces, mask_data, prepare_data, preview_sft_example
+from teich import load_traces, mask_data, prepare_data, preview_sft_example, row_fits_context
 from teich.formatter import _labels_from_offsets, _reconcile_marker_boundary_whitespace
 
 
@@ -881,6 +881,25 @@ def test_prepare_data_renders_text_and_supervised_spans_for_trainer_flow():
     assert source_text_by_kind["user"] == "hello"
     assert source_text_by_kind["reasoning"] == "think"
     assert source_text_by_kind["final_answer"] == "world"
+
+
+def test_row_fits_context_returns_bool_or_details_for_structured_rows():
+    tokenizer = TrainerStyleTokenizer()
+    row = {
+        "id": "fit-row",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "world"},
+        ],
+        "tools": [],
+    }
+
+    details = row_fits_context(row, tokenizer, 100, return_details=True)
+
+    assert details.fits is True
+    assert details.row_id == "fit-row"
+    assert details.token_length == len("<user>hello</user><assistant>world</assistant>")
+    assert row_fits_context(row, tokenizer, 10) is False
 
 
 def test_mask_data_applies_policy_flags_to_typed_prepare_spans():

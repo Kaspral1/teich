@@ -7,7 +7,7 @@ from typing import Any
 
 from datasets import Dataset, concatenate_datasets
 
-from .formatter import format_data, normalize_prepared_dataset_features
+from .formatter import PrepareReport, format_data, normalize_prepared_dataset_features
 from .loader import _resolve_hf_token, load_traces
 
 
@@ -38,6 +38,7 @@ class _ResolvedSourceMix:
 class _ResolvedSourceList:
     datasets: list[Dataset]
     max_examples: int | None
+    names: list[str]
 
 
 def prepare_data(
@@ -58,13 +59,18 @@ def prepare_data(
     train_on_reasoning: bool | None = None,
     teich_masking: bool = True,
     max_length: int | None = None,
+    oversized_policy: str | None = None,
     drop_oversized_examples: bool = True,
     trim_oversized_followups: bool = False,
+    preserve_columns: bool | Sequence[str] | None = None,
     tokenize: bool = False,
+    validate_tools: bool = False,
     strict: bool = True,
+    return_report: bool = False,
     verbose: bool = True,
-) -> Dataset:
+) -> Dataset | tuple[Dataset, PrepareReport]:
     effective_token = _resolve_hf_token(token, hf_token)
+    report = PrepareReport() if return_report else None
     dataset = _resolve_source_dataset(
         source_or_dataset,
         split=split,
@@ -86,46 +92,74 @@ def prepare_data(
                 train_on_reasoning=train_on_reasoning,
                 teich_masking=teich_masking,
                 max_length=max_length,
+                oversized_policy=oversized_policy,
                 drop_oversized_examples=drop_oversized_examples,
                 trim_oversized_followups=trim_oversized_followups,
+                preserve_columns=preserve_columns,
+                source_key=source_name,
+                report=report,
+                validate_tools=validate_tools,
                 tokenize=tokenize,
                 strict=strict,
                 verbose=verbose,
             )
-            for source_dataset, source_chat_template_kwargs in zip(
+            for source_dataset, source_chat_template_kwargs, source_name in zip(
                 dataset.datasets,
                 dataset.chat_template_kwargs,
+                dataset.names,
                 strict=True,
             )
         ]
-        return _mix_prepared_datasets(
+        prepared = _mix_prepared_datasets(
             formatted_datasets,
             probabilities=dataset.probabilities,
             max_examples=dataset.max_examples,
             rigid_percentages=dataset.rigid_percentages,
         )
+        if report is not None:
+            report.returned_rows = prepared.num_rows
+            return prepared, report
+        return prepared
     if isinstance(dataset, _ResolvedSourceList):
-        formatted = format_data(
-            dataset.datasets,
-            tokenizer,
-            messages_column=messages_column,
-            tools_column=tools_column,
-            text_column=text_column,
-            chat_template_kwargs=chat_template_kwargs,
-            train_on_reasoning=train_on_reasoning,
-            teich_masking=teich_masking,
-            max_length=max_length,
-            drop_oversized_examples=drop_oversized_examples,
-            trim_oversized_followups=trim_oversized_followups,
-            tokenize=tokenize,
-            strict=strict,
-            verbose=verbose,
+        formatted_datasets = [
+            format_data(
+                source_dataset,
+                tokenizer,
+                messages_column=messages_column,
+                tools_column=tools_column,
+                text_column=text_column,
+                chat_template_kwargs=chat_template_kwargs,
+                train_on_reasoning=train_on_reasoning,
+                teich_masking=teich_masking,
+                max_length=max_length,
+                oversized_policy=oversized_policy,
+                drop_oversized_examples=drop_oversized_examples,
+                trim_oversized_followups=trim_oversized_followups,
+                preserve_columns=preserve_columns,
+                source_key=source_name,
+                report=report,
+                validate_tools=validate_tools,
+                tokenize=tokenize,
+                strict=strict,
+                verbose=verbose,
+            )
+            for source_dataset, source_name in zip(dataset.datasets, dataset.names, strict=True)
+        ]
+        formatted = concatenate_datasets(
+            [normalize_prepared_dataset_features(formatted_dataset) for formatted_dataset in formatted_datasets]
         )
         if dataset.max_examples is None:
+            if report is not None:
+                report.returned_rows = formatted.num_rows
+                return formatted, report
             return formatted
         limit = min(dataset.max_examples, formatted.num_rows)
-        return formatted.shuffle(seed=_DATASET_MIX_SEED).select(range(limit))
-    return format_data(
+        prepared = formatted.shuffle(seed=_DATASET_MIX_SEED).select(range(limit))
+        if report is not None:
+            report.returned_rows = prepared.num_rows
+            return prepared, report
+        return prepared
+    prepared = format_data(
         dataset,
         tokenizer,
         messages_column=messages_column,
@@ -135,12 +169,20 @@ def prepare_data(
         train_on_reasoning=train_on_reasoning,
         teich_masking=teich_masking,
         max_length=max_length,
+        oversized_policy=oversized_policy,
         drop_oversized_examples=drop_oversized_examples,
         trim_oversized_followups=trim_oversized_followups,
+        preserve_columns=preserve_columns,
+        report=report,
+        validate_tools=validate_tools,
         tokenize=tokenize,
         strict=strict,
         verbose=verbose,
     )
+    if report is not None:
+        report.returned_rows = prepared.num_rows
+        return prepared, report
+    return prepared
 
 
 def _resolve_source_dataset(
@@ -205,6 +247,7 @@ def _resolve_source_dataset(
                 for source in sources
             ],
             max_examples=max_examples,
+            names=[f"source_{index}" for index in range(len(sources))],
         )
     return _resolve_single_source_dataset(
         source_or_dataset,

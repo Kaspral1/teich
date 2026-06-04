@@ -567,3 +567,139 @@ def test_prepare_data_plain_source_list_supports_documented_training_options():
     assert set(prepared.column_names) == {"text", "teich_supervised_spans", "input_ids", "attention_mask"}
     assert any("first answer" in text for text in texts)
     assert any("second answer" in text for text in texts)
+
+
+def test_prepare_data_return_report_and_preserve_provenance_columns():
+    tokenizer = TinyChatTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "id": "short-row",
+                "source": "raw-a",
+                "metadata": {"session_id": "session-a"},
+                "messages": [
+                    {"role": "user", "content": "short"},
+                    {"role": "assistant", "content": "ok"},
+                ],
+                "tools": [],
+            },
+            {
+                "id": "long-row",
+                "source": "raw-b",
+                "metadata": {"session_id": "session-b"},
+                "messages": [
+                    {"role": "user", "content": "short"},
+                    {"role": "assistant", "content": "x" * 100},
+                ],
+                "tools": [],
+            },
+        ]
+    )
+
+    prepared, report = prepare_data(
+        dataset,
+        tokenizer,
+        max_length=60,
+        oversized_policy="drop",
+        preserve_columns=True,
+        return_report=True,
+        tokenize=True,
+        verbose=False,
+    )
+
+    assert prepared.num_rows == 1
+    assert {"source", "metadata", "raw_index"}.issubset(prepared.column_names)
+    assert prepared[0]["source"] == "raw-a"
+    assert prepared[0]["metadata"]["session_id"] == "session-a"
+    assert prepared[0]["raw_index"] == 0
+    assert report.total_rows == 2
+    assert report.returned_rows == 1
+    assert report.max_token_length is not None
+    assert report.max_prepared_token_length is not None
+    assert report.max_token_length > report.max_prepared_token_length
+    assert [row["row_id"] for row in report.kept_rows] == ["short-row"]
+    assert report.oversized_rows[0]["row_id"] == "long-row"
+    assert report.oversized_rows[0]["policy"] == "drop"
+    assert report.dropped_rows[0]["reason"] == "oversized"
+
+
+def test_prepare_data_return_report_tracks_trimmed_oversized_rows():
+    tokenizer = TinyChatTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "id": "trim-row",
+                "messages": [
+                    {"role": "user", "content": "short"},
+                    {"role": "assistant", "content": "ok"},
+                    {"role": "user", "content": "follow up " + ("x" * 80)},
+                    {"role": "assistant", "content": "later " + ("y" * 80)},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared, report = prepare_data(
+        dataset,
+        tokenizer,
+        max_length=60,
+        oversized_policy="trim_followups",
+        return_report=True,
+        verbose=False,
+    )
+
+    assert prepared.num_rows == 1
+    assert "follow up" not in prepared[0]["text"]
+    assert report.trimmed_rows == [
+        {
+            "raw_index": 0,
+            "row_id": "trim-row",
+            "initial_token_length": report.oversized_rows[0]["token_length"],
+            "final_token_length": report.oversized_rows[0]["final_token_length"],
+            "max_length": 60,
+        }
+    ]
+
+
+def test_prepare_data_source_mix_can_preserve_source_key():
+    tokenizer = TinyChatTokenizer()
+
+    prepared = prepare_data(
+        {
+            "alpha": {"source": _dataset_with_answers("alpha", 1)},
+            "beta": {"source": _dataset_with_answers("beta", 1)},
+        },
+        tokenizer,
+        preserve_columns=["source_key", "raw_index"],
+        verbose=False,
+    )
+
+    assert prepared.num_rows == 2
+    assert set(prepared["source_key"]) == {"alpha", "beta"}
+    assert prepared["raw_index"] == [0, 0]
+
+
+def test_prepare_data_oversized_policy_error_raises_on_first_oversized_row():
+    tokenizer = TinyChatTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "id": "too-long",
+                "messages": [
+                    {"role": "user", "content": "short"},
+                    {"role": "assistant", "content": "x" * 100},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="too-long"):
+        prepare_data(
+            dataset,
+            tokenizer,
+            max_length=60,
+            oversized_policy="error",
+            verbose=False,
+        )

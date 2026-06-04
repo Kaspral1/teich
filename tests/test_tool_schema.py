@@ -1,7 +1,30 @@
 from unittest.mock import patch
 
 from teich.config import Config, MCPConfig
-from teich.tool_schema import snapshot_configured_tools, snapshot_mcp_tools
+import pytest
+from datasets import Dataset
+
+from teich import prepare_data
+from teich.tool_schema import snapshot_configured_tools, snapshot_mcp_tools, validate_tool_calls
+
+
+class TinyChatTokenizer:
+    def apply_chat_template(self, messages, *, tokenize=False, add_generation_prompt=False, tools=None, **kwargs):
+        rendered = "".join(
+            f"<{message['role']}>{message.get('content', '')}</{message['role']}>" for message in messages
+        )
+        if tokenize:
+            return self(rendered)
+        return rendered
+
+    def __call__(self, text, add_special_tokens=False, return_attention_mask=True):
+        output = {"input_ids": [ord(character) for character in text]}
+        if return_attention_mask:
+            output["attention_mask"] = [1] * len(output["input_ids"])
+        return output
+
+    def decode(self, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
+        return "".join(chr(token_id) for token_id in token_ids)
 
 
 def test_snapshot_configured_tools_includes_codex_builtins_and_mcp_tools():
@@ -62,3 +85,84 @@ def test_snapshot_mcp_tools_normalizes_schema_and_applies_filters():
         tools = snapshot_mcp_tools(mcp)
 
     assert [tool["function"]["name"] for tool in tools] == ["files.read"]
+
+
+def test_validate_tool_calls_checks_declared_names_and_required_arguments():
+    row = {
+        "id": "row-1",
+        "messages": [
+            {"role": "user", "content": "List files"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": {"timeout_ms": 1000}},
+                    },
+                    {
+                        "id": "call-2",
+                        "type": "function",
+                        "function": {"name": "missing_tool", "arguments": {}},
+                    },
+                ],
+            },
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ],
+    }
+
+    report = validate_tool_calls(row)
+
+    assert report.ok is False
+    assert any("missing required argument 'command'" in error for error in report.errors)
+    assert any("unexpected argument 'timeout_ms'" in error for error in report.errors)
+    assert any("undeclared tool 'missing_tool'" in error for error in report.errors)
+
+
+def test_prepare_data_can_validate_tool_calls_before_rendering():
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "List files"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": {}},
+                            }
+                        ],
+                    },
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "parameters": {"type": "object", "required": ["command"]},
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="missing required argument 'command'"):
+        prepare_data(dataset, TinyChatTokenizer(), validate_tools=True, verbose=False)

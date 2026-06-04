@@ -102,9 +102,10 @@ flowchart TD
     G2 --> G5["Find split directory if present"]
     G4 --> G5
     G5 --> G6["convert_traces_to_training_data"]
-    G6 --> G7["Apply tool schema snapshot from README.md or tools.json"]
-    G7 --> G8["Create datasets.Dataset"]
-    G8 --> G9{"max_examples set?"}
+    G6 --> G7["Drop rows ending on tool results by default"]
+    G7 --> G8["Apply tool schema snapshot from README.md or tools.json"]
+    G8 --> G8A["Create datasets.Dataset"]
+    G8A --> G9{"max_examples set?"}
     G9 -->|"yes"| G10["shuffle(seed=3407) + select max_examples"]
     G9 -->|"no"| F
     G10 --> F
@@ -138,7 +139,10 @@ flowchart TD
 
     P --> Q["Validate messages column is a list"]
     Q --> R["Validate tools column is a list or default []"]
-    R --> S["_supervised_text_and_spans"]
+    R --> R1{"validate_tools=True?"}
+    R1 -->|"yes"| R2["Validate tool-call names and required args against row tools"]
+    R1 -->|"no"| S["_supervised_text_and_spans"]
+    R2 --> S
 
     S --> S1["Deep-copy messages"]
     S1 --> S2["Inject invisible markers around typed candidate fields"]
@@ -163,18 +167,25 @@ flowchart TD
     T --> U{"Any supervised spans?"}
     U -->|"no and strict=True"| U1["Raise ValueError"]
     U -->|"no and strict=False"| U2["Drop row"]
-    U -->|"yes"| V{"drop_oversized_examples and max_length set?"}
-    V -->|"yes"| V1["Tokenize only to measure length"]
+    U -->|"yes"| V{"max_length set?"}
+    V -->|"yes"| V1["Tokenize or measure rendered length"]
     V1 --> V2{"length > max_length?"}
-    V2 -->|"yes"| V3["Drop oversized row"]
+    V2 -->|"yes + oversized_policy=drop"| V3["Drop oversized row"]
+    V2 -->|"yes + oversized_policy=trim_followups"| V4["Trim final follow-up turns, then keep or drop"]
+    V2 -->|"yes + oversized_policy=error"| V5["Raise ValueError"]
     V2 -->|"no"| W["Emit prepared row"]
     V -->|"no"| W
+    V3 --> Z
+    V4 --> W
 
     W --> X{"teich_masking?"}
     X -->|"true"| X1["Output: text + teich_supervised_spans, plus tokens when tokenize=True"]
     X -->|"false"| X2["Output: text only, plus tokens when tokenize=True"]
     X1 --> Z
     X2 --> Z
+    Z --> ZA{"return_report=True?"}
+    ZA -->|"yes"| ZB["Return (dataset, PrepareReport)"]
+    ZA -->|"no"| ZC["Return dataset"]
 ```
 
 ## What `prepare_data` returns
@@ -202,8 +213,10 @@ Important details:
 - **`text`** is what `SFTTrainer` / Unsloth tokenizes when `tokenize=False`; with `tokenize=True`, it stays available for Teich span alignment and preview.
 - **`teich_supervised_spans`** are typed character span metadata. `prepare_data()` records candidate spans; `mask_data()` decides which kinds become labels.
 - **`teich_masking=False`** skips span metadata and returns plain rendered `text` rows for standard next-token training without Teich labels.
-- **Original columns are removed** after formatting.
-- **Oversized examples are measured and dropped** if `drop_oversized_examples=True`; token IDs are kept only when `tokenize=True`.
+- **Original columns are removed** after formatting unless `preserve_columns=True` or an explicit `preserve_columns=[...]` list is passed. `source`, `metadata`, `raw_index`, and `source_key` are the default provenance columns.
+- **Oversized examples use `oversized_policy`** when `max_length` is set: `"drop"`, `"trim_followups"`, or `"error"`. The older `drop_oversized_examples` and `trim_oversized_followups` flags still work as aliases.
+- **Preparation reports** are available with `return_report=True`. The returned `PrepareReport` includes dropped rows, oversized rows, trimmed rows, token lengths, max token lengths, kept-row ids, and returned row count.
+- **Public preflight helpers**: `row_fits_context(row, tokenizer, max_length, chat_template_kwargs)` renders and measures one row, `validate_tool_calls(row)` checks declared tool names and required args, and `trace_is_complete(row)` flags rows that end on a tool result.
 
 # `mask_data` Flow
 

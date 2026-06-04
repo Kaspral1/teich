@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-__version__ = "0.1.1a76"
+__version__ = "0.1.1a77"
 
 from .audit import SFTAuditReport, audit_sft_dataset
 from .config import Config, load_config
 from .converter import TrainingExample, convert_trace_to_training_example, convert_traces_to_training_data
-from .formatter import mask_data, preview_sft_example
-from .loader import load_traces
+from .formatter import PrepareReport, RowContextFit, mask_data, preview_sft_example, row_fits_context
+from .loader import load_traces, trace_is_complete
 from .prepare import prepare_data
+from .tool_schema import ToolCallValidationReport, validate_tool_calls
 
 __all__ = [
+    "PrepareReport",
+    "RowContextFit",
     "SFTAuditReport",
+    "ToolCallValidationReport",
     "Config",
     "TrainingExample",
     "audit_sft_dataset",
@@ -21,4 +25,7 @@ __all__ = [
     "mask_data",
     "prepare_data",
     "preview_sft_example",
+    "row_fits_context",
+    "trace_is_complete",
+    "validate_tool_calls",
 ]

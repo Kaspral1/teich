@@ -14,7 +14,7 @@ Teich now has a usable trace-first generation and SFT preparation flow:
 - Embedded configured tool-schema snapshots in generated dataset READMEs.
 - JSONL/NDJSON prompt files as the recommended generation input format.
 - Multi-turn `follow_up_prompts` for chat and Docker-backed agent generation.
-- `prepare_data()` + `mask_data()` as the supported trainer-first SFT path.
+- `prepare_data()` + `mask_data()` as the supported trainer-first SFT path, including explicit oversized policies, optional preparation reports, provenance preservation, and tool-call validation.
 - `load_traces()` for fallback/manual workflows where users own chat-template rendering, filtering, tokenization, and masking.
 - Generated dataset README cards that show the current Teich SFT path.
 
@@ -63,7 +63,8 @@ train_dataset = prepare_data(
     ["username/chat-traces", "username/tool-traces"],
     tokenizer,
     max_length=32768,
-    drop_oversized_examples=True,
+    oversized_policy="trim_followups",
+    validate_tools=True,
     chat_template_kwargs={"enable_thinking": True},
 )
 
@@ -134,6 +135,10 @@ tokenized = tokenizer(rendered, truncation=True, max_length=32768)
 - [x] Apply masked `labels` after `SFTTrainer` tokenization with `mask_data()`.
 - [x] Support optional reasoning supervision with `train_on_reasoning`
 - [x] Drop oversized rows by default
+- [x] Public `oversized_policy="drop" | "trim_followups" | "error"` API with compatibility aliases for older boolean flags
+- [x] `prepare_data(..., return_report=True)` for dropped, oversized, trimmed, token-length, and row-id reporting
+- [x] Optional provenance preservation for `source`, `metadata`, `raw_index`, and `source_key`
+- [x] Public `row_fits_context`, `validate_tool_calls`, and `trace_is_complete` helpers
 - [x] Add strict marker-render invariant checks
 - [x] Audit dataset labels
 

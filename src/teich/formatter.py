@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass, field
 import difflib
 import json
 import re
@@ -49,6 +50,7 @@ _REASONING_BLOCK_PATTERNS = (
 _REASONING_START_TOKENS = ("<think>\n", "<think>")
 _DATASET_MAP_BATCH_SIZE = 8
 TEICH_SUPERVISED_SPANS_COLUMN = "teich_supervised_spans"
+DEFAULT_PROVENANCE_COLUMNS = ("source", "metadata", "raw_index", "source_key")
 _SPAN_KIND_REASONING = "reasoning"
 _SPAN_KIND_FINAL_ANSWER = "final_answer"
 _SPAN_KIND_TOOL_CALL = "tool_call"
@@ -63,6 +65,106 @@ _TEICH_LABEL_PADDING_COLLATOR_NAMES = {
     "DataCollatorForLanguageModeling",
     "DataCollatorWithPadding",
 }
+_OVERSIZED_POLICIES = {"drop", "trim_followups", "error"}
+_OVERSIZED_POLICY_KEEP = "keep"
+
+
+@dataclass(slots=True)
+class RowContextFit:
+    fits: bool
+    token_length: int
+    max_length: int
+    row_id: Any = None
+
+
+@dataclass(slots=True)
+class PrepareReport:
+    total_rows: int = 0
+    formatted_rows: int = 0
+    returned_rows: int = 0
+    max_token_length: int | None = None
+    max_prepared_token_length: int | None = None
+    token_lengths: list[dict[str, Any]] = field(default_factory=list)
+    kept_rows: list[dict[str, Any]] = field(default_factory=list)
+    dropped_rows: list[dict[str, Any]] = field(default_factory=list)
+    oversized_rows: list[dict[str, Any]] = field(default_factory=list)
+    trimmed_rows: list[dict[str, Any]] = field(default_factory=list)
+
+    def record_token_length(self, row_info: dict[str, Any], token_length: int) -> None:
+        entry = {**row_info, "token_length": token_length}
+        self.token_lengths.append(entry)
+        self.max_token_length = token_length if self.max_token_length is None else max(self.max_token_length, token_length)
+
+    def record_kept_row(self, row_info: dict[str, Any], token_length: int | None) -> None:
+        entry = dict(row_info)
+        if token_length is not None:
+            entry["token_length"] = token_length
+            self.max_prepared_token_length = (
+                token_length
+                if self.max_prepared_token_length is None
+                else max(self.max_prepared_token_length, token_length)
+            )
+        self.kept_rows.append(entry)
+        self.formatted_rows += 1
+
+    def record_dropped_row(self, row_info: dict[str, Any], reason: str, token_length: int | None = None) -> None:
+        entry = {**row_info, "reason": reason}
+        if token_length is not None:
+            entry["token_length"] = token_length
+        self.dropped_rows.append(entry)
+
+    def record_oversized_row(
+        self,
+        row_info: dict[str, Any],
+        *,
+        token_length: int,
+        max_length: int,
+        policy: str,
+        final_token_length: int | None = None,
+    ) -> None:
+        entry = {**row_info, "token_length": token_length, "max_length": max_length, "policy": policy}
+        if final_token_length is not None:
+            entry["final_token_length"] = final_token_length
+        self.oversized_rows.append(entry)
+
+    def record_trimmed_row(
+        self,
+        row_info: dict[str, Any],
+        *,
+        initial_token_length: int,
+        final_token_length: int,
+        max_length: int,
+    ) -> None:
+        self.trimmed_rows.append(
+            {
+                **row_info,
+                "initial_token_length": initial_token_length,
+                "final_token_length": final_token_length,
+                "max_length": max_length,
+            }
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total_rows": self.total_rows,
+            "formatted_rows": self.formatted_rows,
+            "returned_rows": self.returned_rows,
+            "max_token_length": self.max_token_length,
+            "max_prepared_token_length": self.max_prepared_token_length,
+            "token_lengths": self.token_lengths,
+            "kept_rows": self.kept_rows,
+            "dropped_rows": self.dropped_rows,
+            "oversized_rows": self.oversized_rows,
+            "trimmed_rows": self.trimmed_rows,
+        }
+
+
+@dataclass(slots=True)
+class _RenderedRow:
+    text: str
+    supervised_spans: list[dict[str, Any]]
+    tokenized: tuple[list[int], list[int]] | None
+    token_length: int | None
 
 
 def _resolve_chat_template_renderer(tokenizer: Any, text_tokenizer: Any) -> Any:
@@ -1293,6 +1395,14 @@ def normalize_prepared_dataset_features(dataset: Dataset) -> Dataset:
         features["input_ids"] = List(Value("int32"))
     if "attention_mask" in dataset.column_names:
         features["attention_mask"] = List(Value("int8"))
+    if "metadata" in dataset.column_names:
+        features["metadata"] = Json()
+    if "source" in dataset.column_names:
+        features["source"] = Value("string")
+    if "source_key" in dataset.column_names:
+        features["source_key"] = Value("string")
+    if "raw_index" in dataset.column_names:
+        features["raw_index"] = Value("int64")
     normalized_features = Features({column: features[column] for column in dataset.column_names})
     if dataset.features == normalized_features:
         return dataset
@@ -1327,6 +1437,201 @@ def _normalize_span_dicts(value: Any) -> list[tuple[int, int]]:
     return _merge_spans([(span["start"], span["end"]) for span in _normalize_span_metadata(value)])
 
 
+def _resolve_oversized_policy(
+    oversized_policy: str | None,
+    *,
+    drop_oversized_examples: bool,
+    trim_oversized_followups: bool,
+) -> str:
+    if oversized_policy is not None:
+        if oversized_policy not in _OVERSIZED_POLICIES:
+            choices = ", ".join(sorted(_OVERSIZED_POLICIES))
+            raise ValueError(f"oversized_policy must be one of: {choices}")
+        return oversized_policy
+    if not drop_oversized_examples:
+        return _OVERSIZED_POLICY_KEEP
+    if trim_oversized_followups:
+        return "trim_followups"
+    return "drop"
+
+
+def _resolve_preserved_columns(
+    dataset: Dataset,
+    preserve_columns: bool | Sequence[str] | None,
+    *,
+    source_key: str | None,
+) -> list[str]:
+    if preserve_columns is None or preserve_columns is False:
+        return []
+    if preserve_columns is True:
+        candidates = DEFAULT_PROVENANCE_COLUMNS
+    else:
+        if isinstance(preserve_columns, (str, bytes, bytearray)):
+            raise TypeError("preserve_columns must be True or a sequence of non-empty column names.")
+        candidates = tuple(preserve_columns)
+        if not all(isinstance(column, str) and column for column in candidates):
+            raise TypeError("preserve_columns must be True or a sequence of non-empty column names.")
+    preserved: list[str] = []
+    for column in candidates:
+        if column in preserved:
+            continue
+        if column in dataset.column_names or column == "raw_index" or (column == "source_key" and source_key is not None):
+            preserved.append(column)
+    return preserved
+
+
+def _row_identity_from_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, int)):
+        return value
+    return None
+
+
+def _row_report_info(
+    batch: dict[str, list[Any]],
+    batch_index: int,
+    raw_index: int,
+    *,
+    source_key: str | None,
+) -> dict[str, Any]:
+    row_info: dict[str, Any] = {"raw_index": raw_index}
+    for column in ("row_id", "id", "source_key"):
+        values = batch.get(column)
+        if values is None:
+            continue
+        value = _row_identity_from_value(values[batch_index])
+        if value is not None:
+            row_info["row_id"] = value
+            break
+    if "row_id" not in row_info:
+        metadata_values = batch.get("metadata")
+        metadata = metadata_values[batch_index] if metadata_values is not None else None
+        if isinstance(metadata, dict):
+            for key in ("session_id", "id", "source_file"):
+                value = _row_identity_from_value(metadata.get(key))
+                if value is not None:
+                    row_info["row_id"] = value
+                    break
+    source_values = batch.get("source")
+    source_value = _row_identity_from_value(source_values[batch_index]) if source_values is not None else None
+    if source_value is not None:
+        row_info["source"] = source_value
+    source_key_values = batch.get("source_key")
+    source_key_value = _row_identity_from_value(source_key_values[batch_index]) if source_key_values is not None else None
+    if source_key_value is None:
+        source_key_value = source_key
+    if source_key_value is not None:
+        row_info["source_key"] = source_key_value
+    return row_info
+
+
+def _append_preserved_columns(
+    output_batch: dict[str, list[Any]],
+    batch: dict[str, list[Any]],
+    batch_index: int,
+    raw_index: int,
+    *,
+    preserved_columns: list[str],
+    source_key: str | None,
+) -> None:
+    for column in preserved_columns:
+        if column == "raw_index" and column not in batch:
+            output_batch[column].append(raw_index)
+            continue
+        if column == "source_key" and column not in batch:
+            output_batch[column].append(source_key or "")
+            continue
+        output_batch[column].append(batch[column][batch_index])
+
+
+def _render_training_row(
+    *,
+    renderer: Any,
+    text_tokenizer: Any,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    template_kwargs: dict[str, Any],
+    teich_masking: bool,
+    tokenize: bool,
+    measure_token_length: bool,
+    assistant_prompt_prefix_cache: dict[str, tuple[str, ...]],
+    strict: bool,
+) -> _RenderedRow | None:
+    if teich_masking:
+        text, supervised_spans = _supervised_text_and_spans(
+            renderer,
+            messages,
+            tools,
+            template_kwargs,
+            assistant_prompt_prefix_cache,
+            strict,
+        )
+        if not supervised_spans:
+            return None
+    else:
+        text = _render_chat(renderer, messages, tools, template_kwargs)
+        supervised_spans = []
+    tokenized: tuple[list[int], list[int]] | None = None
+    if tokenize:
+        tokenized = _tokenize_trainer_text(text_tokenizer, text)
+        if tokenized is None:
+            raise ValueError("prepare_data(tokenize=True) requires a tokenizer that can tokenize text.")
+    token_length = None
+    if measure_token_length:
+        token_length = len(tokenized[0]) if tokenized is not None else _tokenized_length(text_tokenizer, text)
+    return _RenderedRow(
+        text=text,
+        supervised_spans=supervised_spans,
+        tokenized=tokenized,
+        token_length=token_length,
+    )
+
+
+def row_fits_context(
+    row: Mapping[str, Any],
+    tokenizer: Any,
+    max_length: int,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    *,
+    messages_column: str = "messages",
+    tools_column: str = "tools",
+    text_column: str = "text",
+    return_details: bool = False,
+) -> bool | RowContextFit:
+    if not isinstance(max_length, int) or max_length <= 0:
+        raise ValueError("max_length must be a positive integer.")
+    text_tokenizer = _resolve_text_tokenizer(tokenizer)
+    row_id = row.get("row_id") or row.get("id") or row.get("source_key") or row.get("raw_index")
+    if isinstance(row.get(text_column), str) and messages_column not in row:
+        token_length = _tokenized_length(text_tokenizer, row[text_column])
+        result = RowContextFit(
+            fits=token_length <= max_length,
+            token_length=token_length,
+            max_length=max_length,
+            row_id=row_id,
+        )
+        return result if return_details else result.fits
+    messages = row.get(messages_column)
+    if not isinstance(messages, list):
+        raise TypeError(f"Row is missing a list-valued '{messages_column}' column.")
+    tools = row.get(tools_column) or []
+    if not isinstance(tools, list):
+        raise TypeError(f"Row has a non-list '{tools_column}' column.")
+    messages = _normalize_tool_call_arguments_for_template(normalize_training_messages(messages))
+    renderer = _resolve_chat_template_renderer(tokenizer, text_tokenizer)
+    template_kwargs = _validate_chat_template_kwargs(chat_template_kwargs)
+    text = _render_chat(renderer, messages, tools, template_kwargs)
+    token_length = _tokenized_length(text_tokenizer, text)
+    result = RowContextFit(
+        fits=token_length <= max_length,
+        token_length=token_length,
+        max_length=max_length,
+        row_id=row_id,
+    )
+    return result if return_details else result.fits
+
+
 def format_data(
     dataset: Dataset | Sequence[Dataset],
     tokenizer: Any,
@@ -1338,8 +1643,13 @@ def format_data(
     train_on_reasoning: bool | None = None,
     teich_masking: bool = True,
     max_length: int | None = None,
+    oversized_policy: str | None = None,
     drop_oversized_examples: bool = True,
     trim_oversized_followups: bool = False,
+    preserve_columns: bool | Sequence[str] | None = None,
+    source_key: str | None = None,
+    report: PrepareReport | None = None,
+    validate_tools: bool = False,
     tokenize: bool = False,
     strict: bool = False,
     verbose: bool = True,
@@ -1364,8 +1674,13 @@ def format_data(
                         train_on_reasoning=train_on_reasoning,
                         teich_masking=teich_masking,
                         max_length=max_length,
+                        oversized_policy=oversized_policy,
                         drop_oversized_examples=drop_oversized_examples,
                         trim_oversized_followups=trim_oversized_followups,
+                        preserve_columns=preserve_columns,
+                        source_key=source_key,
+                        report=report,
+                        validate_tools=validate_tools,
                         tokenize=tokenize,
                         strict=strict,
                         verbose=verbose,
@@ -1383,6 +1698,13 @@ def format_data(
     renderer = _resolve_chat_template_renderer(tokenizer, text_tokenizer)
     assistant_prompt_prefix_cache: dict[str, tuple[str, ...]] = {}
     effective_max_length = max_length if isinstance(max_length, int) and max_length > 0 else None
+    effective_oversized_policy = _resolve_oversized_policy(
+        oversized_policy,
+        drop_oversized_examples=drop_oversized_examples,
+        trim_oversized_followups=trim_oversized_followups,
+    )
+    measure_token_length = effective_max_length is not None or report is not None
+    preserved_columns = _resolve_preserved_columns(dataset, preserve_columns, source_key=source_key)
     dropped_count = 0
     dropped_oversized_count = 0
     trimmed_oversized_count = 0
@@ -1395,11 +1717,12 @@ def format_data(
         output_columns.append(TEICH_SUPERVISED_SPANS_COLUMN)
     if tokenize:
         output_columns.extend(["input_ids", "attention_mask"])
+    output_columns.extend(column for column in preserved_columns if column not in output_columns)
 
     def _empty_output_batch() -> dict[str, list[Any]]:
         return {column_name: [] for column_name in output_columns}
 
-    def _map_batch(batch: dict[str, list[Any]]) -> dict[str, list[Any]]:
+    def _map_batch(batch: dict[str, list[Any]], indices: list[int]) -> dict[str, list[Any]]:
         nonlocal dropped_count
         nonlocal dropped_oversized_count
         nonlocal trimmed_oversized_count
@@ -1409,91 +1732,141 @@ def format_data(
             tools_batch = [None] * batch_size
         output_batch = _empty_output_batch()
 
-        def render_row_messages(
-            messages: list[dict[str, Any]],
-            tools: list[dict[str, Any]],
-        ) -> tuple[str, list[dict[str, Any]], tuple[list[int], list[int]] | None, int | None] | None:
-            if teich_masking:
-                text, supervised_spans = _supervised_text_and_spans(
-                    renderer,
-                    messages,
-                    tools,
-                    template_kwargs,
-                    assistant_prompt_prefix_cache,
-                    strict,
-                )
-                if not supervised_spans:
-                    return None
-            else:
-                text = _render_chat(renderer, messages, tools, template_kwargs)
-                supervised_spans = []
-            tokenized: tuple[list[int], list[int]] | None = None
-            if tokenize:
-                tokenized = _tokenize_trainer_text(text_tokenizer, text)
-                if tokenized is None:
-                    raise ValueError("prepare_data(tokenize=True) requires a tokenizer that can tokenize text.")
-            tokenized_length = None
-            if effective_max_length is not None:
-                tokenized_length = len(tokenized[0]) if tokenized is not None else _tokenized_length(text_tokenizer, text)
-            return text, supervised_spans, tokenized, tokenized_length
-
         for index in range(batch_size):
+            raw_index = int(indices[index])
+            row_info = _row_report_info(batch, index, raw_index, source_key=source_key)
+            if report is not None:
+                report.total_rows += 1
             messages = batch[messages_column][index]
             if not isinstance(messages, list):
                 raise TypeError(f"Row is missing a list-valued '{messages_column}' column")
             if len(messages) == 0:
                 dropped_count += 1
+                if report is not None:
+                    report.record_dropped_row(row_info, "empty_messages")
                 continue
             messages = normalize_training_messages(messages)
             if len(messages) == 0:
                 dropped_count += 1
+                if report is not None:
+                    report.record_dropped_row(row_info, "empty_messages")
                 continue
             messages = _normalize_tool_call_arguments_for_template(messages)
             tools = tools_batch[index] or []
             if not isinstance(tools, list):
                 raise TypeError(f"Row is missing a list-valued '{tools_column}' column")
-            rendered = render_row_messages(messages, tools)
+            if validate_tools:
+                from .tool_schema import validate_tool_calls
+
+                validation = validate_tool_calls(
+                    {"messages": messages, "tools": tools},
+                    row_id=row_info.get("row_id", row_info["raw_index"]),
+                )
+                validation.raise_for_errors()
+            rendered = _render_training_row(
+                renderer=renderer,
+                text_tokenizer=text_tokenizer,
+                messages=messages,
+                tools=tools,
+                template_kwargs=template_kwargs,
+                teich_masking=teich_masking,
+                tokenize=tokenize,
+                measure_token_length=measure_token_length,
+                assistant_prompt_prefix_cache=assistant_prompt_prefix_cache,
+                strict=strict,
+            )
             if rendered is None:
                 dropped_count += 1
+                if report is not None:
+                    report.record_dropped_row(row_info, "no_trainable_spans")
                 continue
-            text, supervised_spans, tokenized, tokenized_length = rendered
-            if drop_oversized_examples and effective_max_length is not None:
+            initial_token_length = rendered.token_length
+            if report is not None and initial_token_length is not None:
+                report.record_token_length(row_info, initial_token_length)
+            if effective_max_length is not None and initial_token_length is not None and initial_token_length > effective_max_length:
+                if report is not None:
+                    report.record_oversized_row(
+                        row_info,
+                        token_length=initial_token_length,
+                        max_length=effective_max_length,
+                        policy=effective_oversized_policy,
+                    )
+                if effective_oversized_policy == "error":
+                    row_label = row_info.get("row_id", row_info["raw_index"])
+                    raise ValueError(
+                        f"Row {row_label!r} is {initial_token_length} tokens, above max_length={effective_max_length}."
+                    )
+            if effective_oversized_policy in {"drop", "trim_followups"} and effective_max_length is not None:
                 did_trim = False
-                if tokenized_length is None:
+                if rendered.token_length is None:
                     dropped_oversized_count += 1
+                    if report is not None:
+                        report.record_dropped_row(row_info, "oversized", initial_token_length)
                     continue
-                if tokenized_length > effective_max_length:
-                    while trim_oversized_followups:
+                if rendered.token_length > effective_max_length:
+                    while effective_oversized_policy == "trim_followups":
                         trimmed_messages = _drop_last_user_turn(messages)
                         if trimmed_messages is None:
                             break
                         messages = trimmed_messages
                         did_trim = True
-                        rendered = render_row_messages(messages, tools)
+                        rendered = _render_training_row(
+                            renderer=renderer,
+                            text_tokenizer=text_tokenizer,
+                            messages=messages,
+                            tools=tools,
+                            template_kwargs=template_kwargs,
+                            teich_masking=teich_masking,
+                            tokenize=tokenize,
+                            measure_token_length=measure_token_length,
+                            assistant_prompt_prefix_cache=assistant_prompt_prefix_cache,
+                            strict=strict,
+                        )
                         if rendered is None:
                             break
-                        text, supervised_spans, tokenized, tokenized_length = rendered
-                        if tokenized_length is not None and tokenized_length <= effective_max_length:
+                        if rendered.token_length is not None and rendered.token_length <= effective_max_length:
                             break
-                    if tokenized_length is None or tokenized_length > effective_max_length:
+                    if rendered is None or rendered.token_length is None or rendered.token_length > effective_max_length:
                         dropped_oversized_count += 1
+                        if report is not None:
+                            report.record_dropped_row(row_info, "oversized", initial_token_length)
                         continue
                     if did_trim:
                         trimmed_oversized_count += 1
-            output_batch[text_column].append(text)
+                        if report is not None:
+                            report.record_trimmed_row(
+                                row_info,
+                                initial_token_length=initial_token_length or rendered.token_length,
+                                final_token_length=rendered.token_length,
+                                max_length=effective_max_length,
+                            )
+                            report.oversized_rows[-1]["final_token_length"] = rendered.token_length
+            output_batch[text_column].append(rendered.text)
             if teich_masking:
-                output_batch[TEICH_SUPERVISED_SPANS_COLUMN].append(_span_dicts(supervised_spans))
-            if tokenized is not None:
-                input_ids, attention_mask = tokenized
+                output_batch[TEICH_SUPERVISED_SPANS_COLUMN].append(_span_dicts(rendered.supervised_spans))
+            if rendered.tokenized is not None:
+                input_ids, attention_mask = rendered.tokenized
                 output_batch["input_ids"].append(input_ids)
                 output_batch["attention_mask"].append(attention_mask)
+            _append_preserved_columns(
+                output_batch,
+                batch,
+                index,
+                raw_index,
+                preserved_columns=preserved_columns,
+                source_key=source_key,
+            )
+            if report is not None:
+                report.record_kept_row(row_info, rendered.token_length)
         return output_batch
 
     formatted_data = dataset.map(
         _map_batch,
         batched=True,
+        with_indices=True,
         batch_size=_DATASET_MAP_BATCH_SIZE,
         remove_columns=dataset.column_names,
+        load_from_cache_file=False if report is not None else None,
     )
     if formatted_data.num_rows == 0 and dropped_count > 0:
         if teich_masking:
