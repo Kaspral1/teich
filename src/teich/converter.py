@@ -1415,6 +1415,140 @@ def _convert_claude_code_trace_to_training_example(
     )
 
 
+def _convert_droid_trace_to_training_example(
+    trace_file: Path,
+    events: list[dict[str, Any]],
+) -> TrainingExample:
+    messages: list[dict[str, Any]] = []
+    tool_names: set[str] = set()
+    tool_schemas: dict[str, dict[str, Any]] = {}
+    tool_argument_samples: dict[str, list[Any]] = {}
+    tool_names_by_call_id: dict[str, str] = {}
+    session_id: str | None = None
+    cwd: str | None = None
+    title: str | None = None
+    prompt = ""
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type")
+        if event_type == "session_start":
+            value = event.get("id")
+            if isinstance(value, str) and value.strip():
+                session_id = value.strip()
+            value = event.get("cwd")
+            if isinstance(value, str) and value.strip():
+                cwd = value.strip()
+            value = event.get("sessionTitle") or event.get("title")
+            if isinstance(value, str) and value.strip():
+                title = value.strip()
+            continue
+        if event_type != "message":
+            continue
+        payload = event.get("message")
+        if not isinstance(payload, dict):
+            continue
+        role = payload.get("role")
+        content_blocks = payload.get("content")
+
+        if role == "user":
+            if isinstance(content_blocks, list) and any(
+                isinstance(block, dict) and block.get("type") == "tool_result"
+                for block in content_blocks
+            ):
+                for block in content_blocks:
+                    if not isinstance(block, dict) or block.get("type") != "tool_result":
+                        continue
+                    tool_call_id = block.get("tool_use_id") or block.get("tool_call_id")
+                    if not isinstance(tool_call_id, str) or not tool_call_id:
+                        continue
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "name": tool_names_by_call_id.get(tool_call_id, "unknown_tool"),
+                            "content": _claude_tool_result_text(block),
+                        }
+                    )
+                continue
+            content = _claude_text_from_content(content_blocks)
+            if content and not prompt:
+                prompt = content
+            if content:
+                messages.append({"role": "user", "content": content})
+            continue
+
+        if role == "assistant":
+            content = _claude_text_from_content(content_blocks)
+            message: dict[str, Any] = {"role": "assistant", "content": content}
+            reasoning_content = _claude_reasoning_from_content(content_blocks)
+            if reasoning_content:
+                message["reasoning_content"] = reasoning_content
+            tool_calls: list[dict[str, Any]] = []
+            if isinstance(content_blocks, list):
+                for block in content_blocks:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    tool_call_id = block.get("id")
+                    tool_name = block.get("name")
+                    if not isinstance(tool_call_id, str) or not isinstance(tool_name, str):
+                        continue
+                    if not tool_call_id or not tool_name:
+                        continue
+                    arguments = _normalize_json_like_value(block.get("input") or {})
+                    tool_names.add(tool_name)
+                    tool_names_by_call_id[tool_call_id] = tool_name
+                    tool_argument_samples.setdefault(tool_name, []).append(arguments)
+                    tool_calls.append(
+                        {
+                            "id": tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": arguments,
+                            },
+                        }
+                    )
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+            if content or reasoning_content or tool_calls:
+                _append_or_merge_assistant_message(messages, message)
+
+    tools = _build_tools_from_snapshots_and_calls(
+        tool_names,
+        tool_schemas,
+        tool_argument_samples,
+        {},
+    )
+    if not prompt:
+        prompt = next(
+            (
+                message.get("content", "")
+                for message in messages
+                if message.get("role") == "user" and isinstance(message.get("content"), str)
+            ),
+            "",
+        )
+    metadata: dict[str, Any] = {
+        "source_file": trace_file.name,
+        "session_id": session_id or trace_file.stem,
+        "trace_type": "droid",
+        "model_provider": "factory",
+        "model": None,
+        "cwd": cwd,
+        "title": title,
+        "turn_count": sum(1 for message in messages if message.get("role") == "user"),
+    }
+    return TrainingExample(
+        source_file=trace_file,
+        prompt=prompt,
+        messages=messages,
+        tools=tools,
+        metadata=metadata,
+    )
+
+
 def _convert_hermes_trace_to_training_example(
     trace_file: Path,
     events: list[dict[str, Any]],
@@ -2328,6 +2462,8 @@ def convert_trace_to_training_example(trace_file: Path) -> TrainingExample:
     trace_type = _detect_trace_type(events)
     if trace_type == "claude_code":
         return _convert_claude_code_trace_to_training_example(trace_file, events)
+    if trace_type == "droid":
+        return _convert_droid_trace_to_training_example(trace_file, events)
     if trace_type == "hermes":
         return _convert_hermes_trace_to_training_example(trace_file, events)
     if trace_type == "external_agent":
@@ -2359,6 +2495,8 @@ def _convert_jsonl_file_to_training_rows(jsonl_file: Path) -> list[dict[str, Any
     trace_type = _detect_trace_type(rows)
     if trace_type == "claude_code":
         return [_convert_claude_code_trace_to_training_example(jsonl_file, rows).to_dict()]
+    if trace_type == "droid":
+        return [_convert_droid_trace_to_training_example(jsonl_file, rows).to_dict()]
     if trace_type == "hermes":
         if all(_is_hermes_trace_row(row) for row in rows):
             return [

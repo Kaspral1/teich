@@ -487,6 +487,105 @@ def test_convert_claude_code_stream_json_trace(tmp_path: Path):
     assert todo_tool["function"]["parameters"]["properties"]["todos"]["type"] == "array"
 
 
+def test_convert_droid_trace(tmp_path: Path):
+    trace_file = tmp_path / "droid.jsonl"
+    events = [
+        {
+            "type": "session_start",
+            "id": "droid-session",
+            "title": "inspect the project",
+            "sessionTitle": "Inspect project files",
+            "owner": "caleb",
+            "version": 2,
+            "cwd": "/workspace/project",
+        },
+        {
+            "type": "message",
+            "id": "message-1",
+            "timestamp": "2026-06-02T18:55:30.274Z",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "Inspect the project"}],
+            },
+            "parentId": None,
+        },
+        {
+            "type": "message",
+            "id": "message-2",
+            "timestamp": "2026-06-02T18:55:35.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "I should list the files first.",
+                        "signature": "reasoning_content",
+                        "signatureProvider": "generic-chat-completion-api",
+                        "durationMs": 1200,
+                    },
+                    {"type": "text", "text": "I'll list the files."},
+                    {"type": "tool_use", "id": "LS_0", "name": "LS", "input": {"directory_path": "/workspace/project"}},
+                ],
+                "chatCompletionReasoningField": "reasoning_content",
+                "chatCompletionReasoningContent": "I should list the files first.",
+            },
+            "parentId": "message-1",
+        },
+        {
+            "type": "message",
+            "id": "message-3",
+            "timestamp": "2026-06-02T18:55:36.000Z",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "LS_0", "is_error": False, "content": "README.md\nsrc"},
+                ],
+            },
+            "parentId": "message-2",
+        },
+        {
+            "type": "message",
+            "id": "message-4",
+            "timestamp": "2026-06-02T18:55:40.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "The project contains README.md and src."}],
+            },
+            "parentId": "message-3",
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.metadata["trace_type"] == "droid"
+    assert example.metadata["session_id"] == "droid-session"
+    assert example.metadata["cwd"] == "/workspace/project"
+    assert example.metadata["title"] == "Inspect project files"
+    assert example.metadata["turn_count"] == 1
+    assert example.prompt == "Inspect the project"
+    assert example.messages[0] == {"role": "user", "content": "Inspect the project"}
+    assert example.messages[1]["role"] == "assistant"
+    assert example.messages[1]["content"] == "I'll list the files."
+    assert example.messages[1]["reasoning_content"] == "I should list the files first."
+    assert example.messages[1]["tool_calls"] == [
+        {
+            "id": "LS_0",
+            "type": "function",
+            "function": {"name": "LS", "arguments": {"directory_path": "/workspace/project"}},
+        }
+    ]
+    assert example.messages[2] == {
+        "role": "tool",
+        "tool_call_id": "LS_0",
+        "name": "LS",
+        "content": "README.md\nsrc",
+    }
+    assert example.messages[3] == {"role": "assistant", "content": "The project contains README.md and src."}
+    tool_names = {tool["function"]["name"] for tool in example.tools}
+    assert "LS" in tool_names
+
+
 def test_convert_claude_code_keeps_init_tools_without_tool_calls(tmp_path: Path):
     trace_file = tmp_path / "claude-no-tools.jsonl"
     events = [
