@@ -22,6 +22,17 @@ def test_detect_trace_type_returns_known_trace_type():
             [{"id": "hermes-session", "source": "cli", "messages": [{"role": "user", "content": "hello"}]}],
             "hermes",
         ),
+        (
+            [
+                {
+                    "type": "session",
+                    "version": 3,
+                    "id": "openclaw-session",
+                    "cwd": "/Users/calebfahlgren/.openclaw/workspace",
+                }
+            ],
+            "openclaw",
+        ),
         ([{"type": "external_session_meta", "payload": {"source": "custom-agent"}}], "external_agent"),
     ]
 
@@ -31,6 +42,93 @@ def test_detect_trace_type_returns_known_trace_type():
 
 def test_detect_trace_type_returns_none_for_non_agent_jsonl():
     assert detect_trace_type([{"text": "hello"}, {"text": "world"}]) is None
+
+
+def test_convert_openclaw_trace_uses_distinct_type_with_shared_event_envelope(tmp_path: Path):
+    trace_file = tmp_path / "openclaw-session.jsonl"
+    events = [
+        {
+            "type": "session",
+            "version": 3,
+            "id": "0f853abd-d578-4a01-b37f-504880057fe4",
+            "timestamp": "2026-02-16T23:40:43.787Z",
+            "cwd": "/Users/calebfahlgren/.openclaw/workspace",
+        },
+        {
+            "type": "model_change",
+            "id": "d11668ab",
+            "provider": "anthropic",
+            "modelId": "claude-opus-4-6",
+        },
+        {
+            "type": "thinking_level_change",
+            "id": "1196999b",
+            "thinkingLevel": "low",
+        },
+        {
+            "type": "custom",
+            "id": "teich-system-1",
+            "customType": "teich-system-prompt",
+            "data": {"systemPrompt": "Pi runner system prompt should not contaminate OpenClaw."},
+        },
+        {
+            "type": "custom",
+            "id": "teich-tools-1",
+            "customType": "teich-available-tools",
+            "data": {
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "pi_only_tool",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ]
+            },
+        },
+        {
+            "type": "message",
+            "id": "user-1",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "Hi"}],
+            },
+        },
+        {
+            "type": "message",
+            "id": "assistant-1",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "\n\n"},
+                    {"type": "thinking", "thinking": "First session, BOOTSTRAP.md exists. Let me follow it."},
+                    {"type": "text", "text": "OpenClaw response."},
+                ],
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    example = convert_trace_to_training_example(trace_file)
+
+    assert example.metadata["trace_type"] == "openclaw"
+    assert example.metadata["session_id"] == "0f853abd-d578-4a01-b37f-504880057fe4"
+    assert example.metadata["model_provider"] == "anthropic"
+    assert example.metadata["model"] == "claude-opus-4-6"
+    assert example.metadata["cwd"] == "/Users/calebfahlgren/.openclaw/workspace"
+    assert example.metadata["thinking_level"] == "low"
+    assert "system_prompt" not in example.metadata
+    assert example.prompt == "Hi"
+    assert example.tools == []
+    assert example.messages == [
+        {"role": "user", "content": "Hi"},
+        {
+            "role": "assistant",
+            "content": "OpenClaw response.",
+            "reasoning_content": "First session, BOOTSTRAP.md exists. Let me follow it.",
+        },
+    ]
 
 
 def test_convert_pi_trace_ignores_malformed_tool_calls(tmp_path: Path):

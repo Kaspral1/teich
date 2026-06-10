@@ -12,7 +12,7 @@ _INLINE_THINKING_BLOCK_PATTERN = re.compile(r"<(think|thinking)>(.*?)</\1>", re.
 PI_SYSTEM_PROMPT_CUSTOM_TYPE = "teich-system-prompt"
 TEICH_AVAILABLE_TOOLS_CUSTOM_TYPE = "teich-available-tools"
 TEICH_TRACE_CONTEXT_ITEM_TYPE = "teich_context"
-TraceType = Literal["claude_code", "codex", "external_agent", "hermes", "pi"]
+TraceType = Literal["claude_code", "codex", "external_agent", "hermes", "openclaw", "pi"]
 
 _CLAUDE_CODE_BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "Task": {
@@ -951,7 +951,18 @@ def _claude_code_tool_schema_from_definition(tool: dict[str, Any]) -> dict[str, 
     return schema
 
 
+def _is_openclaw_session_header(event: Any) -> bool:
+    if not isinstance(event, dict) or event.get("type") != "session":
+        return False
+    cwd = event.get("cwd")
+    return isinstance(cwd, str) and ".openclaw" in cwd
+
+
 def _detect_trace_type(events: list[Any], default: TraceType | None = "codex") -> TraceType | None:
+    first_event = next((event for event in events if isinstance(event, dict)), None)
+    if _is_openclaw_session_header(first_event):
+        return "openclaw"
+
     for event in events:
         if _is_hermes_conversation(event):
             return "hermes"
@@ -2019,6 +2030,8 @@ def _convert_codex_trace_to_training_example(
 def _convert_pi_trace_to_training_example(
     trace_file: Path,
     events: list[dict[str, Any]],
+    *,
+    trace_type: Literal["openclaw", "pi"] = "pi",
 ) -> TrainingExample:
     messages: list[dict[str, Any]] = []
     tool_names: set[str] = set()
@@ -2033,6 +2046,7 @@ def _convert_pi_trace_to_training_example(
     teich_system_prompt: str | None = None
     prompt = ""
     invalid_tool_call_ids: set[str] = set()
+    include_teich_pi_metadata = trace_type == "pi"
 
     for event in events:
         if not isinstance(event, dict) or event.get("type") != "message":
@@ -2068,11 +2082,12 @@ def _convert_pi_trace_to_training_example(
                 session_names.append(name.strip())
             continue
         if event_type == "custom":
-            teich_system_prompt = teich_system_prompt or _pi_teich_system_prompt_from_event(event)
-            if event.get("customType") == TEICH_AVAILABLE_TOOLS_CUSTOM_TYPE:
-                data = event.get("data")
-                if isinstance(data, dict):
-                    _add_explicit_tools(data.get("tools"), explicit_tools, tool_names, tool_schemas)
+            if include_teich_pi_metadata:
+                teich_system_prompt = teich_system_prompt or _pi_teich_system_prompt_from_event(event)
+                if event.get("customType") == TEICH_AVAILABLE_TOOLS_CUSTOM_TYPE:
+                    data = event.get("data")
+                    if isinstance(data, dict):
+                        _add_explicit_tools(data.get("tools"), explicit_tools, tool_names, tool_schemas)
             continue
         if event_type != "message":
             continue
@@ -2180,7 +2195,7 @@ def _convert_pi_trace_to_training_example(
     metadata: dict[str, Any] = {
         "source_file": trace_file.name,
         "session_id": session_header.get("id") or trace_file.stem,
-        "trace_type": "pi",
+        "trace_type": trace_type,
         "model_provider": model_change.get("provider"),
         "model": model_change.get("modelId"),
         "cwd": session_header.get("cwd"),
@@ -2330,6 +2345,8 @@ def convert_trace_to_training_example(trace_file: Path) -> TrainingExample:
         return _convert_hermes_trace_to_training_example(trace_file, events)
     if trace_type == "external_agent":
         return _convert_external_agent_trace_to_training_example(trace_file, events)
+    if trace_type == "openclaw":
+        return _convert_pi_trace_to_training_example(trace_file, events, trace_type="openclaw")
     if trace_type == "pi":
         return _convert_pi_trace_to_training_example(trace_file, events)
     return _convert_codex_trace_to_training_example(trace_file, events)
@@ -2371,6 +2388,8 @@ def _convert_jsonl_file_to_training_rows(jsonl_file: Path) -> list[dict[str, Any
         return [_convert_hermes_trace_to_training_example(jsonl_file, rows).to_dict()]
     if trace_type == "external_agent":
         return [_convert_external_agent_trace_to_training_example(jsonl_file, rows).to_dict()]
+    if trace_type == "openclaw":
+        return [_convert_pi_trace_to_training_example(jsonl_file, rows, trace_type="openclaw").to_dict()]
     if trace_type == "pi":
         return [_convert_pi_trace_to_training_example(jsonl_file, rows).to_dict()]
     return [_convert_codex_trace_to_training_example(jsonl_file, rows).to_dict()]

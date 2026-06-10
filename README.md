@@ -257,6 +257,7 @@ Recommended `prompts.jsonl`:
 
 - `codex` copies the native Codex session JSONL out of the mounted `CODEX_HOME/sessions` directory, then normalizes known Codex event-shape edge cases so reasoning summaries are visible and split assistant turns render as thinking before text/tool use. Teich appends configured `tool_schema` metadata so tools remain available for training even if the model did not call them.
 - `pi` copies the native Pi session JSONL out of the mounted `/home/codex/pi-sessions` directory, then normalizes and validates tool-call structure before writing output. Teich appends prompt-level system metadata and configured tool metadata as `custom` events. For OpenRouter, Teich forces Pi onto the chat/completions wire path because Pi's OpenRouter Responses adapter can stall before the first session event.
+- `openclaw` is recognized for imported raw traces when the first session event has `.openclaw` in its `cwd`. OpenClaw is not a Teich runner yet, so Teich only identifies and converts the raw events with `metadata.trace_type = "openclaw"` without applying Pi runner metadata snapshots.
 - `claude-code` copies Claude Code's native transcript JSONL from `.claude/projects/...` so the output keeps Claude's own `user`, `assistant`, `system`, and `result` event format. Split assistant fragments are normalized so thinking appears before the text or tool use it explains. With OpenRouter non-Claude models, Teich runs a local in-container proxy: Claude Code sees a Claude surrogate model name, while the proxy rewrites outbound requests back to the configured model. The native assistant/result events keep the provider-returned model and usage fields when Claude Code records them.
 - `hermes` runs with built-in toolsets `safe,terminal,file,skills,memory,session_search,delegation`, then exports each Hermes Agent `state.db` session as a Teich external trace: an `external_session_meta` event followed by explicit `external_message` events. Hermes' internal `system_prompt`, enabled toolsets, and configured tools remain metadata on each trace. Delegated subagents remain separate trace files rather than being merged into the orchestrator session; child traces include `parent_session_id`.
 - `chat` calls an OpenAI-compatible API directly and writes structured training rows instead of raw agent traces.
@@ -556,7 +557,7 @@ from teich import (
 )
 ```
 
-`detect_trace_type(events)` returns `codex`, `claude_code`, `pi`, `hermes`, or `external_agent` for supported parsed trace events, and `None` for ordinary JSON rows.
+`detect_trace_type(events)` returns `codex`, `claude_code`, `pi`, `openclaw`, `hermes`, or `external_agent` for supported parsed trace events, and `None` for ordinary JSON rows.
 
 `README.md` is the package readme used for PyPI, so these examples are the canonical public package docs.
 

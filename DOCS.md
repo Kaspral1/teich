@@ -71,6 +71,7 @@ Provider output behavior:
 
 - `codex`: copies the native Codex session JSONL from mounted `CODEX_HOME/sessions` and normalizes Codex event-shape edge cases so reasoning summaries are visible and split assistant turns render as thinking before text/tool use.
 - `pi`: copies the native Pi session JSONL from mounted `/home/codex/pi-sessions`, then normalizes and validates event structure.
+- `openclaw`: imported raw OpenClaw traces are recognized when the first session event has `.openclaw` in its `cwd`. OpenClaw is not a Teich runner yet, so Teich only identifies and converts the raw events with `metadata.trace_type = "openclaw"` without applying Pi runner metadata snapshots.
 - `claude-code`: copies Claude Code's native transcript JSONL from `.claude/projects/...`, then normalizes split assistant fragments so thinking appears before the text or tool use it explains. For OpenRouter non-Claude models, a local proxy gives Claude Code a Claude surrogate model while forwarding the configured model to OpenRouter.
 - `hermes`: enables Hermes built-in toolsets `safe,terminal,file,skills,memory,session_search,delegation`, reads Hermes `state.db`, and writes each Hermes session as its own Teich external trace with `external_session_meta` and `external_message` events. Hermes' internal `system_prompt` stays metadata-only instead of becoming supervised training text. Delegated subagent sessions are separate files linked to the orchestrator by `parent_session_id`.
 - `chat`: writes structured training rows directly, without Docker or raw session capture.
