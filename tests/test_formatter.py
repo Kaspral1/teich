@@ -9,7 +9,7 @@ import pytest
 
 from teich import load_traces, mask_data, prepare_data, preview_sft_example, row_fits_context
 from teich.converter import convert_trace_to_training_example
-from teich.formatter import _labels_from_offsets, _reconcile_marker_boundary_whitespace
+from teich.formatter import _labels_from_offsets, _reconcile_marker_boundary_whitespace, _strip_markers_and_collect_spans
 
 
 def prepare_and_mask_for_test(
@@ -378,6 +378,106 @@ class GemmaLikeOffsetTokenizer(OffsetCountingTokenizer):
         if tokenize:
             return self(rendered)
         return rendered
+
+
+def test_reordered_mapping_markers_preserve_typed_tool_spans():
+    class SortedToolArgumentTokenizer(OffsetCountingTokenizer):
+        def apply_chat_template(self, messages, *, tokenize=False, add_generation_prompt=False, tools=None, **kwargs):
+            parts: list[str] = []
+            for index, message in enumerate(messages):
+                role = message["role"]
+                if role == "tool":
+                    if index > 0:
+                        previous = messages[index - 1]
+                        tool_name = previous["tool_calls"][0]["function"]["name"]
+                    else:
+                        tool_name = message.get("name", "tool")
+                    parts.append(
+                        "<|turn>user\n"
+                        f"<|tool_response>{tool_name}:{message.get('content', '')}<tool_response|>"
+                        "<turn|>\n"
+                    )
+                    continue
+                turn_role = "model" if role == "assistant" else role
+                parts.append(f"<|turn>{turn_role}\n")
+                if role == "assistant":
+                    for tool_call in message.get("tool_calls") or []:
+                        function = tool_call["function"]
+                        rendered_arguments = "".join(
+                            f"{name}:{function['arguments'][name]};" for name in sorted(function["arguments"])
+                        )
+                        parts.append(f"<|tool_call>call:{function['name']}{{{rendered_arguments}}}<tool_call|>")
+                parts.append(str(message.get("content") or ""))
+                parts.append("<turn|>\n")
+            if add_generation_prompt:
+                parts.append("<|turn>model\n")
+            rendered = "".join(parts)
+            if tokenize:
+                return self(rendered)
+            return rendered
+
+    tokenizer = SortedToolArgumentTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "update task"},
+                    {
+                        "role": "assistant",
+                        "content": "done final text",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "TaskCreate",
+                                    "arguments": {
+                                        "description": "Create studio backend",
+                                        "activeForm": "Building studio backend",
+                                    },
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "name": "TaskCreate", "content": "SECRET_TOOL_OUTPUT"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared = prepare_data(dataset, tokenizer, tokenize=True, strict=True, verbose=False)
+    spans = prepared[0]["teich_supervised_spans"]
+    assert any(span.get("kind") == "tool_call" for span in spans)
+    assert any(span.get("kind") == "final_answer" for span in spans)
+
+    trainer = SimpleNamespace(
+        train_dataset=prepared,
+        eval_dataset=None,
+        args=SimpleNamespace(dataset_text_field="text", max_length=None, packing=False),
+        tokenizer=tokenizer,
+    )
+    trainer = mask_data(
+        trainer,
+        tokenizer=tokenizer,
+        train_on_reasoning=False,
+        train_on_final_answers=False,
+        train_on_tools=True,
+        audit=False,
+        verbose=False,
+    )
+
+    row = trainer.train_dataset[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    masked_text = tokenizer.decode([token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100])
+
+    assert "<|tool_call>call:TaskCreate" in supervised_text
+    assert "activeForm:Building studio backend" in supervised_text
+    assert "description:Create studio backend" in supervised_text
+    assert "done final text" not in supervised_text
+    assert "SECRET_TOOL_OUTPUT" not in supervised_text
+    assert "done final text" in masked_text
+    assert "SECRET_TOOL_OUTPUT" in masked_text
 
 
 class FakeProcessor:
@@ -2648,6 +2748,50 @@ _REAL_TEMPLATE_COMPATIBILITY_CASES = [
     ),
     pytest.param(
         {
+            "name": "qwen3.5-hyphen-thinking-on",
+            "template_path": "qwen3.5-chat-template.jinja",
+            "chat_template_kwargs": {"enable_thinking": True},
+            "train_on_reasoning": True,
+            "expected_supervised_substrings": ["inspect repo", "<function=bash>", "ls", "done"],
+            "forbidden_supervised_substrings": ["file_a.py", "<tool_response>"],
+        },
+        id="qwen3.5-hyphen-thinking-on",
+    ),
+    pytest.param(
+        {
+            "name": "qwen3.5-hyphen-thinking-off-no-reasoning-labels",
+            "template_path": "qwen3.5-chat-template.jinja",
+            "chat_template_kwargs": {"enable_thinking": False},
+            "train_on_reasoning": False,
+            "expected_supervised_substrings": ["<function=bash>", "ls", "done"],
+            "forbidden_supervised_substrings": ["inspect repo", "<tool_response>", "file_a.py"],
+        },
+        id="qwen3.5-hyphen-thinking-off-no-reasoning-labels",
+    ),
+    pytest.param(
+        {
+            "name": "qwen3.6-hyphen-thinking-on",
+            "template_path": "qwen3.6-chat-template.jinja",
+            "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
+            "train_on_reasoning": True,
+            "expected_supervised_substrings": ["inspect repo", "<function=bash>", "ls", "done"],
+            "forbidden_supervised_substrings": ["file_a.py", "<tool_response>"],
+        },
+        id="qwen3.6-hyphen-thinking-on",
+    ),
+    pytest.param(
+        {
+            "name": "qwen3.6-hyphen-thinking-off-no-reasoning-labels",
+            "template_path": "qwen3.6-chat-template.jinja",
+            "chat_template_kwargs": {"enable_thinking": False, "preserve_thinking": False},
+            "train_on_reasoning": False,
+            "expected_supervised_substrings": ["<function=bash>", "ls", "done"],
+            "forbidden_supervised_substrings": ["inspect repo", "<tool_response>", "file_a.py"],
+        },
+        id="qwen3.6-hyphen-thinking-off-no-reasoning-labels",
+    ),
+    pytest.param(
+        {
             "name": "gemma4-thinking-off-no-reasoning-labels",
             "template_path": "gemma-4-chat-template.jinja",
             "chat_template_kwargs": {"enable_thinking": False},
@@ -3141,6 +3285,36 @@ def test_marker_boundary_whitespace_reconciliation_handles_insertions_and_deleti
     assert inserted[0] == "start\n\nanswer"
     assert inserted[1][0]["start"] == 5
     assert inserted[1][0]["end"] == 14
+
+
+def test_strip_markers_collects_json_escaped_marker_variants():
+    marker = {
+        "start_marker": "\ue000AGD0S\ue001",
+        "end_marker": "\ue000AGD0E\ue001",
+        "kind": "tool_call",
+        "role": "assistant",
+    }
+    escaped_start = json.dumps(marker["start_marker"])[1:-1]
+    escaped_end = json.dumps(marker["end_marker"])[1:-1]
+
+    stripped = _strip_markers_and_collect_spans(
+        f'<parameter=content>\n{{"name":"{escaped_start}teich-studio{escaped_end}"}}\n</parameter>',
+        [marker],
+    )
+
+    assert stripped is not None
+    text, spans = stripped
+    assert text == '<parameter=content>\n{"name":"teich-studio"}\n</parameter>'
+    assert spans == [
+        {
+            "start": 29,
+            "end": 41,
+            "source_start": 29,
+            "source_end": 41,
+            "kind": "tool_call",
+            "role": "assistant",
+        }
+    ]
 
 
 def test_actual_qwen_template_receives_normalized_mapping_tool_arguments():

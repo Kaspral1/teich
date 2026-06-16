@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
-import difflib
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -695,6 +694,11 @@ def _mark_supervised_messages(
     return marked_messages, markers
 
 
+def _marker_text_variants(marker: str) -> tuple[str, ...]:
+    escaped = json.dumps(marker)[1:-1]
+    return (marker, escaped) if escaped != marker else (marker,)
+
+
 def _strip_markers_and_collect_spans(text: str, markers: list[dict[str, str]]) -> tuple[str, list[dict[str, Any]]] | None:
     if not markers:
         return text, []
@@ -703,13 +707,15 @@ def _strip_markers_and_collect_spans(text: str, markers: list[dict[str, str]]) -
     for index, marker in enumerate(markers):
         start_marker = marker["start_marker"]
         end_marker = marker["end_marker"]
-        marker_lookup[start_marker] = ("start", index)
-        marker_lookup[end_marker] = ("end", index)
-        pattern_parts.append(re.escape(start_marker))
-        pattern_parts.append(re.escape(end_marker))
+        for marker_variant in _marker_text_variants(start_marker):
+            marker_lookup[marker_variant] = ("start", index)
+            pattern_parts.append(re.escape(marker_variant))
+        for marker_variant in _marker_text_variants(end_marker):
+            marker_lookup[marker_variant] = ("end", index)
+            pattern_parts.append(re.escape(marker_variant))
     pattern = re.compile("|".join(pattern_parts))
     cleaned_parts: list[str] = []
-    active_starts: dict[int, int] = {}
+    active_starts: dict[int, list[int]] = {}
     spans: list[dict[str, Any]] = []
     cursor = 0
     cleaned_length = 0
@@ -721,11 +727,15 @@ def _strip_markers_and_collect_spans(text: str, markers: list[dict[str, str]]) -
         marker = match.group(0)
         kind, index = marker_lookup[marker]
         if kind == "start":
-            active_starts[index] = cleaned_length
+            active_starts.setdefault(index, []).append(cleaned_length)
         else:
-            start = active_starts.pop(index, None)
-            if start is None:
-                return None
+            starts = active_starts.get(index)
+            if not starts:
+                cursor = match.end()
+                continue
+            start = starts.pop()
+            if not starts:
+                active_starts.pop(index, None)
             if start < cleaned_length:
                 marker = markers[index]
                 spans.append(
@@ -742,8 +752,6 @@ def _strip_markers_and_collect_spans(text: str, markers: list[dict[str, str]]) -
     tail = text[cursor:]
     if tail:
         cleaned_parts.append(tail)
-    if active_starts:
-        return None
     cleaned_text = "".join(cleaned_parts)
     return cleaned_text, spans
 
@@ -754,7 +762,7 @@ def _range_touches_span_boundary(start: int, end: int, spans: list[dict[str, Any
         span_end = span["end"]
         if start == end and (start == span_start or start == span_end):
             return True
-        if span_start <= start and end <= span_end and (start == span_start or end == span_end):
+        if span_start <= start and end <= span_end:
             return True
     return False
 
@@ -813,24 +821,40 @@ def _reconcile_marker_boundary_whitespace(
 ) -> tuple[str, list[dict[str, Any]]] | None:
     if text == target_text:
         return text, spans
-    matcher = difflib.SequenceMatcher(a=text, b=target_text, autojunk=False)
     edits: list[tuple[int, int, str]] = []
-    for tag, start_a, end_a, start_b, end_b in matcher.get_opcodes():
-        if tag == "equal":
-            continue
-        if tag not in {"delete", "insert", "replace"}:
+
+    text_index = 0
+    target_index = 0
+    while text_index < len(text) or target_index < len(target_text):
+        text_space_start = text_index
+        while text_index < len(text) and text[text_index].isspace():
+            text_index += 1
+        target_space_start = target_index
+        while target_index < len(target_text) and target_text[target_index].isspace():
+            target_index += 1
+
+        removed = text[text_space_start:text_index]
+        inserted = target_text[target_space_start:target_index]
+        if removed != inserted:
+            if not _range_touches_span_boundary(text_space_start, text_index, spans):
+                return None
+            edits.append((text_space_start, text_index, inserted))
+
+        while (
+            text_index < len(text)
+            and target_index < len(target_text)
+            and not text[text_index].isspace()
+            and not target_text[target_index].isspace()
+        ):
+            if text[text_index] != target_text[target_index]:
+                return None
+            text_index += 1
+            target_index += 1
+
+        if text_index >= len(text) and target_index < len(target_text) and not target_text[target_index].isspace():
             return None
-        removed = text[start_a:end_a]
-        inserted = target_text[start_b:end_b]
-        if removed and not removed.isspace():
+        if target_index >= len(target_text) and text_index < len(text) and not text[text_index].isspace():
             return None
-        if inserted and not inserted.isspace():
-            return None
-        if not removed and not inserted:
-            return None
-        if not _range_touches_span_boundary(start_a, end_a, spans):
-            return None
-        edits.append((start_a, end_a, inserted))
     if not edits:
         return None
     adjusted_text = text
@@ -1347,6 +1371,9 @@ def _supervised_text_and_spans(
             return formatted_text, _span_dicts(inferred_spans)
     gemma_spans = _gemma_like_supervised_spans(formatted_text)
     if gemma_spans:
+        gemma_spans = _subtract_spans(gemma_spans, _tool_call_spans(formatted_text))
+        gemma_spans = _subtract_spans(gemma_spans, _tool_response_spans(formatted_text))
+        gemma_spans = _subtract_spans(gemma_spans, _reasoning_spans(formatted_text))
         supervised_spans.extend(
             {
                 "start": start,
