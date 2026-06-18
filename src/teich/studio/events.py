@@ -250,6 +250,8 @@ def _summarize_claude(event: dict[str, Any]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def _summarize_external(event: dict[str, Any]) -> list[dict[str, Any]]:
+    if isinstance(event.get("messages"), list):
+        return summarize_chat_row(event)
     if event.get("type") != "external_message":
         return []
     role = event.get("role")
@@ -272,11 +274,17 @@ def _summarize_external(event: dict[str, Any]) -> list[dict[str, Any]]:
     return events
 
 
+def _summarize_structured_row(event: dict[str, Any]) -> list[dict[str, Any]]:
+    return summarize_chat_row(event)
+
+
 _SUMMARIZERS = {
     "codex": _summarize_codex,
     "pi": _summarize_pi,
     "claude-code": _summarize_claude,
     "hermes": _summarize_external,
+    "cursor": _summarize_structured_row,
+    "chat": _summarize_structured_row,
 }
 
 

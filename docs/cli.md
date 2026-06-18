@@ -38,7 +38,7 @@ Extract existing local sessions:
 teich extract claude --model fable-5 --out data
 ```
 
-The first argument is the provider: `claude`, `codex`, `pi`, or `hermes`.
+The first argument is the provider: `claude`, `codex`, `cursor`, `pi`, or `hermes`.
 
 Useful options:
 
@@ -55,6 +55,8 @@ claude  CLAUDE_CONFIG_DIR/projects, CLAUDE_HOME/projects, ~/.claude/projects
 codex   CODEX_HOME/sessions, ~/.codex/sessions
 pi      PI_SESSION_DIR, PI_CODING_AGENT_DIR/sessions, ~/.pi/agent/sessions, ~/.pi/sessions
 hermes  HERMES_STATE_DB, HERMES_HOME/state.db, ~/.hermes/state.db
+cursor  CURSOR_WORKSPACE_STORAGE, CURSOR_GLOBAL_STORAGE_DB, Cursor/User/workspaceStorage,
+        Cursor/User/globalStorage/state.vscdb, ~/.cursor-server/data/User/workspaceStorage
 ```
 
 Explicit paths can point at either the agent root or the native store:
@@ -69,6 +71,8 @@ teich extract pi --sessions-dir /path/to/.pi/agent/sessions --out data
 teich extract pi --sessions-dir /path/to/.pi/sessions --out data
 teich extract hermes --sessions-dir /path/to/.hermes --out data
 teich extract hermes --sessions-dir /path/to/.hermes/state.db --out data
+teich extract cursor --sessions-dir /path/to/Cursor/User/workspaceStorage --out data
+teich extract cursor --sessions-dir /path/to/Cursor/User/globalStorage/state.vscdb --out data
 ```
 
 Extraction anonymizes staged traces by default. Review the staged files before upload; `--no-anon` keeps raw values unchanged.

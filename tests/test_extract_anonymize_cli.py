@@ -37,6 +37,233 @@ def _write_minimal_hermes_state_db(state_db: Path, *, session_id: str = "session
         connection.close()
 
 
+def _write_minimal_cursor_state_db(state_db: Path) -> None:
+    state_db.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(state_db)
+    try:
+        connection.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+        connection.execute("CREATE TABLE composerSessions (id TEXT PRIMARY KEY, data TEXT)")
+        connection.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+            (
+                "workbench.panel.aichat.view.aichat.chatdata",
+                json.dumps(
+                    {
+                        "model": "cursor-fable-5",
+                        "messages": [
+                            {"role": "user", "content": "open chat prompt"},
+                            {
+                                "role": "assistant",
+                                "content": "chat answer",
+                                "toolCalls": [
+                                    {
+                                        "id": "call-read",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "read_file",
+                                            "arguments": {"path": "README.md"},
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                        "tools": [
+                            {
+                                "name": "read_file",
+                                "description": "Read a file",
+                                "parameters": {"type": "object"},
+                            }
+                        ],
+                    }
+                ),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO composerSessions (id, data) VALUES (?, ?)",
+            (
+                "composer-1",
+                json.dumps(
+                    {
+                        "modelName": "cursor-fable-5",
+                        "composer": {
+                            "messages": [
+                                {"type": "human", "text": "composer prompt"},
+                                {"type": "assistant", "text": "composer answer"},
+                                {
+                                    "role": "tool",
+                                    "content": "tool output",
+                                    "tool_call_id": "call-read",
+                                    "name": "read_file",
+                                },
+                            ]
+                        },
+                    }
+                ),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+            (
+                "agentKv:blob:internal-state",
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": "internal agent prompt"},
+                        ]
+                    }
+                ),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _write_archived_cursor_state_db(state_db: Path) -> None:
+    state_db.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(state_db)
+    try:
+        connection.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
+        connection.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            (
+                "composerData:archived-composer",
+                json.dumps(
+                    {
+                        "composerId": "archived-composer",
+                        "status": "completed",
+                        "fullConversationHeadersOnly": [
+                            {"bubbleId": "user-bubble", "type": 1},
+                            {"bubbleId": "assistant-bubble", "type": 2},
+                            {"bubbleId": "tool-bubble", "type": 2},
+                            {"bubbleId": "final-bubble", "type": 2},
+                        ],
+                    }
+                ),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            (
+                "bubbleId:archived-composer:user-bubble",
+                json.dumps(
+                    {
+                        "bubbleId": "user-bubble",
+                        "type": 1,
+                        "text": "archived prompt",
+                        "modelInfo": {"modelName": "cursor-fable-5"},
+                    }
+                ),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            (
+                "bubbleId:archived-composer:assistant-bubble",
+                json.dumps(
+                    {
+                        "bubbleId": "assistant-bubble",
+                        "type": 2,
+                        "text": "archived answer",
+                        "thinking": {"text": "archived reasoning"},
+                    }
+                ),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            (
+                "bubbleId:archived-composer:tool-bubble",
+                json.dumps(
+                    {
+                        "bubbleId": "tool-bubble",
+                        "type": 2,
+                        "toolFormerData": {
+                            "name": "read_file",
+                            "toolCallId": "call-read",
+                            "rawArgs": '{"path":"README.md"}',
+                            "result": "file contents",
+                            "status": "completed",
+                        },
+                    }
+                ),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            (
+                "bubbleId:archived-composer:final-bubble",
+                json.dumps(
+                    {
+                        "bubbleId": "final-bubble",
+                        "type": 2,
+                        "text": "final response",
+                    }
+                ),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _write_unsafe_cursor_state_db(state_db: Path) -> None:
+    state_db.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(state_db)
+    try:
+        connection.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
+
+        def insert(key: str, value: dict[str, object]) -> None:
+            connection.execute("INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)", (key, json.dumps(value)))
+
+        def insert_composer(composer_id: str, bubble_ids: list[str]) -> None:
+            insert(
+                f"composerData:{composer_id}",
+                {
+                    "composerId": composer_id,
+                    "status": "completed",
+                    "fullConversationHeadersOnly": [
+                        {"bubbleId": bubble_id, "type": 1 if bubble_id.startswith("user") else 2}
+                        for bubble_id in bubble_ids
+                    ],
+                },
+            )
+
+        shared_bubbles = {
+            "user-1": {"bubbleId": "user-1", "type": 1, "text": "first prompt"},
+            "assistant-1": {"bubbleId": "assistant-1", "type": 2, "text": "first answer"},
+            "user-2": {"bubbleId": "user-2", "type": 1, "text": "second prompt"},
+            "assistant-2": {"bubbleId": "assistant-2", "type": 2, "text": "second answer"},
+            "leading-assistant": {"bubbleId": "leading-assistant", "type": 2, "text": "orphaned start"},
+            "trailing-user": {"bubbleId": "trailing-user", "type": 1, "text": "dangling user"},
+            "no-user-assistant": {"bubbleId": "no-user-assistant", "type": 2, "text": "no user"},
+        }
+        for composer_id in ("safe-full", "safe-duplicate"):
+            insert_composer(
+                composer_id,
+                [
+                    "leading-assistant",
+                    "user-1",
+                    "assistant-1",
+                    "user-2",
+                    "assistant-2",
+                    "trailing-user",
+                ],
+            )
+            for bubble_id, bubble in shared_bubbles.items():
+                insert(f"bubbleId:{composer_id}:{bubble_id}", bubble)
+
+        insert_composer("contained", ["user-2", "assistant-2"])
+        insert("bubbleId:contained:user-2", shared_bubbles["user-2"])
+        insert("bubbleId:contained:assistant-2", shared_bubbles["assistant-2"])
+
+        insert_composer("no-user", ["no-user-assistant"])
+        insert("bubbleId:no-user:no-user-assistant", shared_bubbles["no-user-assistant"])
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def test_extract_help_covers_providers_options_defaults_and_examples():
     root_help = runner.invoke(app, ["--help"])
 
@@ -50,7 +277,7 @@ def test_extract_help_covers_providers_options_defaults_and_examples():
     assert group_help.exit_code == 0
     group_output = _plain_cli_output(group_help.output)
     assert "PROVIDER" in group_output
-    for provider in ("claude", "codex", "pi", "hermes"):
+    for provider in ("claude", "codex", "cursor", "pi", "hermes"):
         assert provider in group_output
     assert "--sessions-dir" in group_output
     assert "--output,--out" in group_output
@@ -66,13 +293,16 @@ def test_extract_help_covers_providers_options_defaults_and_examples():
     assert ".pi/sessions" in group_output
     assert ".hermes" in group_output
     assert ".hermes/state.db" in group_output
+    assert "Cursor/User/workspaceStorage" in group_output
+    assert "Cursor/User/globalStorage/state.vscdb" in group_output
     assert "CLAUDE_CONFIG_DIR/projects" in group_output
     assert "CODEX_HOME/sessions" in group_output
     assert "HERMES_STATE_DB" in group_output
+    assert "CURSOR_WORKSPACE_STORAGE" in group_output
     assert "fable-5" in group_output
     assert "teich convert data --out teich-training.jsonl" in group_output
 
-    for provider in ("claude", "codex", "hermes", "pi"):
+    for provider in ("claude", "codex", "cursor", "hermes", "pi"):
         result = runner.invoke(app, ["extract", provider, "--help"])
 
         assert result.exit_code == 0
@@ -87,6 +317,7 @@ def test_extract_help_covers_providers_options_defaults_and_examples():
         assert ".codex" in output
         assert ".pi" in output
         assert ".hermes" in output
+        assert "Cursor" in output
 
 
 def test_extract_codex_from_explicit_sessions_dir(tmp_path: Path):
@@ -140,14 +371,149 @@ def test_extract_hermes_from_explicit_state_db(tmp_path: Path):
     )
 
     assert result.exit_code == 0
-    extracted = output_dir / "hermes-agent-session-1.jsonl"
+    extracted = output_dir / "sessions.jsonl"
     assert extracted.exists()
     rows = [json.loads(line) for line in extracted.read_text(encoding="utf-8").splitlines()]
-    assert rows[0]["type"] == "external_session_meta"
-    assert rows[0]["payload"]["source"] == "hermes-agent"
-    assert rows[1]["type"] == "external_message"
-    assert rows[1]["role"] == "user"
+    assert rows[0]["id"] == "session/1"
+    assert rows[0]["source"] == "cli"
+    assert rows[0]["hermes_source"] == "cli"
+    assert rows[0]["messages"][0]["role"] == "user"
+    assert rows[0]["messages"][0]["content"] == "hello"
     assert (output_dir / "README.md").exists()
+
+
+def test_extract_cursor_from_workspace_state_db(tmp_path: Path):
+    state_db = tmp_path / "workspaceStorage" / "workspace-hash" / "state.vscdb"
+    _write_minimal_cursor_state_db(state_db)
+
+    output_dir = tmp_path / "output"
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "cursor",
+            "--sessions-dir",
+            str(state_db.parent.parent),
+            "--output",
+            str(output_dir),
+            "--no-anon",
+        ],
+        input="n\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    extracted = output_dir / "cursor-sessions.jsonl"
+    assert extracted.exists()
+    rows = [json.loads(line) for line in extracted.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 2
+    rows_by_table = {row["metadata"]["cursor_table"]: row for row in rows}
+    assert set(rows_by_table) == {"ItemTable", "composerSessions"}
+    assert {row["metadata"]["cursor_scope"] for row in rows} == {"workspace"}
+    assert {row["metadata"]["cursor_workspace_id"] for row in rows} == {"workspace-hash"}
+    assert rows_by_table["composerSessions"]["prompt"] == "composer prompt"
+    assert rows_by_table["ItemTable"]["prompt"] == "open chat prompt"
+    assert rows_by_table["ItemTable"]["tools"][0]["function"]["name"] == "read_file"
+    assert rows_by_table["ItemTable"]["messages"][1]["tool_calls"][0]["function"]["name"] == "read_file"
+    converted = convert_traces_to_training_data(output_dir)
+    assert {row["prompt"] for row in converted} == {"composer prompt", "open chat prompt"}
+    assert {row["metadata"]["trace_type"] for row in converted} == {"cursor"}
+
+
+def test_extract_cursor_reconstructs_archived_composer_data(tmp_path: Path):
+    state_db = tmp_path / "globalStorage" / "state.vscdb"
+    _write_archived_cursor_state_db(state_db)
+
+    output_dir = tmp_path / "output"
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "cursor",
+            "--sessions-dir",
+            str(state_db),
+            "--output",
+            str(output_dir),
+            "--no-anon",
+        ],
+        input="n\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    rows = [
+        json.loads(line)
+        for line in (output_dir / "cursor-sessions.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["metadata"]["cursor_storage_kind"] == "composerData"
+    assert row["metadata"]["cursor_scope"] == "global"
+    assert row["metadata"]["cursor_headers"] == 4
+    assert row["prompt"] == "archived prompt"
+    assert row["response"] == "final response"
+    assert row["model"] == "cursor-fable-5"
+    assert [message["role"] for message in row["messages"]] == ["user", "assistant", "assistant", "tool", "assistant"]
+    assert row["messages"][1]["reasoning_content"] == "archived reasoning"
+    assert row["messages"][2]["tool_calls"][0]["function"]["name"] == "read_file"
+    assert row["messages"][3]["tool_call_id"] == "call-read"
+    assert row["messages"][3]["content"] == "file contents"
+    assert row["messages"][4]["content"] == "final response"
+    tools_by_name = {tool["function"]["name"]: tool for tool in row["tools"]}
+    assert "run_terminal_cmd" in tools_by_name
+    assert tools_by_name["read_file"]["function"]["parameters"]["properties"]["path"] == {"type": "string"}
+    assert tools_by_name["read_file"]["function"]["parameters"]["required"] == ["path"]
+
+    converted = convert_traces_to_training_data(output_dir)
+    assert len(converted) == 1
+    assert converted[0]["prompt"] == "archived prompt"
+    assert any(
+        message.get("role") == "assistant" and message.get("content") == "final response"
+        for message in converted[0]["messages"]
+    )
+
+
+def test_extract_cursor_sanitizes_training_unsafe_archived_rows(tmp_path: Path):
+    state_db = tmp_path / "globalStorage" / "state.vscdb"
+    _write_unsafe_cursor_state_db(state_db)
+
+    output_dir = tmp_path / "output"
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "cursor",
+            "--sessions-dir",
+            str(state_db),
+            "--output",
+            str(output_dir),
+            "--no-anon",
+        ],
+        input="n\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    rows = [
+        json.loads(line)
+        for line in (output_dir / "cursor-sessions.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(rows) == 1
+    row = rows[0]
+    assert [message["role"] for message in row["messages"]] == ["user", "assistant", "user", "assistant"]
+    assert [message["content"] for message in row["messages"]] == [
+        "first prompt",
+        "first answer",
+        "second prompt",
+        "second answer",
+    ]
+    assert row["prompt"] == "first prompt"
+    assert row["response"] == "second answer"
+    assert row["metadata"]["cursor_message_count"] == 4
+    tool_names = {tool["function"]["name"] for tool in row["tools"]}
+    assert {"read_file", "run_terminal_cmd", "edit_file"}.issubset(tool_names)
+
+    converted = convert_traces_to_training_data(output_dir)
+    assert len(converted) == 1
+    assert converted[0]["messages"] == row["messages"]
+    assert converted[0]["metadata"]["trace_type"] == "cursor"
 
 
 def test_extract_accepts_agent_root_or_native_session_store(tmp_path: Path):
@@ -187,8 +553,8 @@ def test_extract_accepts_agent_root_or_native_session_store(tmp_path: Path):
         ("codex-sessions", "codex", codex_sessions, "session.jsonl"),
         ("pi-root", "pi", pi_root, "session.jsonl"),
         ("pi-sessions", "pi", pi_sessions, "session.jsonl"),
-        ("hermes-root", "hermes", hermes_root, "hermes-agent-session-1.jsonl"),
-        ("hermes-state-db", "hermes", hermes_root / "state.db", "hermes-agent-session-1.jsonl"),
+        ("hermes-root", "hermes", hermes_root, "sessions.jsonl"),
+        ("hermes-state-db", "hermes", hermes_root / "state.db", "sessions.jsonl"),
     ]
     for label, provider, source, expected_file in cases:
         output_dir = tmp_path / f"out-{label}"
@@ -294,7 +660,7 @@ def test_extract_no_anon_skips_automatic_anonymization(tmp_path: Path):
     assert original_key in text
 
 
-def test_extract_model_filter_for_codex_claude_pi_and_hermes(tmp_path: Path):
+def test_extract_model_filter_for_codex_claude_cursor_pi_and_hermes(tmp_path: Path):
     codex_dir = tmp_path / "codex"
     claude_dir = tmp_path / "claude"
     pi_dir = tmp_path / "pi"
@@ -347,11 +713,59 @@ def test_extract_model_filter_for_codex_claude_pi_and_hermes(tmp_path: Path):
     finally:
         connection.close()
 
+    cursor_db = tmp_path / "cursor" / "globalStorage" / "state.vscdb"
+    cursor_db.parent.mkdir(parents=True)
+    connection = sqlite3.connect(cursor_db)
+    try:
+        connection.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
+        for composer_id, model in (("cursor-fable", "cursor-fable-5"), ("cursor-opus", "cursor-opus")):
+            connection.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                (
+                    f"composerData:{composer_id}",
+                    json.dumps(
+                        {
+                            "composerId": composer_id,
+                            "status": "completed",
+                            "fullConversationHeadersOnly": [
+                                {"bubbleId": "user", "type": 1},
+                                {"bubbleId": "assistant", "type": 2},
+                            ],
+                        }
+                    ),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                (
+                    f"bubbleId:{composer_id}:user",
+                    json.dumps({"bubbleId": "user", "type": 1, "text": "hello"}),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                (
+                    f"bubbleId:{composer_id}:assistant",
+                    json.dumps(
+                        {
+                            "bubbleId": "assistant",
+                            "type": 2,
+                            "text": "answer",
+                            "modelInfo": {"modelName": model},
+                        }
+                    ),
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
     cases = [
         ("codex", codex_dir, "fable.jsonl"),
         ("claude", claude_dir, "fable.jsonl"),
+        ("cursor", cursor_db, "cursor-sessions.jsonl"),
         ("pi", pi_dir, "fable.jsonl"),
-        ("hermes", state_db, "hermes-agent-hermes-fable.jsonl"),
+        ("hermes", state_db, "sessions.jsonl"),
     ]
     for provider, source, expected_file in cases:
         output_dir = tmp_path / f"out-{provider}"

@@ -90,12 +90,13 @@ The Extract tab is a UI wrapper over:
 teich extract PROVIDER --sessions-dir PATH --out ./output
 ```
 
-Use it to stage existing local sessions from `claude`, `codex`, `pi`, or `hermes` without leaving the browser. The source box accepts either the provider home folder or the provider's direct data path:
+Use it to stage existing local sessions from `claude`, `codex`, `cursor`, `pi`, or `hermes` without leaving the browser. The source box accepts either the provider home folder or the provider's direct data path:
 
 - Claude: `.claude` or `.claude/projects`
 - Codex: `.codex` or `.codex/sessions`
 - Pi: `.pi`, `.pi/agent/sessions`, or `.pi/sessions`
 - Hermes: `.hermes` or `.hermes/state.db`
+- Cursor: `Cursor/User/workspaceStorage` or `Cursor/User/globalStorage/state.vscdb`
 
 Studio can fill in detected default paths for the selected provider. Extraction writes into the configured output folder, generates a dataset `README.md`, and anonymizes staged traces by default. Check **Skip anonymization** only when you are intentionally keeping raw local values.
 

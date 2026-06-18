@@ -116,7 +116,7 @@ class DatasetUploadRequest(BaseModel):
 _docker_cache: dict[str, Any] = {"checked_at": 0.0, "available": False, "detail": None}
 TERMINAL_READY_STATUSES = {"ready", "live", "exited", "error"}
 TERMINAL_STARTUP_NOTICE_SECONDS = 15.0
-EXTRACT_PROVIDERS = {"claude", "codex", "hermes", "pi"}
+EXTRACT_PROVIDERS = {"claude", "codex", "cursor", "hermes", "pi"}
 UPLOAD_IGNORE_PATTERNS = ["partials/**", "failures/**"]
 
 
@@ -125,7 +125,7 @@ def _normalize_extract_provider(provider: str) -> ExtractProvider:
     if normalized == "claude-code":
         normalized = "claude"
     if normalized not in EXTRACT_PROVIDERS:
-        raise ValueError("Provider must be one of: claude, codex, pi, hermes.")
+        raise ValueError("Provider must be one of: claude, codex, cursor, pi, hermes.")
     return cast(ExtractProvider, normalized)
 
 
@@ -218,6 +218,15 @@ def detect_trace_provider(events: list[dict[str, Any]]) -> str:
             return "pi"
         if "sessionId" in event or event_type == "queue-operation":
             return "claude-code"
+        metadata = event.get("metadata")
+        if isinstance(metadata, dict) and isinstance(metadata.get("trace_type"), str):
+            return metadata["trace_type"]
+        if (
+            isinstance(event.get("messages"), list)
+            and event.get("source") == "cli"
+            and ("hermes_source" in event or "parent_session_id" in event or "started_at" in event)
+        ):
+            return "hermes"
         if isinstance(event.get("messages"), list):
             return "chat"
     return "unknown"

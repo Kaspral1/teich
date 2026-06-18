@@ -203,7 +203,7 @@
       <section class="view" id="view-extract">
         <header class="view-header">
           <h1>Extract</h1>
-          <p>Stage existing local Claude, Codex, Pi, or Hermes sessions into the Studio output folder.</p>
+          <p>Stage existing local Claude, Codex, Cursor, Pi, or Hermes sessions into the Studio output folder.</p>
         </header>
 
         <div class="card">
@@ -213,6 +213,7 @@
               <select id="extract-provider">
                 <option value="claude">Claude</option>
                 <option value="codex">Codex</option>
+                <option value="cursor">Cursor</option>
                 <option value="pi">Pi</option>
                 <option value="hermes">Hermes</option>
               </select>
@@ -231,7 +232,7 @@
             </label>
             <label class="field span-2">
               <span>Session sources</span>
-              <textarea id="extract-sources" rows="5" placeholder="/path/to/.claude&#10;/path/to/.claude/projects&#10;/path/to/.hermes/state.db"></textarea>
+              <textarea id="extract-sources" rows="5" placeholder="/path/to/.claude&#10;/path/to/.claude/projects&#10;/path/to/.hermes/state.db&#10;/path/to/Cursor/User/workspaceStorage"></textarea>
               <small id="extract-source-hint"></small>
             </label>
           </div>

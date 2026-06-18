@@ -9,7 +9,13 @@ import pytest
 
 from teich import load_traces, mask_data, prepare_data, preview_sft_example, row_fits_context
 from teich.converter import convert_trace_to_training_example
-from teich.formatter import _labels_from_offsets, _reconcile_marker_boundary_whitespace, _strip_markers_and_collect_spans
+from teich.formatter import (
+    PrepareReport,
+    _labels_from_offsets,
+    _reconcile_marker_boundary_whitespace,
+    _strip_markers_and_collect_spans,
+    format_data,
+)
 
 
 def prepare_and_mask_for_test(
@@ -443,7 +449,12 @@ def test_reordered_mapping_markers_preserve_typed_tool_spans():
                     },
                     {"role": "tool", "tool_call_id": "call_1", "name": "TaskCreate", "content": "SECRET_TOOL_OUTPUT"},
                 ],
-                "tools": [],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "TaskCreate", "parameters": {"type": "object"}},
+                    }
+                ],
             }
         ]
     )
@@ -702,6 +713,141 @@ def test_prepare_and_mask_supervises_only_assistant_turns_across_multi_turn_conv
     )
     assert "<system>system rules</system>" in masked_text
     assert "<user>first request</user>" in masked_text
+
+
+def test_prepare_data_formats_sanitized_cursor_tool_row():
+    tokenizer = FakeTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "inspect"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-read",
+                                "type": "function",
+                                "function": {"name": "read_file", "arguments": '{"path":"README.md"}'},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call-read", "name": "read_file", "content": "contents"},
+                    {"role": "assistant", "content": "done"},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "read_file", "parameters": {"type": "object"}},
+                    }
+                ],
+                "metadata": {"trace_type": "cursor"},
+            }
+        ]
+    )
+
+    training_data = prepare_and_mask_for_test(dataset, tokenizer, include_debug_columns=True)
+    rendered = training_data[0]["text"]
+    supervised_text = tokenizer.decode([token for token in training_data[0]["labels"] if token != -100])
+
+    assert training_data.num_rows == 1
+    assert "<tool_call>read_file</tool_call>" in rendered
+    assert "<tool_call>read_file</tool_call>" in supervised_text
+    assert "done</assistant>" in supervised_text
+
+
+def test_prepare_data_truncates_before_turn_with_undeclared_tool_call():
+    tokenizer = FakeTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "first request"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-valid",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": {"command": "ls"}},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call-valid", "name": "bash", "content": "file_a.py"},
+                    {"role": "assistant", "content": "first answer"},
+                    {"role": "user", "content": "second request"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-missing",
+                                "type": "function",
+                                "function": {"name": "missing_tool", "arguments": {}},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call-missing", "name": "missing_tool", "content": "ignored"},
+                    {"role": "assistant", "content": "second answer"},
+                ],
+                "tools": [{"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}}],
+            }
+        ]
+    )
+
+    training_data = prepare_and_mask_for_test(dataset, tokenizer, include_debug_columns=True)
+    rendered = training_data[0]["text"]
+
+    assert training_data.num_rows == 1
+    assert "first request" in rendered
+    assert "first answer" in rendered
+    assert "<tool_call>bash</tool_call>" in rendered
+    assert "second request" not in rendered
+    assert "missing_tool" not in rendered
+    assert "second answer" not in rendered
+
+
+def test_prepare_data_drops_row_when_undeclared_tool_call_has_no_prior_turn():
+    report = PrepareReport()
+    dataset = Dataset.from_list(
+        [
+            {
+                "id": "drop-me",
+                "messages": [
+                    {"role": "user", "content": "first request"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-missing",
+                                "type": "function",
+                                "function": {"name": "missing_tool", "arguments": {}},
+                            }
+                        ],
+                    },
+                ],
+                "tools": [{"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}}],
+            },
+            {
+                "id": "keep-me",
+                "messages": [
+                    {"role": "user", "content": "second request"},
+                    {"role": "assistant", "content": "second answer"},
+                ],
+                "tools": [],
+            },
+        ]
+    )
+
+    training_data = format_data(dataset, FakeTokenizer(), preserve_columns=["id"], report=report, verbose=False)
+
+    assert training_data.num_rows == 1
+    assert training_data[0]["id"] == "keep-me"
+    assert "second answer" in training_data[0]["text"]
+    assert report.dropped_rows == [{"raw_index": 0, "row_id": "drop-me", "unsupported_tool": "missing_tool", "reason": "unsupported_tool_call"}]
 
 
 def test_prepare_and_mask_returns_compact_training_columns_by_default():

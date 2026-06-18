@@ -65,6 +65,18 @@ def test_snapshot_configured_tools_uses_pi_builtins():
     assert "edit" in names
 
 
+def test_snapshot_configured_tools_uses_cursor_builtins():
+    config = Config(agent={"provider": "cursor"})
+
+    tools = snapshot_configured_tools(config)
+
+    names = [tool["function"]["name"] for tool in tools]
+    assert "read_file" in names
+    assert "run_terminal_cmd" in names
+    assert "edit_file" in names
+    assert "codebase_search" in names
+
+
 def test_snapshot_configured_tools_uses_hermes_builtins():
     config = Config(agent={"provider": "hermes"})
 

@@ -229,7 +229,24 @@ def test_detect_trace_provider():
     assert detect_trace_provider([{"type": "session", "id": "x"}]) == "pi"
     assert detect_trace_provider([{"type": "external_session_meta"}]) == "hermes"
     assert detect_trace_provider([{"type": "user", "sessionId": "abc"}]) == "claude-code"
+    assert detect_trace_provider([{"source": "cli", "hermes_source": "cli", "messages": []}]) == "hermes"
+    assert detect_trace_provider([{"metadata": {"trace_type": "cursor"}, "messages": []}]) == "cursor"
     assert detect_trace_provider([{"messages": []}]) == "chat"
+
+
+def test_summarize_structured_cursor_and_native_hermes_rows():
+    row = {
+        "messages": [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "content": "done"},
+        ]
+    }
+
+    assert [event["kind"] for event in summarize_trace_events("cursor", [row])] == ["user", "assistant"]
+    assert [event["kind"] for event in summarize_trace_events("hermes", [{"source": "cli", **row}])] == [
+        "user",
+        "assistant",
+    ]
 
 
 # ---------------------------------------------------------------------------

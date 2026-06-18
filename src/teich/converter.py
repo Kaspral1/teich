@@ -15,8 +15,21 @@ FIRST_MESSAGE_TIMESTAMP_METADATA_KEY = "first_message_timestamp"
 PI_SYSTEM_PROMPT_CUSTOM_TYPE = "teich-system-prompt"
 TEICH_AVAILABLE_TOOLS_CUSTOM_TYPE = "teich-available-tools"
 TEICH_TRACE_CONTEXT_ITEM_TYPE = "teich_context"
-TraceType = Literal["claude_code", "codex", "droid", "external_agent", "hermes", "openclaw", "pi"]
+TraceType = Literal["claude_code", "codex", "cursor", "droid", "external_agent", "hermes", "openclaw", "pi"]
 _TIMESTAMP_KEYS = ("timestamp", "created_at", "createdAt")
+_CURSOR_METADATA_KEYS = frozenset(
+    {
+        "cursor_headers",
+        "cursor_key",
+        "cursor_message_count",
+        "cursor_row",
+        "cursor_scope",
+        "cursor_source_db",
+        "cursor_storage_kind",
+        "cursor_table",
+        "cursor_workspace_id",
+    }
+)
 
 
 def _object_parameters(
@@ -1672,6 +1685,20 @@ def _external_session_source(event: dict[str, Any]) -> str:
     return source.strip().lower() if isinstance(source, str) else ""
 
 
+def _is_cursor_trace_row(event: Any) -> bool:
+    if not isinstance(event, dict):
+        return False
+    metadata = event.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    trace_type = metadata.get("trace_type")
+    if isinstance(trace_type, str) and trace_type.strip().lower().replace("-", "_") == "cursor":
+        return True
+    if any(key in metadata for key in _CURSOR_METADATA_KEYS):
+        return True
+    return isinstance(event.get("raw_cursor"), dict)
+
+
 def _detect_trace_type(events: list[Any], default: TraceType | None = "codex") -> TraceType | None:
     first_event = next((event for event in events if isinstance(event, dict)), None)
     if _is_openclaw_session_header(first_event):
@@ -1684,6 +1711,8 @@ def _detect_trace_type(events: list[Any], default: TraceType | None = "codex") -
             continue
         if _is_hermes_trace_row(event):
             return "hermes"
+        if _is_cursor_trace_row(event):
+            return "cursor"
         event_type = event.get("type")
         if event_type == "external_session_meta":
             source = _external_session_source(event)

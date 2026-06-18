@@ -3628,6 +3628,7 @@ class HermesRunner(ExternalCliRunner):
                 "model": self._sqlite_row_get(row, "model") or self.config.get_effective_model(),
                 "configured_context_length": self.config.model.context_length,
                 "hermes_source": self._sqlite_row_get(row, "source"),
+                "toolsets": HERMES_DEFAULT_TOOLSETS.split(","),
                 "total_tokens": total_tokens,
                 "estimated_cost_usd": estimated_cost,
                 "actual_cost_usd": actual_cost,
@@ -3635,6 +3636,9 @@ class HermesRunner(ExternalCliRunner):
                 "messages": messages,
             }
         )
+        tools = self._configured_tools()
+        if tools:
+            session["tools"] = tools
         model_config = self._json_or_original(session.get("model_config"))
         if model_config is not None:
             session["model_config"] = model_config
@@ -3650,21 +3654,9 @@ class HermesRunner(ExternalCliRunner):
     ) -> dict[str, object]:
         return self._hermes_session_export(row, messages, workspace, partial=partial)
 
-    def _resolve_hermes_trace_path(self, session_id: str, *, partial: bool = False) -> Path:
-        safe_session_id = self._safe_session_file_id(session_id)
-        destination = (
-            self.config.output.failures_dir if partial else self.config.output.traces_dir
-        ) / f"{self.source_name}-{safe_session_id}.jsonl"
-        if not destination.exists():
-            return destination
-        stem = destination.stem
-        suffix = destination.suffix
-        counter = 1
-        while True:
-            candidate = destination.with_name(f"{stem}_{counter}{suffix}")
-            if not candidate.exists():
-                return candidate
-            counter += 1
+    def _resolve_hermes_trace_path(self, _session_id: str | None = None, *, partial: bool = False) -> Path:
+        destination_dir = self.config.output.failures_dir if partial else self.config.output.traces_dir
+        return destination_dir / "sessions.jsonl"
 
     def _hermes_message_export(self, row: sqlite3.Row) -> dict[str, object]:
         message = dict(row)
@@ -3779,16 +3771,30 @@ class HermesRunner(ExternalCliRunner):
         if not rows:
             return {}
         exported: dict[str, Path] = {}
-        for row in rows:
-            session_id = str(row.get("id") or "")
-            if not session_id:
-                continue
-            events = self._hermes_external_trace_events(row)
-            with HERMES_TRACE_WRITE_LOCK:
-                destination = self._resolve_hermes_trace_path(session_id, partial=partial)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                self._write_events(destination, events)
-            exported[session_id] = destination
+        destination = self._resolve_hermes_trace_path(partial=partial)
+        with HERMES_TRACE_WRITE_LOCK:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            existing_ids: set[str] = set()
+            if destination.exists():
+                try:
+                    with destination.open("r", encoding="utf-8") as handle:
+                        for raw_line in handle:
+                            if not raw_line.strip():
+                                continue
+                            existing = json.loads(raw_line)
+                            if isinstance(existing, dict) and existing.get("id"):
+                                existing_ids.add(str(existing["id"]))
+                except (OSError, json.JSONDecodeError):
+                    existing_ids = set()
+            with destination.open("a", encoding="utf-8") as handle:
+                for row in rows:
+                    session_id = str(row.get("id") or "")
+                    if not session_id:
+                        continue
+                    if session_id not in existing_ids:
+                        handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+                        existing_ids.add(session_id)
+                    exported[session_id] = destination
         return exported
 
     def _hermes_state_session_rows(
@@ -3835,7 +3841,7 @@ class HermesRunner(ExternalCliRunner):
         home_dir.chmod(0o777)
         container_name = self._container_name(self.container_kind, session_id)
         turn_prompts = _agent_turn_prompts(prompt, prompt_input)
-        fallback_destination = self._resolve_output_path(f"{self.source_name}-{session_id}.jsonl")
+        fallback_destination = self._resolve_hermes_trace_path()
         fallback_destination.parent.mkdir(parents=True, exist_ok=True)
         stdout_parts: list[str] = []
         try:
@@ -3918,7 +3924,6 @@ class HermesRunner(ExternalCliRunner):
                 self._export_hermes_state_sessions(home_dir, workspace, partial=True)
             except Exception:
                 pass
-            self._discard_output_file(fallback_destination)
             raise
         finally:
             if len(turn_prompts) > 1:

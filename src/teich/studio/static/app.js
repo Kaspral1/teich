@@ -811,7 +811,7 @@ async function detectExtractSources({ apply = false } = {}) {
     const sources = result.sources || [];
     $("#extract-source-hint").textContent = sources.length
       ? `${sources.length} default path${sources.length === 1 ? "" : "s"} found`
-      : "No default paths found. Paste a .claude/.codex/.pi/.hermes folder or provider data path.";
+      : "No default paths found. Paste a .claude/.codex/.pi/.hermes folder, Cursor workspaceStorage/globalStorage path, or provider data path.";
     if (apply) $("#extract-sources").value = sources.join("\n");
     return sources;
   } catch (err) {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
@@ -11,9 +12,20 @@ import os
 import re
 import shutil
 import sqlite3
+from tempfile import TemporaryDirectory
 from typing import Any, Literal
 
-ExtractProvider = Literal["claude", "codex", "hermes", "pi"]
+from .tool_schema import CURSOR_BUILTIN_TOOLS
+
+ExtractProvider = Literal["claude", "codex", "cursor", "hermes", "pi"]
+CURSOR_RECORD_TERMS = (
+    "aichat",
+    "ai_chat",
+    "aiService",
+    "chat",
+    "composer",
+    "conversation",
+)
 
 
 @dataclass(frozen=True)
@@ -63,6 +75,8 @@ def default_session_sources(provider: ExtractProvider, home: Path | None = None)
                 home / ".hermes" / "state.db",
             ]
         )
+    if provider == "cursor":
+        return _existing_unique_paths(_cursor_default_sources(home))
     raise ValueError(f"Unsupported extract provider: {provider}")
 
 
@@ -76,13 +90,16 @@ def extract_local_sessions(
     clear_destination: bool = False,
 ) -> ExtractResult:
     """Extract local sessions for provider into output_dir."""
-    resolved_sources = _existing_unique_paths(list(sources) if sources is not None else default_session_sources(provider, home))
+    source_candidates = list(sources) if sources is not None else default_session_sources(provider, home)
+    resolved_sources = _existing_unique_paths(source_candidates)
     destination_dir = output_dir
     destination_dir.mkdir(parents=True, exist_ok=True)
     if clear_destination:
         _clear_extract_destination(destination_dir)
     if provider == "hermes":
         copied_files = _extract_hermes_state_dbs(resolved_sources, destination_dir, model_filter=model_filter)
+    elif provider == "cursor":
+        copied_files = _extract_cursor_databases(resolved_sources, destination_dir, model_filter=model_filter)
     else:
         copied_files = _extract_jsonl_session_files(
             provider,
@@ -115,7 +132,11 @@ def _existing_unique_paths(paths: Iterable[Path | None]) -> list[Path]:
         if path is None:
             continue
         expanded = path.expanduser()
-        if not expanded.exists():
+        try:
+            exists = expanded.exists()
+        except OSError:
+            continue
+        if not exists:
             continue
         try:
             key = expanded.resolve()
@@ -137,7 +158,7 @@ def _clear_extract_destination(destination_dir: Path) -> None:
         artifact_path = destination_dir / artifact_name
         if artifact_path.is_file():
             artifact_path.unlink()
-    for provider in ("claude", "codex", "hermes", "pi"):
+    for provider in ("claude", "codex", "cursor", "hermes", "pi"):
         legacy_dir = destination_dir / _provider_output_name(provider)
         if legacy_dir.is_dir():
             shutil.rmtree(legacy_dir)
@@ -157,6 +178,118 @@ def _jsonl_files(source: Path) -> list[Path]:
     if not source.is_dir():
         return []
     return sorted(path for path in source.rglob("*.jsonl") if path.is_file())
+
+
+def _cursor_default_sources(home: Path) -> list[Path | None]:
+    sources: list[Path | None] = [
+        _env_path("CURSOR_GLOBAL_STORAGE_DB"),
+        _env_path("CURSOR_WORKSPACE_STORAGE"),
+        _env_path("CURSOR_USER_DATA_DIR", "globalStorage", "state.vscdb"),
+        _env_path("CURSOR_USER_DATA_DIR", "workspaceStorage"),
+        home / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb",
+        home / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage" / "state.vscdb",
+        home / ".cursor-server" / "data" / "User" / "globalStorage" / "state.vscdb",
+    ]
+    sources.extend(_cursor_recent_workspace_state_dbs(home / ".config" / "Cursor" / "User" / "workspaceStorage"))
+    sources.extend(
+        _cursor_recent_workspace_state_dbs(
+            home / "Library" / "Application Support" / "Cursor" / "User" / "workspaceStorage"
+        )
+    )
+    sources.extend(_cursor_recent_workspace_state_dbs(home / ".cursor-server" / "data" / "User" / "workspaceStorage"))
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        roaming = Path(appdata).expanduser()
+        cursor_user_dir = roaming / "Cursor" / "User"
+        sources.extend(
+            [
+                cursor_user_dir / "globalStorage" / "state.vscdb",
+                *_cursor_recent_workspace_state_dbs(cursor_user_dir / "workspaceStorage"),
+            ]
+        )
+    userprofile = os.environ.get("USERPROFILE")
+    if userprofile:
+        roaming = Path(userprofile).expanduser() / "AppData" / "Roaming"
+        cursor_user_dir = roaming / "Cursor" / "User"
+        sources.extend(
+            [
+                cursor_user_dir / "globalStorage" / "state.vscdb",
+                *_cursor_recent_workspace_state_dbs(cursor_user_dir / "workspaceStorage"),
+            ]
+        )
+    if Path("/mnt/c/Users").is_dir():
+        windows_users_dir = Path("/mnt/c/Users")
+        home_cursor_user_dir = windows_users_dir / home.name / "AppData" / "Roaming" / "Cursor" / "User"
+        sources.extend(
+            [
+                home_cursor_user_dir / "globalStorage" / "state.vscdb",
+                *_cursor_recent_workspace_state_dbs(home_cursor_user_dir / "workspaceStorage"),
+            ]
+        )
+        for user_dir in sorted(path for path in windows_users_dir.iterdir() if path.is_dir()):
+            cursor_user_dir = user_dir / "AppData" / "Roaming" / "Cursor" / "User"
+            sources.extend(
+                [
+                    cursor_user_dir / "globalStorage" / "state.vscdb",
+                    *_cursor_recent_workspace_state_dbs(cursor_user_dir / "workspaceStorage"),
+                ]
+            )
+    return sources
+
+
+def _cursor_recent_workspace_state_dbs(workspace_storage_dir: Path, *, limit: int = 10) -> list[Path]:
+    try:
+        if not workspace_storage_dir.is_dir():
+            return []
+        state_dbs = [path for path in workspace_storage_dir.glob("*/state.vscdb") if path.is_file()]
+    except OSError:
+        return []
+    return sorted(state_dbs, key=_safe_path_mtime, reverse=True)[:limit]
+
+
+def _safe_path_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _cursor_state_dbs(source: Path) -> list[Path]:
+    if source.is_file() and source.name.endswith((".vscdb", ".db", ".sqlite", ".sqlite3")):
+        return [source]
+    if not source.is_dir():
+        return []
+    candidates = [path for path in source.rglob("state.vscdb") if path.is_file()]
+    candidates.extend(path for path in source.rglob("*.vscdb") if path.is_file() and path not in candidates)
+    return sorted(candidates)
+
+
+def _extract_cursor_databases(
+    sources: list[Path],
+    destination_dir: Path,
+    *,
+    model_filter: str | None = None,
+) -> list[Path]:
+    rows: list[dict[str, Any]] = []
+    seen: set[Path] = set()
+    for source in sources:
+        for state_db in _cursor_state_dbs(source):
+            try:
+                key = state_db.resolve()
+            except OSError:
+                key = state_db
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.extend(_cursor_database_rows(state_db))
+    rows = _sanitize_cursor_rows(rows)
+    if model_filter:
+        rows = [row for row in rows if trace_matches_model([row], model_filter)]
+    if not rows:
+        return []
+    destination = destination_dir / "cursor-sessions.jsonl"
+    _write_jsonl_dict_events(destination, rows)
+    return [destination]
 
 
 def _extract_jsonl_session_files(
@@ -221,7 +354,1090 @@ def _write_jsonl_dict_events(path: Path, events: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for event in events:
-            handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+            line = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+            line = line.replace("\u0085", "\\u0085").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+            handle.write(line + "\n")
+
+
+def _cursor_database_rows(state_db: Path) -> list[dict[str, Any]]:
+    try:
+        with TemporaryDirectory(prefix="teich-cursor-") as temp_dir:
+            snapshot_db = _snapshot_sqlite_db(state_db, Path(temp_dir))
+            return _cursor_database_rows_from_snapshot(snapshot_db, state_db)
+    except OSError:
+        return _cursor_database_rows_from_snapshot(state_db, state_db)
+
+
+def _snapshot_sqlite_db(state_db: Path, temp_dir: Path) -> Path:
+    snapshot_db = temp_dir / state_db.name
+    shutil.copy2(state_db, snapshot_db)
+    for suffix in ("-wal", "-shm"):
+        sidecar = state_db.with_name(state_db.name + suffix)
+        if sidecar.is_file():
+            shutil.copy2(sidecar, snapshot_db.with_name(snapshot_db.name + suffix))
+    return snapshot_db
+
+
+def _cursor_database_rows_from_snapshot(snapshot_db: Path, source_db: Path) -> list[dict[str, Any]]:
+    try:
+        connection = sqlite3.connect(f"file:{snapshot_db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return []
+    connection.row_factory = sqlite3.Row
+    try:
+        table_names = [
+            str(row["name"])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            ).fetchall()
+            if isinstance(row["name"], str) and not str(row["name"]).startswith("sqlite_")
+        ]
+        rows: list[dict[str, Any]] = []
+        for table_name in table_names:
+            rows.extend(_cursor_table_rows(connection, source_db, table_name))
+            rows.extend(_cursor_composer_data_rows(connection, source_db, table_name))
+        return rows
+    except sqlite3.Error:
+        return []
+    finally:
+        connection.close()
+
+
+def _cursor_table_rows(
+    connection: sqlite3.Connection,
+    state_db: Path,
+    table_name: str,
+) -> list[dict[str, Any]]:
+    try:
+        columns = [
+            str(row["name"])
+            for row in connection.execute(
+                f"PRAGMA table_info({_sqlite_identifier(table_name)})"
+            ).fetchall()
+            if isinstance(row["name"], str)
+        ]
+    except sqlite3.Error:
+        return []
+    if not columns:
+        return []
+    table_is_candidate = _cursor_text_is_candidate(table_name) or any(
+        _cursor_text_is_candidate(column) for column in columns
+    )
+    selected_columns = ", ".join(_sqlite_identifier(column) for column in columns)
+    where_clause, params = _cursor_candidate_row_filter(columns)
+    if not table_is_candidate and where_clause is None:
+        return []
+    query = f"SELECT {selected_columns} FROM {_sqlite_identifier(table_name)}"
+    query_params: list[str] = []
+    if where_clause is not None:
+        query += f" WHERE {where_clause}"
+        query_params = params
+    try:
+        raw_rows = connection.execute(query, query_params).fetchall()
+    except sqlite3.Error:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for row_index, raw_row in enumerate(raw_rows, start=1):
+        row_data = {
+            column: _decode_cursor_sqlite_value(raw_row[column])
+            for column in columns
+        }
+        key = _cursor_record_key(row_data)
+        if not table_is_candidate and not _cursor_record_is_candidate(key, row_data):
+            continue
+        value = _cursor_primary_payload(row_data)
+        messages = _cursor_extract_messages(value)
+        explicit_prompt = _cursor_explicit_prompt(value)
+        response = _cursor_response(messages) or _cursor_explicit_response(value)
+        model = _cursor_find_model(value)
+        tools = _cursor_extract_tools(value)
+        if not messages and not response and not tools:
+            continue
+        prompt = _cursor_prompt(messages, key, explicit_prompt=explicit_prompt)
+        metadata = {
+            "trace_type": "cursor",
+            "source": "cursor",
+            "source_db": str(state_db),
+            "cursor_scope": _cursor_db_scope(state_db),
+            "cursor_workspace_id": _cursor_workspace_id(state_db),
+            "cursor_table": table_name,
+            "cursor_row": row_index,
+            "cursor_key": key,
+        }
+        if model:
+            metadata["model"] = model
+        rows.append(
+            {
+                "messages": messages,
+                "prompt": prompt,
+                "response": response,
+                "model": model,
+                "tools": tools,
+                "metadata": metadata,
+                "raw_cursor": row_data,
+            }
+        )
+    return rows
+
+
+def _sanitize_cursor_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized: list[tuple[int, dict[str, Any]]] = []
+    for index, row in enumerate(rows):
+        clean_row = _sanitize_cursor_row(row)
+        if clean_row is not None:
+            sanitized.append((index, clean_row))
+    return _dedupe_cursor_rows(sanitized)
+
+
+def _sanitize_cursor_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    messages = row.get("messages")
+    if not isinstance(messages, list):
+        return None
+    clean_messages = [_cursor_clean_message(message) for message in messages]
+    clean_messages = [message for message in clean_messages if message is not None]
+    clean_messages = _cursor_drop_adjacent_duplicate_messages(clean_messages)
+    clean_messages = _cursor_trim_messages_to_trainable_conversation(clean_messages)
+    if not clean_messages:
+        return None
+    if not any(_cursor_message_is_user_prompt(message) for message in clean_messages):
+        return None
+    if not any(_cursor_message_is_trainable_assistant(message) for message in clean_messages):
+        return None
+
+    clean_row = dict(row)
+    clean_row["messages"] = clean_messages
+    clean_row["prompt"] = _cursor_prompt(
+        clean_messages,
+        str((row.get("metadata") or {}).get("cursor_key") or ""),
+        explicit_prompt=row.get("prompt") if isinstance(row.get("prompt"), str) else None,
+    )
+    clean_row["response"] = _cursor_response(clean_messages)
+    merged_tools = _cursor_merge_tools(
+        _cursor_builtin_tools(),
+        row.get("tools") if isinstance(row.get("tools"), list) else [],
+        _cursor_tools_from_messages(clean_messages),
+    )
+    clean_row["tools"] = merged_tools
+    metadata = dict(row.get("metadata")) if isinstance(row.get("metadata"), dict) else {}
+    metadata["cursor_message_count"] = len(clean_messages)
+    clean_row["metadata"] = metadata
+    return clean_row
+
+
+def _cursor_clean_message(message: Any) -> dict[str, Any] | None:
+    if not isinstance(message, dict):
+        return None
+    role = _cursor_normalize_role(message.get("role"))
+    content = _cursor_string_content(message.get("content")).strip()
+    clean: dict[str, Any] = {"role": role, "content": content}
+    if role == "assistant":
+        reasoning_content = _cursor_string_content(message.get("reasoning_content") or message.get("thinking")).strip()
+        if reasoning_content:
+            clean["reasoning_content"] = reasoning_content
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            normalized_tool_calls = [_cursor_normalize_tool_call(tool_call) for tool_call in tool_calls]
+            normalized_tool_calls = [tool_call for tool_call in normalized_tool_calls if tool_call is not None]
+            if normalized_tool_calls:
+                clean["tool_calls"] = normalized_tool_calls
+    elif role == "tool":
+        tool_call_id = message.get("tool_call_id")
+        if isinstance(tool_call_id, str) and tool_call_id.strip():
+            clean["tool_call_id"] = tool_call_id.strip()
+        name = message.get("name")
+        if isinstance(name, str) and name.strip():
+            clean["name"] = name.strip()
+        if message.get("is_error") is True:
+            clean["is_error"] = True
+    if not _cursor_message_has_signal(clean):
+        return None
+    return clean
+
+
+def _cursor_message_has_signal(message: dict[str, Any]) -> bool:
+    if isinstance(message.get("content"), str) and message["content"].strip():
+        return True
+    if message.get("role") == "assistant":
+        return bool(message.get("tool_calls")) or (
+            isinstance(message.get("reasoning_content"), str) and message["reasoning_content"].strip()
+        )
+    return False
+
+
+def _cursor_message_is_user_prompt(message: dict[str, Any]) -> bool:
+    return message.get("role") == "user" and isinstance(message.get("content"), str) and bool(message["content"].strip())
+
+
+def _cursor_message_is_trainable_assistant(message: dict[str, Any]) -> bool:
+    if message.get("role") != "assistant":
+        return False
+    if isinstance(message.get("content"), str) and message["content"].strip():
+        return True
+    if isinstance(message.get("reasoning_content"), str) and message["reasoning_content"].strip():
+        return True
+    return bool(message.get("tool_calls"))
+
+
+def _cursor_drop_adjacent_duplicate_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    previous_signature: str | None = None
+    for message in messages:
+        signature = _cursor_message_signature(message)
+        if signature == previous_signature:
+            continue
+        deduped.append(message)
+        previous_signature = signature
+    return deduped
+
+
+def _cursor_trim_messages_to_trainable_conversation(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    first_user_index = next(
+        (index for index, message in enumerate(messages) if _cursor_message_is_user_prompt(message)),
+        None,
+    )
+    if first_user_index is None:
+        return []
+    start_index = first_user_index
+    while start_index > 0 and messages[start_index - 1].get("role") == "system":
+        start_index -= 1
+    messages = messages[start_index:]
+
+    last_trainable_assistant_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if _cursor_message_is_trainable_assistant(messages[index])
+        ),
+        None,
+    )
+    if last_trainable_assistant_index is None:
+        return []
+    return messages[: last_trainable_assistant_index + 1]
+
+
+def _dedupe_cursor_rows(indexed_rows: list[tuple[int, dict[str, Any]]]) -> list[dict[str, Any]]:
+    kept: list[tuple[int, dict[str, Any], str, int]] = []
+    for original_index, row in sorted(indexed_rows, key=lambda item: len(item[1].get("messages") or []), reverse=True):
+        sequence = _cursor_row_sequence_signature(row)
+        if not sequence:
+            continue
+        if any(_cursor_sequence_contains(kept_sequence, sequence) for _, _, kept_sequence, _ in kept):
+            continue
+        kept.append((original_index, row, sequence, len(row.get("messages") or [])))
+    return [row for _, row, _, _ in sorted(kept, key=lambda item: item[0])]
+
+
+def _cursor_row_sequence_signature(row: dict[str, Any]) -> str:
+    signatures = [_cursor_message_signature(message) for message in row.get("messages") or []]
+    return "|".join(signatures)
+
+
+def _cursor_sequence_contains(haystack: str, needle: str) -> bool:
+    if not haystack or not needle:
+        return False
+    return f"|{needle}|" in f"|{haystack}|"
+
+
+def _cursor_message_signature(message: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "role": message.get("role"),
+            "content": message.get("content"),
+            "reasoning_content": message.get("reasoning_content"),
+            "tool_calls": message.get("tool_calls"),
+            "tool_call_id": message.get("tool_call_id"),
+            "name": message.get("name"),
+            "is_error": message.get("is_error"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _cursor_normalize_tool_call(tool_call: Any) -> dict[str, Any] | None:
+    if not isinstance(tool_call, dict):
+        return None
+    function = tool_call.get("function")
+    if not isinstance(function, dict):
+        return None
+    name = function.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    arguments = function.get("arguments")
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments or {}, ensure_ascii=False)
+    call_id = tool_call.get("id")
+    if not isinstance(call_id, str) or not call_id.strip():
+        call_id = name.strip()
+    return {
+        "id": call_id.strip(),
+        "type": "function",
+        "function": {
+            "name": name.strip(),
+            "arguments": arguments,
+        },
+    }
+
+
+def _cursor_builtin_tools() -> list[dict[str, Any]]:
+    return deepcopy(CURSOR_BUILTIN_TOOLS)
+
+
+def _cursor_merge_tools(*tool_groups: list[Any]) -> list[dict[str, Any]]:
+    merged_by_name: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for tool_group in tool_groups:
+        for tool in tool_group:
+            normalized_tool = _cursor_normalize_tool(tool)
+            if normalized_tool is None:
+                continue
+            name = normalized_tool.get("function", {}).get("name")
+            if not isinstance(name, str):
+                continue
+            if name in merged_by_name:
+                merged_by_name[name] = _cursor_merge_tool_schema(merged_by_name[name], normalized_tool)
+                continue
+            order.append(name)
+            merged_by_name[name] = deepcopy(normalized_tool)
+    return [merged_by_name[name] for name in order]
+
+
+def _cursor_merge_tool_schema(existing_tool: dict[str, Any], incoming_tool: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(existing_tool)
+    existing_function = merged.get("function")
+    incoming_function = incoming_tool.get("function")
+    if not isinstance(existing_function, dict) or not isinstance(incoming_function, dict):
+        return merged
+    if not existing_function.get("description") and isinstance(incoming_function.get("description"), str):
+        existing_function["description"] = incoming_function["description"]
+    incoming_parameters = incoming_function.get("parameters")
+    if isinstance(incoming_parameters, dict):
+        existing_parameters = existing_function.get("parameters")
+        existing_function["parameters"] = _cursor_merge_json_schema(existing_parameters, incoming_parameters)
+    return merged
+
+
+def _cursor_composer_data_rows(
+    connection: sqlite3.Connection,
+    state_db: Path,
+    table_name: str,
+) -> list[dict[str, Any]]:
+    key_column, value_column = _cursor_key_value_columns(connection, table_name)
+    if key_column is None or value_column is None:
+        return []
+    try:
+        composer_rows = connection.execute(
+            (
+                f"SELECT {_sqlite_identifier(key_column)}, {_sqlite_identifier(value_column)} "
+                f"FROM {_sqlite_identifier(table_name)} "
+                f"WHERE {_sqlite_identifier(key_column)} LIKE 'composerData:%' "
+                f"ORDER BY {_sqlite_identifier(key_column)}"
+            )
+        ).fetchall()
+        bubble_rows = connection.execute(
+            (
+                f"SELECT {_sqlite_identifier(key_column)}, {_sqlite_identifier(value_column)} "
+                f"FROM {_sqlite_identifier(table_name)} "
+                f"WHERE {_sqlite_identifier(key_column)} LIKE 'bubbleId:%'"
+            )
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    if not composer_rows:
+        return []
+    bubble_map = {
+        str(row[0]): _decode_cursor_sqlite_value(row[1])
+        for row in bubble_rows
+        if isinstance(row[0], str)
+    }
+
+    rows: list[dict[str, Any]] = []
+    for row_index, composer_row in enumerate(composer_rows, start=1):
+        key = str(composer_row[0])
+        composer_data = _decode_cursor_sqlite_value(composer_row[1])
+        if not isinstance(composer_data, dict):
+            continue
+        composer_id = str(composer_data.get("composerId") or key.split(":", 1)[1])
+        headers = composer_data.get("fullConversationHeadersOnly")
+        if not isinstance(headers, list) or not headers:
+            continue
+        messages, used_bubbles = _cursor_messages_from_composer_headers(composer_id, headers, bubble_map)
+        if not messages:
+            continue
+        response = _cursor_response(messages)
+        if not response and not any(message.get("tool_calls") for message in messages):
+            continue
+        model = _cursor_find_model(composer_data) or _cursor_find_model(used_bubbles)
+        prompt = _cursor_prompt(messages, key, explicit_prompt=_cursor_explicit_prompt(composer_data))
+        metadata = {
+            "trace_type": "cursor",
+            "source": "cursor",
+            "source_db": str(state_db),
+            "cursor_scope": _cursor_db_scope(state_db),
+            "cursor_workspace_id": _cursor_workspace_id(state_db),
+            "cursor_table": table_name,
+            "cursor_row": row_index,
+            "cursor_key": key,
+            "cursor_storage_kind": "composerData",
+            "cursor_composer_id": composer_id,
+            "cursor_status": composer_data.get("status"),
+            "cursor_headers": len(headers),
+            "cursor_bubbles": len(used_bubbles),
+        }
+        if model:
+            metadata["model"] = model
+        rows.append(
+            {
+                "messages": messages,
+                "prompt": prompt,
+                "response": response,
+                "model": model,
+                "tools": _cursor_tools_from_messages(messages),
+                "metadata": metadata,
+                "raw_cursor": {
+                    "composer_data": _cursor_relevant_composer_data(composer_data),
+                    "bubble_ids": [
+                        bubble["bubbleId"]
+                        for bubble in used_bubbles
+                        if isinstance(bubble.get("bubbleId"), str)
+                    ],
+                },
+            }
+        )
+    return rows
+
+
+def _cursor_key_value_columns(
+    connection: sqlite3.Connection,
+    table_name: str,
+) -> tuple[str | None, str | None]:
+    try:
+        columns = [
+            str(row["name"])
+            for row in connection.execute(
+                f"PRAGMA table_info({_sqlite_identifier(table_name)})"
+            ).fetchall()
+            if isinstance(row["name"], str)
+        ]
+    except sqlite3.Error:
+        return None, None
+    key_column = next((column for column in columns if _cursor_text_column_can_identify_record(column)), None)
+    value_column = next(
+        (
+            column
+            for column in columns
+            if re.sub(r"[^a-z0-9]+", "", column.casefold()) in {"value", "data", "json", "payload", "state"}
+        ),
+        None,
+    )
+    return key_column, value_column
+
+
+def _cursor_messages_from_composer_headers(
+    composer_id: str,
+    headers: list[Any],
+    bubble_map: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    messages: list[dict[str, Any]] = []
+    used_bubbles: list[dict[str, Any]] = []
+    for header in headers:
+        if not isinstance(header, dict):
+            continue
+        bubble_id = header.get("bubbleId")
+        if not isinstance(bubble_id, str) or not bubble_id:
+            continue
+        bubble_key = f"bubbleId:{composer_id}:{bubble_id}"
+        bubble = bubble_map.get(bubble_key)
+        if not isinstance(bubble, dict):
+            continue
+        used_bubbles.append(bubble)
+        messages.extend(_cursor_messages_from_bubble(header, bubble))
+    return messages, used_bubbles
+
+
+def _cursor_messages_from_bubble(header: dict[str, Any], bubble: dict[str, Any]) -> list[dict[str, Any]]:
+    bubble_type = bubble.get("type", header.get("type"))
+    content = _cursor_bubble_content(bubble, bubble_type)
+    thinking = _cursor_bubble_thinking(bubble)
+    tool_call = _cursor_bubble_tool_call(bubble)
+
+    if bubble_type == 1:
+        return [{"role": "user", "content": content}] if content else []
+
+    messages: list[dict[str, Any]] = []
+    if content or thinking or tool_call:
+        message: dict[str, Any] = {"role": "assistant", "content": content}
+        if thinking:
+            message["reasoning_content"] = thinking
+        if tool_call:
+            message["tool_calls"] = [tool_call]
+        messages.append(message)
+
+    tool_result = _cursor_bubble_tool_result_message(bubble, tool_call)
+    if tool_result is not None:
+        messages.append(tool_result)
+    return messages
+
+
+def _cursor_bubble_content(bubble: dict[str, Any], bubble_type: Any) -> str:
+    text = _cursor_string_content(bubble.get("text")).strip()
+    if text:
+        return text
+    if bubble_type == 1:
+        rich_text = _cursor_string_content(bubble.get("richText")).strip()
+        if rich_text:
+            return rich_text
+    return ""
+
+
+def _cursor_bubble_thinking(bubble: dict[str, Any]) -> str:
+    thinking = bubble.get("thinking")
+    if isinstance(thinking, dict):
+        return _cursor_string_content(thinking.get("text")).strip()
+    return ""
+
+
+def _cursor_bubble_tool_call(bubble: dict[str, Any]) -> dict[str, Any] | None:
+    tool_data = bubble.get("toolFormerData")
+    if not isinstance(tool_data, dict):
+        return None
+    name = tool_data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    arguments = tool_data.get("rawArgs")
+    if not isinstance(arguments, str):
+        arguments = tool_data.get("params")
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments or {}, ensure_ascii=False)
+    tool_call_id = tool_data.get("toolCallId") or bubble.get("bubbleId")
+    if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+        tool_call_id = name.strip()
+    return {
+        "id": tool_call_id.strip(),
+        "type": "function",
+        "function": {
+            "name": name.strip(),
+            "arguments": arguments,
+        },
+    }
+
+
+def _cursor_bubble_tool_result_message(
+    bubble: dict[str, Any],
+    tool_call: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    tool_data = bubble.get("toolFormerData")
+    if not isinstance(tool_data, dict):
+        return None
+    result = tool_data.get("result")
+    error = tool_data.get("error")
+    if result in (None, "") and error in (None, ""):
+        return None
+    tool_name = _cursor_nested_tool_call_name(tool_call) or tool_data.get("name")
+    tool_call_id = tool_data.get("toolCallId") or (tool_call or {}).get("id") or bubble.get("bubbleId")
+    content = _cursor_string_content(error if error not in (None, "") else result)
+    message: dict[str, Any] = {
+        "role": "tool",
+        "content": content,
+    }
+    if isinstance(tool_call_id, str) and tool_call_id.strip():
+        message["tool_call_id"] = tool_call_id.strip()
+    if isinstance(tool_name, str) and tool_name.strip():
+        message["name"] = tool_name.strip()
+    if error not in (None, ""):
+        message["is_error"] = True
+    return message
+
+
+def _cursor_nested_tool_call_name(tool_call: dict[str, Any] | None) -> str | None:
+    if not isinstance(tool_call, dict):
+        return None
+    function = tool_call.get("function")
+    if not isinstance(function, dict):
+        return None
+    name = function.get("name")
+    return name if isinstance(name, str) else None
+
+
+def _cursor_tools_from_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    observed_arguments: dict[str, list[dict[str, Any]]] = {}
+    for message in messages:
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            name = _cursor_nested_tool_call_name(tool_call)
+            if not name:
+                continue
+            observed_arguments.setdefault(name, []).append(_cursor_tool_call_arguments(tool_call))
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "parameters": _cursor_schema_from_observed_arguments(arguments),
+            },
+        }
+        for name, arguments in sorted(observed_arguments.items())
+    ]
+
+
+def _cursor_tool_call_arguments(tool_call: dict[str, Any]) -> dict[str, Any]:
+    function = tool_call.get("function")
+    if not isinstance(function, dict):
+        return {}
+    arguments = function.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return arguments if isinstance(arguments, dict) else {}
+
+
+def _cursor_schema_from_observed_arguments(arguments: list[dict[str, Any]]) -> dict[str, Any]:
+    properties: dict[str, Any] = {}
+    required_counts: dict[str, int] = {}
+    for argument_set in arguments:
+        for key, value in argument_set.items():
+            if not isinstance(key, str) or not key:
+                continue
+            required_counts[key] = required_counts.get(key, 0) + 1
+            properties[key] = _cursor_merge_json_schema(properties.get(key), _cursor_json_schema_for_value(value))
+    schema: dict[str, Any] = {"type": "object"}
+    if properties:
+        schema["properties"] = dict(sorted(properties.items()))
+        required = sorted(
+            key
+            for key, count in required_counts.items()
+            if count == len(arguments)
+        )
+        if required:
+            schema["required"] = required
+    return schema
+
+
+def _cursor_json_schema_for_value(value: Any) -> dict[str, Any]:
+    if isinstance(value, bool):
+        return {"type": "boolean"}
+    if isinstance(value, int) and not isinstance(value, bool):
+        return {"type": "integer"}
+    if isinstance(value, float):
+        return {"type": "number"}
+    if isinstance(value, str):
+        return {"type": "string"}
+    if isinstance(value, list):
+        item_schema: dict[str, Any] | None = None
+        for item in value:
+            item_schema = _cursor_merge_json_schema(item_schema, _cursor_json_schema_for_value(item))
+        return {"type": "array", "items": item_schema or {}}
+    if isinstance(value, dict):
+        return _cursor_schema_from_observed_arguments([value])
+    if value is None:
+        return {"type": "null"}
+    return {}
+
+
+def _cursor_merge_json_schema(existing: Any, incoming: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(existing, dict) or not existing:
+        return incoming
+    if not incoming:
+        return existing
+    existing_type = existing.get("type")
+    incoming_type = incoming.get("type")
+    if existing_type == incoming_type:
+        if existing_type == "object":
+            properties = dict(existing.get("properties")) if isinstance(existing.get("properties"), dict) else {}
+            incoming_properties = incoming.get("properties")
+            if isinstance(incoming_properties, dict):
+                for key, value in incoming_properties.items():
+                    properties[key] = _cursor_merge_json_schema(properties.get(key), value)
+            merged = {"type": "object"}
+            if properties:
+                merged["properties"] = dict(sorted(properties.items()))
+            existing_required = (
+                {item for item in existing.get("required") if isinstance(item, str)}
+                if isinstance(existing.get("required"), list)
+                else None
+            )
+            incoming_required = (
+                {item for item in incoming.get("required") if isinstance(item, str)}
+                if isinstance(incoming.get("required"), list)
+                else None
+            )
+            if existing_required is None:
+                required = sorted(incoming_required or set())
+            elif incoming_required is None:
+                required = sorted(existing_required)
+            else:
+                required = sorted(existing_required & incoming_required)
+            if required:
+                merged["required"] = required
+            for key in ("additionalProperties", "anyOf", "oneOf", "description", "enum"):
+                if key in existing:
+                    merged[key] = existing[key]
+                elif key in incoming:
+                    merged[key] = incoming[key]
+            return merged
+        if existing_type == "array":
+            return {
+                "type": "array",
+                "items": _cursor_merge_json_schema(existing.get("items"), incoming.get("items") or {}),
+            }
+        return existing
+    types: list[str] = []
+    for schema_type in (existing_type, incoming_type):
+        if isinstance(schema_type, list):
+            types.extend(str(item) for item in schema_type)
+        elif isinstance(schema_type, str):
+            types.append(schema_type)
+    return {"type": sorted(set(types))} if types else {}
+
+
+def _cursor_relevant_composer_data(composer_data: dict[str, Any]) -> dict[str, Any]:
+    keep_keys = (
+        "_v",
+        "composerId",
+        "status",
+        "createdAt",
+        "lastUpdatedAt",
+        "fullConversationHeadersOnly",
+        "capabilities",
+        "codebaseSearchSettings",
+    )
+    return {key: composer_data[key] for key in keep_keys if key in composer_data}
+
+
+def _sqlite_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _cursor_candidate_row_filter(columns: list[str]) -> tuple[str | None, list[str]]:
+    key_columns = [
+        column
+        for column in columns
+        if _cursor_text_column_can_identify_record(column)
+    ]
+    if not key_columns:
+        return None, []
+    terms = [f"%{term.casefold()}%" for term in CURSOR_RECORD_TERMS]
+    clauses: list[str] = []
+    params: list[str] = []
+    for column in key_columns:
+        column_expr = f"LOWER(CAST({_sqlite_identifier(column)} AS TEXT))"
+        for term in terms:
+            clauses.append(f"{column_expr} LIKE ?")
+            params.append(term)
+    return " OR ".join(clauses), params
+
+
+def _cursor_text_column_can_identify_record(column: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "", column.casefold())
+    return normalized in {"key", "itemkey", "name"} or normalized.endswith("key")
+
+
+def _decode_cursor_sqlite_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return {"encoding": "bytes", "size": len(value)}
+    decode_depth = 0
+    while isinstance(value, str) and decode_depth < 5:
+        stripped = value.strip()
+        if stripped.startswith("\x00json:"):
+            stripped = stripped[len("\x00json:"):].strip()
+        if not stripped.startswith(("{", "[", '"')):
+            break
+        try:
+            decoded = json.loads(stripped)
+        except json.JSONDecodeError:
+            break
+        if decoded == value:
+            break
+        value = decoded
+        decode_depth += 1
+    return value
+
+
+def _cursor_record_key(row_data: dict[str, Any]) -> str:
+    for key_name in ("key", "name", "id", "itemKey", "item_key"):
+        value = row_data.get(key_name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _cursor_primary_payload(row_data: dict[str, Any]) -> Any:
+    for key_name in ("value", "data", "json", "payload", "state"):
+        value = row_data.get(key_name)
+        if value is not None:
+            return value
+    return row_data
+
+
+def _cursor_text_is_candidate(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.casefold()
+    return any(term.casefold() in normalized for term in CURSOR_RECORD_TERMS)
+
+
+def _cursor_record_is_candidate(key: str, value: Any) -> bool:
+    if _cursor_text_is_candidate(key):
+        return True
+    return _cursor_value_has_candidate_shape(value)
+
+
+def _cursor_value_has_candidate_shape(value: Any) -> bool:
+    if isinstance(value, dict):
+        if any(_cursor_text_is_candidate(key) for key in value):
+            return True
+        if any(key in value for key in ("messages", "conversation", "conversations", "bubbles", "toolCalls")):
+            return True
+        return any(_cursor_value_has_candidate_shape(item) for item in value.values())
+    if isinstance(value, list):
+        return _cursor_messages_from_list(value) is not None or any(
+            _cursor_value_has_candidate_shape(item) for item in value
+        )
+    return False
+
+
+def _cursor_extract_messages(value: Any) -> list[dict[str, Any]]:
+    message_list = _cursor_find_message_list(value)
+    if not message_list:
+        return []
+    messages: list[dict[str, Any]] = []
+    for item in message_list:
+        message = _cursor_normalize_message(item)
+        if message is not None:
+            messages.append(message)
+    return messages
+
+
+def _cursor_find_message_list(value: Any) -> list[Any] | None:
+    direct = _cursor_messages_from_list(value)
+    if direct is not None:
+        return direct
+    if isinstance(value, dict):
+        preferred_keys = (
+            "messages",
+            "conversation",
+            "conversations",
+            "bubbles",
+            "chat",
+            "composer",
+            "turns",
+            "items",
+        )
+        for key in preferred_keys:
+            found = _cursor_find_message_list(value.get(key))
+            if found is not None:
+                return found
+        for item in value.values():
+            found = _cursor_find_message_list(item)
+            if found is not None:
+                return found
+    if isinstance(value, list):
+        for item in value:
+            found = _cursor_find_message_list(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _cursor_messages_from_list(value: Any) -> list[Any] | None:
+    if not isinstance(value, list) or not value:
+        return None
+    message_like = [
+        item
+        for item in value
+        if isinstance(item, dict)
+        and (
+            any(key in item for key in ("role", "from", "speaker", "type", "author"))
+            and any(key in item for key in ("content", "text", "message", "value", "parts"))
+        )
+    ]
+    return value if message_like else None
+
+
+def _cursor_normalize_message(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    role = _cursor_normalize_role(
+        item.get("role")
+        or item.get("from")
+        or item.get("speaker")
+        or item.get("author")
+        or item.get("type")
+    )
+    content = _cursor_message_content(item)
+    tool_calls = item.get("toolCalls") or item.get("tool_calls")
+    if not content and not tool_calls:
+        return None
+    message: dict[str, Any] = {"role": role, "content": content}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return message
+
+
+def _cursor_normalize_role(value: Any) -> str:
+    normalized = str(value or "").strip().casefold()
+    if normalized in {"user", "human", "request", "prompt"}:
+        return "user"
+    if normalized in {"assistant", "ai", "agent", "gpt", "bot", "response"}:
+        return "assistant"
+    if normalized in {"tool", "tool_result", "toolresult", "function"}:
+        return "tool"
+    if normalized == "system":
+        return "system"
+    return "assistant" if "assistant" in normalized or "ai" in normalized else "user"
+
+
+def _cursor_message_content(item: dict[str, Any]) -> str:
+    for key in ("content", "text", "message", "value", "markdown", "rawText"):
+        text = _cursor_string_content(item.get(key))
+        if text:
+            return text
+    return _cursor_string_content(item.get("parts"))
+
+
+def _cursor_string_content(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = [_cursor_string_content(item) for item in value]
+        return "\n".join(part for part in parts if part)
+    if isinstance(value, dict):
+        for key in ("text", "content", "value", "message"):
+            text = _cursor_string_content(value.get(key))
+            if text:
+                return text
+        return json.dumps(value, ensure_ascii=False)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _cursor_prompt(messages: list[dict[str, Any]], key: str, *, explicit_prompt: str | None = None) -> str:
+    for message in messages:
+        if message.get("role") == "user" and isinstance(message.get("content"), str) and message["content"].strip():
+            return message["content"].strip()
+    if explicit_prompt:
+        return explicit_prompt
+    return key
+
+
+def _cursor_explicit_prompt(value: Any) -> str | None:
+    for prompt_key in ("prompt", "query", "input", "userMessage", "text", "title", "name"):
+        prompt = _cursor_find_string_key(value, prompt_key)
+        if prompt:
+            return prompt
+    return None
+
+
+def _cursor_response(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "assistant" and isinstance(message.get("content"), str) and message["content"].strip():
+            return message["content"]
+    return ""
+
+
+def _cursor_explicit_response(value: Any) -> str:
+    for response_key in ("response", "answer", "assistantMessage", "output"):
+        response = _cursor_find_string_key(value, response_key)
+        if response:
+            return response
+    return ""
+
+
+def _cursor_find_model(value: Any) -> str | None:
+    for key in ("model", "modelName", "modelId", "selectedModel"):
+        model = _cursor_find_string_key(value, key)
+        if model:
+            return model
+    return None
+
+
+def _cursor_find_string_key(value: Any, target_key: str) -> str | None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == target_key and isinstance(item, str) and item.strip():
+                return item.strip()
+        for item in value.values():
+            found = _cursor_find_string_key(item, target_key)
+            if found:
+                return found
+    if isinstance(value, list):
+        for item in value:
+            found = _cursor_find_string_key(item, target_key)
+            if found:
+                return found
+    return None
+
+
+def _cursor_extract_tools(value: Any) -> list[dict[str, Any]]:
+    tools = _cursor_find_key_value(value, "tools")
+    if isinstance(tools, list):
+        normalized = [_cursor_normalize_tool(tool) for tool in tools]
+        return [tool for tool in normalized if tool is not None]
+    return []
+
+
+def _cursor_normalize_tool(tool: Any) -> dict[str, Any] | None:
+    if not isinstance(tool, dict):
+        return None
+    if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+        return tool
+    name = tool.get("name")
+    if not isinstance(name, str) or not name.strip():
+        function = tool.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    function_schema: dict[str, Any] = {"name": name.strip()}
+    description = tool.get("description")
+    if isinstance(description, str) and description.strip():
+        function_schema["description"] = description.strip()
+    parameters = tool.get("parameters") or tool.get("input_schema") or tool.get("schema")
+    if isinstance(parameters, dict):
+        function_schema["parameters"] = parameters
+    return {"type": "function", "function": function_schema}
+
+
+def _cursor_find_key_value(value: Any, target_key: str) -> Any:
+    if isinstance(value, dict):
+        if target_key in value:
+            return value[target_key]
+        for item in value.values():
+            found = _cursor_find_key_value(item, target_key)
+            if found is not None:
+                return found
+    if isinstance(value, list):
+        for item in value:
+            found = _cursor_find_key_value(item, target_key)
+            if found is not None:
+                return found
+    return None
+
+
+def _cursor_db_scope(state_db: Path) -> str:
+    parts = {part.casefold() for part in state_db.parts}
+    if "globalstorage" in parts:
+        return "global"
+    if "workspacestorage" in parts:
+        return "workspace"
+    return "unknown"
+
+
+def _cursor_workspace_id(state_db: Path) -> str | None:
+    if state_db.parent.name and state_db.parent.name != "globalStorage":
+        return state_db.parent.name
+    return None
 
 
 def _unique_destination(destination_dir: Path, file_name: str) -> Path:
@@ -244,20 +1460,23 @@ def _extract_hermes_state_dbs(
     *,
     model_filter: str | None = None,
 ) -> list[Path]:
-    copied: list[Path] = []
+    rows: list[dict[str, Any]] = []
     for source in sources:
         state_dbs = [source] if source.is_file() else sorted(source.rglob("state.db"))
         for state_db in state_dbs:
-            copied.extend(_export_hermes_state_db(state_db, destination_dir, model_filter=model_filter))
-    return copied
+            rows.extend(_hermes_state_db_session_rows(state_db, model_filter=model_filter))
+    if not rows:
+        return []
+    destination = destination_dir / "sessions.jsonl"
+    _write_jsonl_dict_events(destination, rows)
+    return [destination]
 
 
-def _export_hermes_state_db(
+def _hermes_state_db_session_rows(
     state_db: Path,
-    destination_dir: Path,
     *,
     model_filter: str | None = None,
-) -> list[Path]:
+) -> list[dict[str, Any]]:
     if not state_db.exists():
         return []
     connection = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
@@ -266,7 +1485,7 @@ def _export_hermes_state_db(
         if not _has_table(connection, "sessions") or not _has_table(connection, "messages"):
             return []
         session_rows = connection.execute("SELECT * FROM sessions ORDER BY started_at ASC, id ASC").fetchall()
-        exported: list[Path] = []
+        exported: list[dict[str, Any]] = []
         for session_row in session_rows:
             session_id = str(_sqlite_row_get(session_row, "id", "") or "")
             if not session_id:
@@ -275,15 +1494,67 @@ def _export_hermes_state_db(
                 "SELECT * FROM messages WHERE session_id = ? ORDER BY id ASC",
                 (session_id,),
             ).fetchall()
-            events = _hermes_external_trace_events(session_row, message_rows)
-            if model_filter and not trace_matches_model(events, model_filter):
+            messages = [_hermes_message_export(message_row) for message_row in message_rows]
+            row = _hermes_session_export(session_row, messages, state_db)
+            if model_filter and not trace_matches_model([row], model_filter):
                 continue
-            destination = _unique_destination(destination_dir, f"hermes-agent-{_safe_file_id(session_id)}.jsonl")
-            _write_jsonl_dict_events(destination, events)
-            exported.append(destination)
+            exported.append(row)
         return exported
     finally:
         connection.close()
+
+
+def _hermes_message_export(row: sqlite3.Row) -> dict[str, Any]:
+    message = dict(row)
+    message["content"] = _json_or_original(message.get("content")) or ""
+    for key in (
+        "tool_calls",
+        "reasoning_details",
+        "codex_reasoning_items",
+        "codex_message_items",
+    ):
+        value = _json_or_original(message.get(key))
+        if value is not None and value != "":
+            message[key] = value
+    return message
+
+
+def _hermes_session_export(
+    row: sqlite3.Row,
+    messages: list[dict[str, Any]],
+    state_db: Path,
+) -> dict[str, Any]:
+    session = dict(row)
+    hermes_source = _sqlite_row_get(row, "source")
+    input_tokens = _sqlite_row_get(row, "input_tokens")
+    output_tokens = _sqlite_row_get(row, "output_tokens")
+    total_tokens = _sqlite_row_get(row, "total_tokens")
+    if total_tokens is None and (input_tokens is not None or output_tokens is not None):
+        total_tokens = (input_tokens or 0) + (output_tokens or 0)
+    actual_cost = _sqlite_row_get(row, "actual_cost_usd")
+    estimated_cost = _sqlite_row_get(row, "estimated_cost_usd")
+    total_cost = actual_cost if actual_cost is not None else estimated_cost
+    if total_cost is None:
+        total_cost = _sqlite_row_get(row, "total_cost")
+    session.update(
+        {
+            "source": hermes_source or "cli",
+            "timestamp": _timestamp(_sqlite_row_get(row, "started_at")),
+            "teich_export_status": "completed",
+            "teich_partial": False,
+            "hermes_source": hermes_source,
+            "total_tokens": total_tokens,
+            "estimated_cost_usd": estimated_cost,
+            "actual_cost_usd": actual_cost,
+            "total_cost": total_cost,
+            "source_db": str(state_db),
+            "messages": messages,
+        }
+    )
+    model_config = _json_or_original(session.get("model_config"))
+    if model_config is not None:
+        session["model_config"] = model_config
+    return session
 
 
 def _has_table(connection: sqlite3.Connection, table_name: str) -> bool:
@@ -296,10 +1567,6 @@ def _has_table(connection: sqlite3.Connection, table_name: str) -> bool:
 
 def _sqlite_row_get(row: sqlite3.Row, key: str, default: Any = None) -> Any:
     return row[key] if key in row.keys() else default
-
-
-def _safe_file_id(value: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_.-]+", "-", value.strip()) or "session"
 
 
 def trace_matches_model(events: Iterable[dict[str, Any]], model_filter: str) -> bool:
@@ -359,73 +1626,3 @@ def _json_or_original(value: Any) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return value
-
-
-def _hermes_external_trace_events(
-    session_row: sqlite3.Row,
-    message_rows: list[sqlite3.Row],
-) -> list[dict[str, Any]]:
-    session = dict(session_row)
-    input_tokens = _sqlite_row_get(session_row, "input_tokens")
-    output_tokens = _sqlite_row_get(session_row, "output_tokens")
-    total_tokens = _sqlite_row_get(session_row, "total_tokens")
-    if total_tokens is None and (input_tokens is not None or output_tokens is not None):
-        total_tokens = (input_tokens or 0) + (output_tokens or 0)
-    payload: dict[str, Any] = {
-        **session,
-        "source": "hermes-agent",
-        "hermes_source": _sqlite_row_get(session_row, "source"),
-        "timestamp": _timestamp(_sqlite_row_get(session_row, "started_at")),
-        "model": _sqlite_row_get(session_row, "model"),
-        "total_tokens": total_tokens,
-        "estimated_cost_usd": _sqlite_row_get(session_row, "estimated_cost_usd"),
-        "actual_cost_usd": _sqlite_row_get(session_row, "actual_cost_usd"),
-    }
-    model_config = _json_or_original(payload.get("model_config"))
-    if model_config is not None:
-        payload["model_config"] = model_config
-    events: list[dict[str, Any]] = [
-        {
-            "timestamp": payload["timestamp"],
-            "type": "external_session_meta",
-            "payload": payload,
-        }
-    ]
-    for message_row in message_rows:
-        event = _hermes_external_message_event(message_row)
-        if event is not None:
-            events.append(event)
-    return events
-
-
-def _hermes_external_message_event(row: sqlite3.Row) -> dict[str, Any] | None:
-    role = _sqlite_row_get(row, "role")
-    if not isinstance(role, str) or not role.strip():
-        return None
-    content = _json_or_original(_sqlite_row_get(row, "content")) or ""
-    if not isinstance(content, str):
-        content = json.dumps(content, ensure_ascii=False)
-    event: dict[str, Any] = {
-        "timestamp": _timestamp(_sqlite_row_get(row, "timestamp")),
-        "type": "external_message",
-        "role": role.strip(),
-        "content": content,
-    }
-    for key in (
-        "tool_call_id",
-        "tool_calls",
-        "token_count",
-        "finish_reason",
-        "reasoning",
-        "reasoning_content",
-        "reasoning_details",
-        "codex_reasoning_items",
-        "codex_message_items",
-    ):
-        value = _json_or_original(_sqlite_row_get(row, key))
-        if value is not None and value != "":
-            event[key] = value
-    tool_name = _sqlite_row_get(row, "tool_name") or _sqlite_row_get(row, "name")
-    if isinstance(tool_name, str) and tool_name.strip():
-        event["name"] = tool_name.strip()
-    return event

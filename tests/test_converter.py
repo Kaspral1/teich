@@ -25,6 +25,16 @@ def test_detect_trace_type_returns_known_trace_type():
         (
             [
                 {
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "tools": [],
+                    "metadata": {"trace_type": "cursor", "cursor_storage_kind": "composerData"},
+                }
+            ],
+            "cursor",
+        ),
+        (
+            [
+                {
                     "type": "session",
                     "version": 3,
                     "id": "openclaw-session",
@@ -50,6 +60,80 @@ def test_detect_trace_type_returns_known_trace_type():
 
 def test_detect_trace_type_returns_none_for_non_agent_jsonl():
     assert detect_trace_type([{"text": "hello"}, {"text": "world"}]) is None
+
+
+def test_detect_trace_type_does_not_confuse_generic_chat_tools_for_cursor():
+    events = [
+        {
+            "messages": [
+                {"role": "user", "content": "List files"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": {"command": "ls"}},
+                        }
+                    ],
+                },
+            ],
+            "tools": [{"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}}],
+        }
+    ]
+
+    assert detect_trace_type(events) is None
+
+
+def test_convert_structured_cursor_rows_preserves_messages_tools_and_trace_type(tmp_path: Path):
+    trace_file = tmp_path / "cursor-sessions.jsonl"
+    row = {
+        "messages": [
+            {"role": "user", "content": "Inspect app.js"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"app.js\"}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "name": "read_file", "content": "contents"},
+            {"role": "assistant", "content": "Done"},
+        ],
+        "prompt": "Inspect app.js",
+        "response": "Done",
+        "model": "claude-fable-5",
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            }
+        ],
+        "metadata": {"trace_type": "cursor", "cursor_storage_kind": "composerData"},
+    }
+    trace_file.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    events = [json.loads(line) for line in trace_file.read_text(encoding="utf-8").splitlines()]
+    examples = convert_traces_to_training_data(trace_file)
+
+    assert detect_trace_type(events) == "cursor"
+    assert len(examples) == 1
+    assert examples[0]["metadata"]["trace_type"] == "cursor"
+    assert examples[0]["metadata"]["model"] == "claude-fable-5"
+    assert examples[0]["messages"] == row["messages"]
+    assert examples[0]["tools"] == row["tools"]
 
 
 def test_convert_openclaw_trace_uses_distinct_type_with_shared_event_envelope(tmp_path: Path):

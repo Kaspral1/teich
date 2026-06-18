@@ -15,7 +15,7 @@ flowchart TD
     C1 --> C2["Write raw/native traces or structured chat rows"]
     C2 --> C3["Write dataset README + tool snapshots"]
     C3 --> D
-    X --> X1["Copy local sessions<br/>claude, codex, pi, or hermes"]
+    X --> X1["Copy local sessions<br/>claude, codex, cursor, pi, or hermes"]
     X1 --> X2["Filter by --model metadata when requested"]
     X2 --> X3["Anonymize staged data + write README"]
     X3 --> X4{"upload to Hugging Face?"}

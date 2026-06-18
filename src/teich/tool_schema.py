@@ -226,6 +226,341 @@ PI_BUILTIN_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+CURSOR_BUILTIN_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read file contents from the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "target_file": {"type": "string"},
+                    "start_line_one_indexed": {"type": "integer"},
+                    "end_line_one_indexed_inclusive": {"type": "integer"},
+                    "explanation": {"type": "string"},
+                    "should_read_entire_file": {"type": "boolean"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file_v2",
+            "description": "Read file contents from the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "target_file": {"type": "string"},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer"},
+                    "explanation": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "List directory contents.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "relative_workspace_path": {"type": "string"},
+                    "target_directory": {"type": "string"},
+                    "directory_path": {"type": "string"},
+                    "explanation": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_terminal_cmd",
+            "description": "Run a terminal command in the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "is_background": {"type": "boolean"},
+                    "require_user_approval": {"type": "boolean"},
+                    "explanation": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_terminal_command_v2",
+            "description": "Run a terminal command in the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "working_directory": {"type": "string"},
+                    "cwd": {"type": "string"},
+                    "timeout_ms": {"type": "integer"},
+                    "is_background": {"type": "boolean"},
+                    "skip_approval": {"type": "boolean"},
+                    "description": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Edit a file in the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_file": {"type": "string"},
+                    "path": {"type": "string"},
+                    "instructions": {"type": "string"},
+                    "code_edit": {"type": "string"},
+                    "blocking": {"type": "boolean"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file_v2",
+            "description": "Edit a file in the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "target_file": {"type": "string"},
+                    "relative_workspace_path": {"type": "string"},
+                    "instructions": {"type": "string"},
+                    "streaming_content": {"type": "string"},
+                    "code_edit": {"type": "string"},
+                    "no_codeblock": {"type": "boolean"},
+                    "cloud_agent_edit": {"type": "boolean"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_replace",
+            "description": "Replace matching text in a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "path": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                    "replace_all": {"type": "boolean"},
+                    "explanation": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "description": "Apply a patch to files in the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch": {"type": "string"},
+                    "file_path": {"type": "string"},
+                    "target_file": {"type": "string"},
+                    "instructions": {"type": "string"},
+                    "code_edit": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_file",
+            "description": "Delete a file from the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "target_file": {"type": "string"},
+                    "explanation": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "file_search",
+            "description": "Search for files by fuzzy path or filename.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "explanation": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob_file_search",
+            "description": "Search for files by glob pattern.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "glob_pattern": {"type": "string"},
+                    "globPattern": {"type": "string"},
+                    "target_directory": {"type": "string"},
+                    "targetDirectory": {"type": "string"},
+                    "explanation": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep_search",
+            "description": "Search workspace text with grep-like filters.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "include_pattern": {"type": "string"},
+                    "exclude_pattern": {"type": "string"},
+                    "case_sensitive": {"type": "boolean"},
+                    "explanation": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ripgrep_raw_search",
+            "description": "Run a raw ripgrep search.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string"},
+                    "glob": {"type": "string"},
+                    "case_insensitive": {"type": "boolean"},
+                    "output_mode": {"type": "string"},
+                    "head_limit": {"type": "integer"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "codebase_search",
+            "description": "Search the codebase semantically.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "target_directories": {"type": "array", "items": {"type": "string"}},
+                    "explanation": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_lints",
+            "description": "Read diagnostics or lints for files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {"type": "array", "items": {"type": "string"}},
+                    "file_paths": {"type": "array", "items": {"type": "string"}},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "todo_write",
+            "description": "Create or update a task checklist.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {"type": "array"},
+                    "merge": {"type": "boolean"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search_term": {"type": "string"},
+                    "searchTerm": {"type": "string"},
+                    "query": {"type": "string"},
+                    "explanation": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": "Fetch a web page.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "urls": {"type": "array", "items": {"type": "string"}},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+]
+
+
 HERMES_BUILTIN_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -917,6 +1252,8 @@ def snapshot_configured_tools(config: Config) -> list[dict[str, Any]]:
         tools.extend(CODEX_BUILTIN_TOOLS)
     elif provider == "pi":
         tools.extend(PI_BUILTIN_TOOLS)
+    elif provider == "cursor":
+        tools.extend(CURSOR_BUILTIN_TOOLS)
     elif provider in {"hermes", "hermes-agent", "hermes_agent"}:
         tools.extend(HERMES_BUILTIN_TOOLS)
     for mcp in config.mcp_servers:

@@ -151,6 +151,15 @@ def _detect_trace_provider(events: list[dict[str, Any]]) -> str:
             return "pi"
         if "sessionId" in event or event_type == "queue-operation":
             return "claude-code"
+        metadata = event.get("metadata")
+        if isinstance(metadata, dict) and isinstance(metadata.get("trace_type"), str):
+            return metadata["trace_type"]
+        if (
+            isinstance(event.get("messages"), list)
+            and event.get("source") == "cli"
+            and ("hermes_source" in event or "parent_session_id" in event or "started_at" in event)
+        ):
+            return "hermes"
         if isinstance(event.get("messages"), list):
             return "chat"
     return "unknown"

@@ -64,12 +64,16 @@ Common examples:
   teich extract pi --sessions-dir /path/to/.pi/sessions --out data
   teich extract hermes --sessions-dir /path/to/.hermes --out data
   teich extract hermes --sessions-dir /path/to/.hermes/state.db --out data
+  teich extract cursor --sessions-dir /path/to/Cursor/User/workspaceStorage --out data
+  teich extract cursor --sessions-dir /path/to/Cursor/User/globalStorage/state.vscdb --out data
 
 Default stores:
   claude  CLAUDE_CONFIG_DIR/projects, CLAUDE_HOME/projects, ~/.claude/projects
   codex   CODEX_HOME/sessions, ~/.codex/sessions
   pi      PI_SESSION_DIR, PI_CODING_AGENT_DIR/sessions, ~/.pi/agent/sessions, ~/.pi/sessions
   hermes  HERMES_STATE_DB, HERMES_HOME/state.db, ~/.hermes/state.db
+  cursor  CURSOR_WORKSPACE_STORAGE, CURSOR_GLOBAL_STORAGE_DB, Cursor/User/workspaceStorage,
+          Cursor/User/globalStorage/state.vscdb, ~/.cursor-server/data/User/workspaceStorage
 
 After extraction:
   teich convert data --out teich-training.jsonl
@@ -88,7 +92,7 @@ Outputs:
   sandbox/   workspace snapshots for agent providers
   failures/  failed or interrupted traces excluded from resume/upload
 
-Use teich extract instead when you already have local Claude, Codex, Pi, or Hermes sessions.
+Use teich extract instead when you already have local Claude, Codex, Pi, Hermes, or Cursor sessions.
 """
 CONVERT_EXTRA_HELP = """\
 Examples:
@@ -481,7 +485,8 @@ def _extract_sources_option() -> list[Path] | None:
         help=(
             "Explicit agent root, native session folder, state.db file, or JSONL file. "
             "Examples: .claude, .claude/projects, .codex, .codex/sessions, .pi, "
-            ".pi/agent/sessions, .pi/sessions, .hermes, .hermes/state.db. Can be passed more than once."
+            ".pi/agent/sessions, .pi/sessions, .hermes, .hermes/state.db, "
+            "Cursor/User/workspaceStorage, Cursor/User/globalStorage/state.vscdb. Can be passed more than once."
         ),
     )
 
@@ -508,7 +513,7 @@ def extract(
     provider: ExtractProvider = typer.Argument(
         ...,
         metavar="PROVIDER",
-        help="Provider to extract: claude, codex, pi, or hermes.",
+        help="Provider to extract: claude, codex, cursor, pi, or hermes.",
     ),
     output: Path = _extract_output_option(),
     sessions_dir: list[Path] | None = _extract_sources_option(),
@@ -1081,7 +1086,7 @@ output:
   # Where generated .jsonl files are written.
   # - codex / pi: normalized copies of native agent session traces
   # - claude-code: native Claude Code transcript JSONL from .claude/projects/...
-  # - hermes: one Teich external trace per Hermes session, including delegated subagents
+  # - hermes: one native sessions.jsonl file with one row per Hermes session, including delegated subagents
   # - chat: text-only training rows with messages/prompt/response/thinking fields
   traces_dir: ./output
 

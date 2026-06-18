@@ -168,6 +168,13 @@ class _RenderedRow:
     token_length: int | None
 
 
+@dataclass(slots=True)
+class _UnsupportedToolPolicyResult:
+    messages: list[dict[str, Any]] | None
+    unsupported_tool: str | None = None
+    truncated: bool = False
+
+
 def _resolve_chat_template_renderer(tokenizer: Any, text_tokenizer: Any) -> Any:
     if hasattr(text_tokenizer, "apply_chat_template"):
         return text_tokenizer
@@ -1529,6 +1536,87 @@ def _drop_last_user_turn(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     return trimmed
 
 
+def _tool_schema_names(tools: list[dict[str, Any]]) -> set[str]:
+    names: set[str] = set()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        if isinstance(name, str) and name.strip():
+            names.add(name.strip())
+    return names
+
+
+def _tool_call_name(tool_call: Any) -> str | None:
+    if not isinstance(tool_call, dict):
+        return None
+    function = tool_call.get("function")
+    if isinstance(function, dict):
+        name = function.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    name = tool_call.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return None
+
+
+def _first_unsupported_tool_call(
+    messages: list[dict[str, Any]],
+    tool_names: set[str],
+) -> tuple[int, str] | None:
+    for message_index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") not in {"assistant", "model"}:
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            name = _tool_call_name(tool_call)
+            if name and name not in tool_names:
+                return message_index, name
+    return None
+
+
+def _truncate_before_user_turn(
+    messages: list[dict[str, Any]],
+    message_index: int,
+) -> list[dict[str, Any]] | None:
+    user_index = next(
+        (
+            index
+            for index in range(message_index - 1, -1, -1)
+            if isinstance(messages[index], dict) and messages[index].get("role") == "user"
+        ),
+        None,
+    )
+    if user_index is None:
+        return None
+    trimmed = messages[:user_index]
+    if not any(isinstance(message, dict) and message.get("role") == "user" for message in trimmed):
+        return None
+    if not any(isinstance(message, dict) and message.get("role") in {"assistant", "model"} for message in trimmed):
+        return None
+    return trimmed
+
+
+def _apply_unsupported_tool_call_policy(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+) -> _UnsupportedToolPolicyResult:
+    unsupported = _first_unsupported_tool_call(messages, _tool_schema_names(tools))
+    if unsupported is None:
+        return _UnsupportedToolPolicyResult(messages=messages)
+    message_index, tool_name = unsupported
+    trimmed = _truncate_before_user_turn(messages, message_index)
+    if trimmed is None:
+        return _UnsupportedToolPolicyResult(messages=None, unsupported_tool=tool_name)
+    return _UnsupportedToolPolicyResult(messages=trimmed, unsupported_tool=tool_name, truncated=True)
+
+
 def _normalize_span_dicts(value: Any) -> list[tuple[int, int]]:
     return _merge_spans([(span["start"], span["end"]) for span in _normalize_span_metadata(value)])
 
@@ -1851,6 +1939,19 @@ def format_data(
             tools = tools_batch[index] or []
             if not isinstance(tools, list):
                 raise TypeError(f"Row is missing a list-valued '{tools_column}' column")
+            tool_policy = _apply_unsupported_tool_call_policy(messages, tools)
+            if tool_policy.messages is None:
+                dropped_count += 1
+                if report is not None:
+                    dropped_row_info = dict(row_info)
+                    if tool_policy.unsupported_tool:
+                        dropped_row_info["unsupported_tool"] = tool_policy.unsupported_tool
+                    report.record_dropped_row(dropped_row_info, "unsupported_tool_call")
+                continue
+            if tool_policy.truncated:
+                messages = tool_policy.messages
+                if tool_policy.unsupported_tool:
+                    row_info["truncated_before_unsupported_tool_call"] = tool_policy.unsupported_tool
             if validate_tools:
                 from .tool_schema import validate_tool_calls
 

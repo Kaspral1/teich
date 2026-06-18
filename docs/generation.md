@@ -44,6 +44,7 @@ Supported harnesses:
 ```bash
 teich extract claude
 teich extract codex
+teich extract cursor
 teich extract pi
 teich extract hermes
 ```
@@ -54,6 +55,7 @@ By default, Teich looks in the provider's usual home-directory store:
 - Codex: `~/.codex/sessions`
 - Pi: `~/.pi/agent/sessions` or `~/.pi/sessions`
 - Hermes: `~/.hermes/state.db`
+- Cursor: `Cursor/User/workspaceStorage` and `Cursor/User/globalStorage/state.vscdb`
 
 If the store is somewhere else, point `--sessions-dir` at the folder or file to scan. You can pass it more than once:
 
@@ -67,6 +69,8 @@ teich extract pi --sessions-dir /path/to/.pi/agent/sessions --out data
 teich extract pi --sessions-dir /path/to/.pi/sessions --out data
 teich extract hermes --sessions-dir /path/to/.hermes --out data
 teich extract hermes --sessions-dir /path/to/.hermes/state.db --out data
+teich extract cursor --sessions-dir /path/to/Cursor/User/workspaceStorage --out data
+teich extract cursor --sessions-dir /path/to/Cursor/User/globalStorage/state.vscdb --out data
 ```
 
 By default, extracted datasets are written to `data/` under the current directory. JSONL traces are staged directly in that folder, matching the generated Hugging Face `*.jsonl` dataset metadata. Use `--out` or `--output` to choose a different folder:
@@ -156,7 +160,7 @@ publish:
 
 Dataset tags are generated from provider and model:
 
-- `codex`, `pi`, `claude-code`, `hermes`: `agent-traces`, `format:agent-traces`, provider, model, `distillation`, `teich`
+- `codex`, `pi`, `claude-code`, `hermes`, `cursor`: `agent-traces`, `format:agent-traces`, provider, model, `distillation`, `teich`
 - `chat`: `conversational`, model, `distillation`, `teich`
 
 If `publish.hf_token` is omitted, Teich also accepts `HF_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, or `TEICH_HF_TOKEN`.
@@ -167,7 +171,8 @@ Provider outputs:
 
 - `codex` / `pi`: normalized copies of native agent session JSONL files in `output/`, workspace snapshots in `sandbox/`, and a dataset `README.md`
 - `claude-code`: native Claude Code transcript JSONL copied from `.claude/projects/...`, workspace snapshots in `sandbox/`, and a dataset `README.md`
-- `hermes`: one Teich external trace JSONL per Hermes `state.db` session, including delegated subagent sessions as separate files linked by `parent_session_id`
+- `hermes`: one native `sessions.jsonl` file with one row per Hermes `state.db` session, including delegated subagent sessions linked by `parent_session_id`
+- `cursor`: structured rows in `cursor-sessions.jsonl` extracted from Cursor `state.vscdb` tables, including both chat-like and composer-like records when present
 - `chat`: text-only JSONL training rows in `output/` and a dataset `README.md`
 
 `teich extract` writes the same trace shapes to `data/` by default, but it operates on existing local session stores and anonymizes the staged output in place before the upload prompt.
@@ -223,7 +228,7 @@ Runs Hermes Agent with built-in toolsets:
 safe,terminal,file,skills,memory,session_search,delegation
 ```
 
-Teich exports each Hermes `state.db` session as its own external trace with `external_session_meta` and `external_message` events. Hermes' internal `system_prompt`, enabled toolsets, and configured tools remain metadata on each trace. Delegated subagent sessions remain separate files linked by `parent_session_id`.
+Teich exports Hermes `state.db` sessions into a single native `sessions.jsonl` file matching `hermes sessions export sessions.jsonl`: each JSONL row is a session with embedded `messages`. Hermes' internal `system_prompt`, enabled toolsets, and configured tools remain metadata on each row. Delegated subagent sessions stay linked by `parent_session_id`.
 
 ### `chat`
 
