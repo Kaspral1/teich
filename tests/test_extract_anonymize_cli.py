@@ -682,8 +682,9 @@ def test_extract_defaults_to_data_folder_and_anonymizes_before_prompt(tmp_path: 
     assert "Data was written to data" in result.output
     assert "Would you like to upload to Hugging Face?" in result.output
     assert "/home/user1/project" in text
-    assert "user1@example.com" in text
-    assert "sk-or-v1-" in text
+    assert "redacted-user1@example.com" in text
+    assert "redacted_api_key_" in text
+    assert "sk-or-v1-" not in text
     assert original_key not in text
     assert "alice@example.com" not in text
 
@@ -929,8 +930,9 @@ def test_extract_claude_preserves_raw_order_and_only_anonymizes_inline(tmp_path:
     assert "alice@example.com" not in extracted_lines[0]
     assert secret_key not in extracted_lines[0]
     assert "/home/alice" not in extracted_lines[0]
-    assert "user1@example.com" in extracted_lines[0]
-    assert "sk-or-v1-" in extracted_lines[0]
+    assert "redacted-user1@example.com" in extracted_lines[0]
+    assert "redacted_api_key_" in extracted_lines[0]
+    assert "sk-or-v1-" not in extracted_lines[0]
     assert "/home/user1/project" in extracted_lines[0]
     assert convert_traces_to_training_data(extracted_file) == source_examples
 
@@ -1126,14 +1128,15 @@ def test_anonymize_replaces_emails_keys_and_home_usernames_consistently(tmp_path
     text = (output_dir / "trace.jsonl").read_text(encoding="utf-8")
     assert "alice" not in text
     assert "example.com" in text
-    assert "user1@example.com" in text
-    assert text.count("user1@example.com") == 2
+    assert "redacted-user1@example.com" in text
+    assert text.count("redacted-user1@example.com") == 2
     assert "/home/user1/project" in text
     assert "C:\\\\Users\\\\user1\\\\Documents" in text
     assert "projects/-home-user1-Documents-repo/session.jsonl" in text
     assert "-home-user1" in text
     assert "user1 user1 4096" in text
-    assert "sk-or-v1-" in text
+    assert "redacted_api_key_" in text
+    assert "sk-or-v1-" not in text
     assert original_key not in text
     assert "email=2" in result.output
     assert "username=7" in result.output
@@ -1158,24 +1161,34 @@ def test_anonymize_jsonl_preserves_valid_json_after_escaped_path_replacements(tm
     parsed = json.loads(text)
     assert "alice" not in text
     assert parsed["path"].startswith(r"C:\Users\user")
-    assert "example.com" in parsed["message"]
+    assert "redacted-user1@example.com" in parsed["message"]
     assert original_key not in parsed["message"]
 
 
 def test_anonymize_generalizes_to_synthetic_secret_and_reference_matrix(tmp_path: Path):
     input_dir = tmp_path / "output"
     input_dir.mkdir()
+    stripe_key = "sk_" + "live_" + "abcdefghijklmnopqrstuvwxyz123456"
+    twilio_key = "S" + "K" + "0123456789abcdef0123456789abcdef"
     raw_values = {
         "email": "dev.team+alerts@company.io",
         "sk_ant": "sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGHIJK",
         "sk_proj": "sk-proj-abcdefghijklmnopqrstuvwxyzABCDEFGHIJK",
         "sk": "sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJK123456",
+        "cursor_synthetic": "sk-Mmu5OJR5NQoTJOGj6z6cHPraZ35yuZfK",
         "hf": "hf_abcdefghijklmnopqrstuvwxyz123456",
         "github_pat": "github_pat_abcdefghijklmnopqrstuvwxyz_1234567890",
         "gho": "gho_abcdefghijklmnopqrstuvwxyz123456",
         "glpat": "glpat-abcdefghijklmnopqrstuvwxyz123456",
+        "linear": "lin_api_abcdefghijklmnopqrstuvwxyz123456",
+        "npm": "npm_abcdefghijklmnopqrstuvwxyz123456",
+        "pypi": "pypi-abcdefghijklmnopqrstuvwxyz123456",
+        "stripe": stripe_key,
         "xoxb": "xoxb-abcdefghijklmnopqrstuvwxyz-123456",
         "google": "AIzaabcdefghijklmnopqrstuvwxyz123456",
+        "aws": "AKIAIOSFODNN7EXAMPLE",
+        "twilio": twilio_key,
+        "sendgrid": "SG.abcdefghijklmnopqrstuv.ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdefghi",
         "jwt": (
             "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
             "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkphbmUifQ."
@@ -1227,19 +1240,29 @@ def test_anonymize_generalizes_to_synthetic_secret_and_reference_matrix(tmp_path
     assert "D:\\\\Users\\\\user" in text
     assert "-Users-user" in text
     assert "/Users/Public/Documents/shared" in text
-    assert "sk-ant-api03-" in text
-    assert "sk-proj-" in text
-    assert "sk-" in text
-    assert "hf_" in text
-    assert "github_pat_" in text
-    assert "gho_" in text
-    assert "glpat-" in text
-    assert "xoxb-" in text
-    assert "AIza" in text
-    assert "eyJ0eXAiOiJKV1Qi." in text
+    assert text.count("redacted_api_key_") >= 9
+    assert "sk-ant-api03-" not in text
+    assert "sk-proj-" not in text
+    assert "sk-" not in text
+    assert "hf_" not in text
+    assert "github_pat_" not in text
+    assert "gho_" not in text
+    assert "glpat-" not in text
+    assert "lin_api_" not in text
+    assert "npm_" not in text
+    assert "pypi-" not in text
+    assert "sk_live_" not in text
+    assert "xoxb-" not in text
+    assert "AIza" not in text
+    assert "AKIA" not in text
+    assert twilio_key not in text
+    assert "SG." not in text
+    assert "redacted_jwt_" in text
+    assert "eyJ" not in text
     assert "Bearer redacted_" in text
     assert "PROJECT_SECRET=redacted_" in text
     assert "process.env.PROJECT_SECRET" in text
+    assert "sk-Mmu5OJR5NQoTJOGj6z6cHPraZ35yuZfK" not in text
     assert image_data in text
     assert "redacted_base64" not in text
     assert "@src/main.ts" in text
@@ -1251,6 +1274,114 @@ def test_anonymize_generalizes_to_synthetic_secret_and_reference_matrix(tmp_path
     assert "@app.get" in text
     assert "git@gitlab.com:example/repo.git" in text
     assert "https://medium.com/@someone/post" in text
+
+
+def test_anonymize_scrubs_supabase_database_and_structured_secret_surfaces(tmp_path: Path):
+    input_dir = tmp_path / "output"
+    input_dir.mkdir()
+    supabase_anon = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIn0."
+        "signature1234567890abcdef"
+    )
+    service_role = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJyb2xlIjoic2VydmljZV9yb2xlIiwiaXNzIjoic3VwYWJhc2UifQ."
+        "servicerolesignature1234567890"
+    )
+    raw_secrets = {
+        "postgres_password": "pg-password-abcdefghijklmnopqrstuvwxyz",
+        "jwt_secret": "jwt-secret-abcdefghijklmnopqrstuvwxyz",
+        "dashboard_password": "dashboard-password-abcdefghijklmnopqrstuvwxyz",
+        "secret_key_base": "PHOENIX_SECRET_KEY_BASE_RANDOM_abcdefghijklmnopqrstuvwxyz",
+        "vault_enc_key": "RANDOM_ENCRYPTION_KEY_32_CHARS_abcdef",
+        "database_password": "database-pass-abcdefghijklmnopqrstuvwxyz",
+        "mongodb_password": "mongo-pass-abcdefghijklmnopqrstuvwxyz",
+        "redis_password": "redis-pass-abcdefghijklmnopqrstuvwxyz",
+        "query_token": "query-token-abcdefghijklmnopqrstuvwxyz",
+        "azure_account_key": "azurestorageaccountkeyabcdefghijklmnopqrstuvwxyz123456",
+        "json_password": "json-password-abcdefghijklmnopqrstuvwxyz",
+        "json_api_key": "json-api-key-abcdefghijklmnopqrstuvwxyz",
+        "aws_secret": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "private_key": (
+            "-----BEGIN PRIVATE KEY-----\n"
+            "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCabcdefghijklmnopqrstuvwxyz\n"
+            "-----END PRIVATE KEY-----"
+        ),
+    }
+    env_text = "\n".join(
+        [
+            "# Supabase-style generated env",
+            f"POSTGRES_PASSWORD={raw_secrets['postgres_password']}",
+            f"JWT_SECRET={raw_secrets['jwt_secret']}",
+            f"ANON_KEY={supabase_anon}",
+            f"SERVICE_ROLE_KEY={service_role}",
+            "DASHBOARD_USERNAME=supabase",
+            f"DASHBOARD_PASSWORD={raw_secrets['dashboard_password']}",
+            f"SECRET_KEY_BASE={raw_secrets['secret_key_base']}",
+            f"VAULT_ENC_KEY={raw_secrets['vault_enc_key']}",
+            "POSTGRES_HOST=db",
+            "POSTGRES_DB=postgres",
+            "POSTGRES_PORT=5432",
+            "NEXT_PUBLIC_SUPABASE_URL=https://demo.supabase.co",
+            f"NEXT_PUBLIC_SUPABASE_ANON_KEY={supabase_anon}",
+            f"DATABASE_URL=postgresql://postgres:{raw_secrets['database_password']}@db:5432/postgres",
+            f"MONGODB_URI=mongodb+srv://admin:{raw_secrets['mongodb_password']}@cluster.mongodb.net/app",
+            f"REDIS_URL=redis://:{raw_secrets['redis_password']}@redis:6379/0",
+            f"AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=acct;AccountKey={raw_secrets['azure_account_key']};EndpointSuffix=core.windows.net",
+            "JWT_EXPIRY=3600",
+            "PROCEDURAL_WARMUP_TOKENS=4096",
+        ]
+    )
+    direct_urls = "\n".join(
+        [
+            f"direct postgres postgresql://app:{raw_secrets['database_password']}@db.example.com/app",
+            f"direct mongodb mongodb://root:{raw_secrets['mongodb_password']}@mongo.example.com/app",
+            f"https://api.example.com/data?access_token={raw_secrets['query_token']}&page=1",
+        ]
+    )
+    (input_dir / "trace.jsonl").write_text(
+        json.dumps(
+            {
+                "content": env_text + "\n" + direct_urls,
+                "config": {
+                    "password": raw_secrets["json_password"],
+                    "apiKey": raw_secrets["json_api_key"],
+                    "aws_secret_access_key": raw_secrets["aws_secret"],
+                    "privateKey": raw_secrets["private_key"],
+                    "supportsLocalAgentJwt": "abcdefghijklmnopqrstuvwxyz1234567890",
+                    "maxTokens": 4096,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    output_dir = tmp_path / "anonymized"
+    result = runner.invoke(app, ["anonymize", str(input_dir), "--output", str(output_dir)])
+
+    assert result.exit_code == 0
+    text = (output_dir / "trace.jsonl").read_text(encoding="utf-8")
+    for value in [*raw_secrets.values(), supabase_anon, service_role]:
+        assert value not in text
+    assert "eyJ" not in text
+    assert "redacted_jwt_" in text
+    assert "redacted_secret_" in text
+    assert "redacted_private_key_" in text
+    assert "postgresql://app:redacted_secret_" in text
+    assert "mongodb://root:redacted_secret_" in text
+    assert "access_token=redacted_secret_" in text
+    assert "POSTGRES_HOST=db" in text
+    assert "POSTGRES_DB=postgres" in text
+    assert "POSTGRES_PORT=5432" in text
+    assert "NEXT_PUBLIC_SUPABASE_URL=https://demo.supabase.co" in text
+    assert "JWT_EXPIRY=3600" in text
+    assert "PROCEDURAL_WARMUP_TOKENS=4096" in text
+    assert "supportsLocalAgentJwt" in text
+    assert "abcdefghijklmnopqrstuvwxyz1234567890" in text
+    assert "maxTokens" in text
+    assert "api_key=" in result.output
 
 
 def test_anonymize_keeps_secret_replacements_consistent_per_trace(tmp_path: Path):
@@ -1274,8 +1405,8 @@ def test_anonymize_keeps_secret_replacements_consistent_per_trace(tmp_path: Path
 
     assert result.exit_code == 0
     text = (output_dir / "trace.jsonl").read_text(encoding="utf-8")
-    emails = re.findall(r"user\d+@example\.com", text)
-    keys = re.findall(r"sk-proj-[A-Za-z0-9]{32}", text)
+    emails = re.findall(r"redacted-user\d+@example\.com", text)
+    keys = re.findall(r"redacted_api_key_[A-Za-z0-9]{16}", text)
     paths = re.findall(r"/(?:home|Users)/(user\d+)/app", text)
     assert len(set(emails)) == 1
     assert len(set(keys)) == 1
@@ -1316,10 +1447,11 @@ def test_anonymize_scrubs_env_style_keys_without_scrubbing_tokenizer_terms(tmp_p
     assert "ctx7sk-ba627c37-3cea-45c2-8808-720374cce2a3" not in text
     assert "abcdefghijklmnopqrstuvwxyz1234567890" in text
     assert "HF_TOKEN=\\\"redacted_" in text
-    assert "ctx7sk-" in text
+    assert "redacted_api_key_" in text
+    assert "ctx7sk-" not in text
     assert "process.env.GROQ_API_KEY" in text
     assert "gsk_TESTabcdefghijklmnop" not in text
-    assert "gsk_" in text
+    assert "gsk_" not in text
     assert "AutoTokenizer.from_pretrained" in text
     assert "PROCEDURAL_WARMUP_TOKENS" in text
     assert "adapter.supportsLocalAgentJwt" in text
@@ -1376,6 +1508,8 @@ def test_anonymize_does_not_treat_systemd_units_as_emails(tmp_path: Path):
                         "Read https://medium.com/@ahmed.soliman/why-anthropics",
                         "origin git@github.com:CompactAIOfficial/MythosMini.git",
                         "package source ssh://user3@example.com/user/repo",
+                        "Keep repo@feature.module and package@v1.2.3 as code references",
+                        "Keep user@example.test because it is a reserved test-domain reference",
                         "contact 'lane@example.com' for help",
                     ]
                 )
@@ -1397,8 +1531,11 @@ def test_anonymize_does_not_treat_systemd_units_as_emails(tmp_path: Path):
     assert "https://medium.com/@ahmed.soliman/why-anthropics" in text
     assert "git@github.com:CompactAIOfficial/MythosMini.git" in text
     assert "ssh://user3@example.com/user/repo" in text
+    assert "repo@feature.module" in text
+    assert "package@v1.2.3" in text
+    assert "user@example.test" in text
     assert "lane@example.com" not in text
-    assert "user1@example.com" in text
+    assert "redacted-user1@example.com" in text
     assert "email=1" in result.output
 
 
