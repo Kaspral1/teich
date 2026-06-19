@@ -171,6 +171,48 @@ def _write_minimal_cursor_state_db(state_db: Path) -> None:
         connection.close()
 
 
+def _write_cursor_image_state_db(state_db: Path) -> None:
+    state_db.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(state_db)
+    try:
+        connection.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+        connection.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+            (
+                "workbench.panel.aichat.view.aichat.chatdata",
+                json.dumps(
+                    {
+                        "model": "cursor-vision-1",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "make me a website like this"},
+                                    {
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": "image/png",
+                                            "data": "abc123",
+                                        },
+                                    },
+                                    {
+                                        "type": "input_image",
+                                        "image_url": "data:image/jpeg;base64,def456",
+                                    },
+                                ],
+                            },
+                            {"role": "assistant", "content": "I'll build a similar site."},
+                        ],
+                    }
+                ),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def _write_archived_cursor_state_db(state_db: Path) -> None:
     state_db.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(state_db)
@@ -647,7 +689,18 @@ def test_extract_cursor_preserves_native_project_transcripts_and_tools(tmp_path:
     transcript = project_dir / "agent-transcripts" / "session-1" / "session-1.jsonl"
     transcript.parent.mkdir(parents=True)
     transcript_events = [
-        {"role": "user", "message": {"content": [{"type": "text", "text": "native prompt"}]}},
+        {
+            "role": "user",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "native prompt"},
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": "abc123"},
+                    },
+                ]
+            },
+        },
         {
             "role": "assistant",
             "message": {
@@ -711,6 +764,10 @@ def test_extract_cursor_preserves_native_project_transcripts_and_tools(tmp_path:
     row = converted[0]
     assert row["prompt"] == "native prompt"
     assert [message["role"] for message in row["messages"]] == ["user", "assistant", "tool"]
+    assert row["messages"][0]["content"] == [
+        {"type": "text", "text": "native prompt"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc123"}},
+    ]
     assert row["messages"][1]["content"] == "native answer"
     assert row["messages"][1]["reasoning_content"] == "native thinking"
     assert row["messages"][1]["tool_calls"][0]["function"]["name"] == "Shell"
@@ -718,6 +775,42 @@ def test_extract_cursor_preserves_native_project_transcripts_and_tools(tmp_path:
     tools_by_name = {tool["function"]["name"]: tool for tool in row["tools"]}
     assert {"Shell", "read_file", "run_terminal_cmd", "edit_file", "codebase_search"}.issubset(tools_by_name)
     assert tools_by_name["Shell"]["function"]["parameters"]["required"] == ["command"]
+
+
+def test_extract_cursor_preserves_recovered_db_image_blocks(tmp_path: Path):
+    state_db = tmp_path / "workspaceStorage" / "workspace-images" / "state.vscdb"
+    _write_cursor_image_state_db(state_db)
+
+    output_dir = tmp_path / "output"
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "cursor",
+            "--sessions-dir",
+            str(state_db),
+            "--output",
+            str(output_dir),
+            "--no-anon",
+        ],
+        input="n\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    events = _read_extracted_jsonl_rows(output_dir)
+    user_event = next(event for event in events if event.get("role") == "user")
+    assert user_event["message"]["content"] == [
+        {"type": "text", "text": "make me a website like this"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc123"}},
+        {"type": "input_image", "image_url": "data:image/jpeg;base64,def456"},
+    ]
+
+    converted = convert_traces_to_training_data(output_dir)
+    assert len(converted) == 1
+    row = converted[0]
+    assert row["prompt"] == "make me a website like this"
+    assert row["messages"][0]["content"] == user_event["message"]["content"]
+    assert row["messages"][1] == {"role": "assistant", "content": "I'll build a similar site."}
 
 
 def test_extract_cursor_prefers_recovered_db_sessions_over_redacted_native_transcripts(tmp_path: Path):

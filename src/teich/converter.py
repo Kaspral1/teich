@@ -1864,6 +1864,66 @@ def _claude_reasoning_from_content(content: Any) -> str | None:
     return result or None
 
 
+def _cursor_content_with_preserved_images(content: Any) -> list[dict[str, Any]] | None:
+    if isinstance(content, str):
+        return None
+    items = content if isinstance(content, list) else [content] if isinstance(content, dict) else []
+    blocks: list[dict[str, Any]] = []
+    has_image = False
+    for item in items:
+        if isinstance(item, str):
+            if item.strip():
+                blocks.append({"type": "text", "text": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        if _cursor_is_image_content_block(item):
+            blocks.append(deepcopy(item))
+            has_image = True
+            continue
+        block_type = item.get("type")
+        if block_type in {"text", "input_text", "output_text"}:
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                blocks.append({"type": "text", "text": text})
+    return blocks if has_image else None
+
+
+def _cursor_is_image_content_block(block: dict[str, Any]) -> bool:
+    block_type = block.get("type")
+    if isinstance(block_type, str) and block_type.lower() in {"image", "input_image", "image_url"}:
+        return True
+    image_url = block.get("image_url")
+    if isinstance(image_url, str) and image_url:
+        return True
+    if isinstance(image_url, dict) and any(isinstance(image_url.get(key), str) for key in ("url", "data")):
+        return True
+    for key in ("url", "uri", "data", "data_url", "dataUrl"):
+        value = block.get(key)
+        if isinstance(value, str) and value.startswith("data:image/"):
+            return True
+    media_type = _cursor_content_block_media_type(block)
+    if isinstance(media_type, str) and media_type.lower().startswith("image/"):
+        return True
+    source = block.get("source")
+    if isinstance(source, dict):
+        source_type = source.get("type")
+        source_media_type = _cursor_content_block_media_type(source)
+        if isinstance(source_media_type, str) and source_media_type.lower().startswith("image/"):
+            return True
+        if isinstance(source_type, str) and source_type.lower() == "base64" and isinstance(source.get("data"), str):
+            return True
+    return False
+
+
+def _cursor_content_block_media_type(block: dict[str, Any]) -> str | None:
+    for key in ("media_type", "mime_type", "mimeType", "mime"):
+        value = block.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _claude_assistant_content_blocks(event: dict[str, Any]) -> list[dict[str, Any]]:
     if event.get("type") != "assistant":
         return []
@@ -3179,7 +3239,10 @@ def _convert_cursor_trace_to_training_example(
             content = _claude_text_from_content(content_blocks)
             if content and not prompt:
                 prompt = content
-            if content:
+            preserved_content = _cursor_content_with_preserved_images(content_blocks)
+            if preserved_content is not None:
+                messages.append({"role": "user", "content": preserved_content})
+            elif content:
                 messages.append({"role": "user", "content": content})
             continue
 

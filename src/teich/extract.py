@@ -616,9 +616,12 @@ def _cursor_message_to_transcript_event(message: dict[str, Any]) -> dict[str, An
     content = message.get("content")
     text = content if isinstance(content, str) else _cursor_string_content(content)
     if role == "user":
+        content_blocks = _cursor_transcript_content_blocks(content)
+        if not content_blocks:
+            return None
         return {
             "role": "user",
-            "message": {"content": [{"type": "text", "text": text}]},
+            "message": {"content": content_blocks},
         }
     if role == "assistant":
         blocks: list[dict[str, Any]] = []
@@ -885,7 +888,7 @@ def _cursor_clean_message(message: Any) -> dict[str, Any] | None:
     if not isinstance(message, dict):
         return None
     role = _cursor_normalize_role(message.get("role"))
-    content = _cursor_string_content(message.get("content")).strip()
+    content = _cursor_content_with_preserved_media(message.get("content"))
     clean: dict[str, Any] = {"role": role, "content": content}
     if role == "assistant":
         reasoning_content = _cursor_string_content(message.get("reasoning_content") or message.get("thinking")).strip()
@@ -914,6 +917,8 @@ def _cursor_clean_message(message: Any) -> dict[str, Any] | None:
 def _cursor_message_has_signal(message: dict[str, Any]) -> bool:
     if isinstance(message.get("content"), str) and message["content"].strip():
         return True
+    if isinstance(message.get("content"), list):
+        return any(_cursor_content_block_has_signal(block) for block in message["content"])
     if message.get("role") == "assistant":
         return bool(message.get("tool_calls")) or (
             isinstance(message.get("reasoning_content"), str) and message["reasoning_content"].strip()
@@ -922,7 +927,7 @@ def _cursor_message_has_signal(message: dict[str, Any]) -> bool:
 
 
 def _cursor_message_is_user_prompt(message: dict[str, Any]) -> bool:
-    return message.get("role") == "user" and isinstance(message.get("content"), str) and bool(message["content"].strip())
+    return message.get("role") == "user" and _cursor_message_has_signal(message)
 
 
 def _cursor_message_is_trainable_assistant(message: dict[str, Any]) -> bool:
@@ -1730,7 +1735,12 @@ def _cursor_normalize_role(value: Any) -> str:
     return "assistant" if "assistant" in normalized or "ai" in normalized else "user"
 
 
-def _cursor_message_content(item: dict[str, Any]) -> str:
+def _cursor_message_content(item: dict[str, Any]) -> Any:
+    value = _cursor_message_content_value(item)
+    return _cursor_content_with_preserved_media(value)
+
+
+def _cursor_message_content_value(item: dict[str, Any]) -> Any:
     for key in (
         "content",
         "text",
@@ -1745,10 +1755,14 @@ def _cursor_message_content(item: dict[str, Any]) -> str:
         "input",
         "userMessage",
     ):
-        text = _cursor_string_content(item.get(key))
+        value = item.get(key)
+        text = _cursor_string_content(value)
         if text:
-            return text
-    return _cursor_string_content(item.get("parts"))
+            return value
+        blocks = _cursor_content_blocks_with_media(value)
+        if blocks is not None:
+            return value
+    return item.get("parts")
 
 
 def _cursor_string_content(value: Any) -> str:
@@ -1761,6 +1775,8 @@ def _cursor_string_content(value: Any) -> str:
         parts = [_cursor_string_content(item) for item in value]
         return "\n".join(part for part in parts if part)
     if isinstance(value, dict):
+        if _cursor_is_media_content_block(value):
+            return ""
         rich_text = _cursor_rich_text_content(value)
         if rich_text is not None:
             return rich_text
@@ -1772,6 +1788,90 @@ def _cursor_string_content(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+def _cursor_content_with_preserved_media(value: Any) -> str | list[dict[str, Any]]:
+    blocks = _cursor_content_blocks_with_media(value)
+    if blocks is not None:
+        return blocks
+    return _cursor_string_content(value).strip()
+
+
+def _cursor_content_blocks_with_media(value: Any) -> list[dict[str, Any]] | None:
+    if isinstance(value, str):
+        return None
+    items = value if isinstance(value, list) else [value] if isinstance(value, dict) else []
+    blocks: list[dict[str, Any]] = []
+    has_media = False
+    for item in items:
+        if isinstance(item, str):
+            text = _cursor_rich_text_content(item) or item
+            if text.strip():
+                blocks.append({"type": "text", "text": text})
+            continue
+        if not isinstance(item, dict):
+            continue
+        if _cursor_is_media_content_block(item):
+            blocks.append(deepcopy(item))
+            has_media = True
+            continue
+        text = _cursor_string_content(item).strip()
+        if text:
+            blocks.append({"type": "text", "text": text})
+    return blocks if has_media else None
+
+
+def _cursor_transcript_content_blocks(value: Any) -> list[dict[str, Any]]:
+    blocks = _cursor_content_blocks_with_media(value)
+    if blocks is not None:
+        return blocks
+    text = _cursor_string_content(value).strip()
+    return [{"type": "text", "text": text}] if text else []
+
+
+def _cursor_content_block_has_signal(block: Any) -> bool:
+    if isinstance(block, str):
+        return bool(block.strip())
+    if not isinstance(block, dict):
+        return False
+    if _cursor_is_media_content_block(block):
+        return True
+    return bool(_cursor_string_content(block).strip())
+
+
+def _cursor_is_media_content_block(value: dict[str, Any]) -> bool:
+    block_type = value.get("type")
+    if isinstance(block_type, str) and block_type.lower() in {"image", "input_image", "image_url"}:
+        return True
+    image_url = value.get("image_url")
+    if isinstance(image_url, str) and image_url:
+        return True
+    if isinstance(image_url, dict) and any(isinstance(image_url.get(key), str) for key in ("url", "data")):
+        return True
+    for key in ("url", "uri", "data", "data_url", "dataUrl"):
+        item = value.get(key)
+        if isinstance(item, str) and item.startswith("data:image/"):
+            return True
+    media_type = _cursor_media_type(value)
+    if isinstance(media_type, str) and media_type.lower().startswith("image/"):
+        return True
+    source = value.get("source")
+    if isinstance(source, dict):
+        source_type = source.get("type")
+        source_media_type = _cursor_media_type(source)
+        if isinstance(source_media_type, str) and source_media_type.lower().startswith("image/"):
+            return True
+        if isinstance(source_type, str) and source_type.lower() == "base64" and isinstance(source.get("data"), str):
+            return True
+    return False
+
+
+def _cursor_media_type(value: dict[str, Any]) -> str | None:
+    for key in ("media_type", "mime_type", "mimeType", "mime"):
+        item = value.get(key)
+        if isinstance(item, str) and item:
+            return item
+    return None
 
 
 def _cursor_rich_text_content(value: Any) -> str | None:

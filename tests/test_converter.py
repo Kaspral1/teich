@@ -205,7 +205,22 @@ def test_convert_cursor_session_events_preserves_messages_tools_and_trace_type(t
                 }
             ],
         },
-        {"role": "user", "message": {"content": [{"type": "text", "text": "List files"}]}},
+        {
+            "role": "user",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "List files"},
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": "abc123"},
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/jpeg;base64,def456",
+                    },
+                ]
+            },
+        },
         {
             "role": "assistant",
             "message": {
@@ -234,6 +249,11 @@ def test_convert_cursor_session_events_preserves_messages_tools_and_trace_type(t
     assert example.metadata["session_id"] == "session-1"
     assert example.metadata["model"] == "claude-opus-4.5"
     assert [message["role"] for message in example.messages] == ["user", "assistant", "tool", "assistant"]
+    assert example.messages[0]["content"] == [
+        {"type": "text", "text": "List files"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc123"}},
+        {"type": "input_image", "image_url": "data:image/jpeg;base64,def456"},
+    ]
     assert example.messages[1]["reasoning_content"] == "Need a directory listing."
     assert example.messages[1]["tool_calls"][0]["function"]["name"] == "Shell"
     assert example.messages[2]["tool_call_id"] == "call-shell"
