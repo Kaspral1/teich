@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -16,6 +17,8 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from typer.core import TyperCommand, TyperGroup
+
+from tqdm import tqdm
 
 from .anonymize import anonymize_path
 from .config import CLAUDE_PROVIDER_ALIASES, Config
@@ -193,6 +196,35 @@ def _upload_ignore_patterns(cfg: Config) -> list[str]:
         if pattern not in patterns:
             patterns.append(pattern)
     return patterns
+
+
+@contextmanager
+def _anonymize_progress_bar():
+    """Yield a callback that updates a live file and replacement-count bar."""
+    totals = {"api_key": 0, "email": 0, "username": 0}
+    with tqdm(desc="Anonymizing", unit="file", dynamic_ncols=True, leave=False) as bar:
+
+        def on_file(file_report, done: int, total: int | None) -> None:
+            if total is not None:
+                bar.total = total
+            for key, count in file_report.replacements.items():
+                totals[key] = totals.get(key, 0) + count
+            bar.set_postfix(
+                keys=totals["api_key"],
+                emails=totals["email"],
+                users=totals["username"],
+                file=file_report.path.name,
+                refresh=False,
+            )
+            bar.update(max(0, done - bar.n))
+
+        yield on_file
+
+
+def _anonymize_with_progress(input_path: Path, output_path: Path, *, in_place: bool):
+    """Run anonymize_path with a live tqdm bar showing files and scrub counts."""
+    with _anonymize_progress_bar() as progress:
+        return anonymize_path(input_path, output_path, in_place=in_place, progress=progress)
 
 
 def _has_non_empty_trace_outputs(traces_dir: Path) -> bool:
@@ -446,14 +478,17 @@ def _run_extract_command(
     console.print(Panel.fit("Teich Extract", style="bold blue"))
     if provider == "cursor":
         console.print(f"[yellow]{CURSOR_EXTRACTION_NOTICE}[/yellow]", soft_wrap=True)
-    result = extract_local_sessions(
-        provider,
-        output_dir=output,
-        sources=sessions_dir,
-        model_filter=model_filter,
-        clear_destination=True,
-        anonymize=not skip_anonymize,
-    )
+    progress_context = nullcontext(None) if skip_anonymize else _anonymize_progress_bar()
+    with progress_context as anonymize_progress:
+        result = extract_local_sessions(
+            provider,
+            output_dir=output,
+            sources=sessions_dir,
+            model_filter=model_filter,
+            clear_destination=True,
+            anonymize=not skip_anonymize,
+            anonymize_progress=anonymize_progress,
+        )
     if not result.source_paths:
         console.print(f"[red]No local {provider} session folders found.[/red]")
         console.print("[yellow]Pass one or more explicit folders with --sessions-dir.[/yellow]")
@@ -558,7 +593,7 @@ def anonymize(
 ) -> None:
     """Replace emails, home-directory usernames, and API keys with deterministic dummy values."""
     try:
-        report = anonymize_path(input_path, output, in_place=in_place)
+        report = _anonymize_with_progress(input_path, output, in_place=in_place)
     except (FileNotFoundError, ValueError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)

@@ -15,7 +15,7 @@ import sqlite3
 from tempfile import TemporaryDirectory
 from typing import Any, Literal
 
-from .anonymize import TraceAnonymizer, anonymize_file
+from .anonymize import AnonymizeFileReport, AnonymizeProgress, TraceAnonymizer, anonymize_file
 from .tool_schema import CURSOR_BUILTIN_TOOLS
 
 ExtractProvider = Literal["claude", "codex", "cursor", "hermes", "pi"]
@@ -50,22 +50,32 @@ class ExtractResult:
 class _InlineAnonymizer:
     """Anonymize traces as they are written, one TraceAnonymizer per file."""
 
-    def __init__(self) -> None:
+    def __init__(self, progress: AnonymizeProgress | None = None) -> None:
         self.totals: dict[str, int] = {"email": 0, "username": 0, "api_key": 0}
+        self.progress = progress
+        self.files_done = 0
 
     def _add(self, counts: dict[str, int]) -> None:
         for key, count in counts.items():
             self.totals[key] = self.totals.get(key, 0) + count
 
-    def copy_file(self, source: Path, destination: Path) -> None:
-        report = anonymize_file(source, destination)
+    def _record(self, report: AnonymizeFileReport) -> None:
         self._add(report.replacements)
+        self.files_done += 1
+        if self.progress is not None:
+            self.progress(report, self.files_done, None)
 
-    def anonymize_events(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def copy_file(self, source: Path, destination: Path) -> None:
+        self._record(anonymize_file(source, destination))
+
+    def anonymize_events(self, events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
         anonymizer = TraceAnonymizer()
         events = [anonymizer.anonymize_value(event) for event in events]
-        self._add(anonymizer.counts)
-        return events
+        replacements = {key: value for key, value in anonymizer.counts.items() if value}
+        return events, replacements
+
+    def record_events_file(self, path: Path, replacements: dict[str, int]) -> None:
+        self._record(AnonymizeFileReport(path=path, output_path=path, replacements=replacements))
 
     def anonymize_remaining_files(self, root: Path, excluded: Iterable[Path]) -> None:
         """Scrub pre-existing output files without re-reading newly written traces."""
@@ -125,6 +135,7 @@ def extract_local_sessions(
     clear_destination: bool = False,
     progress: ProgressCallback | None = None,
     anonymize: bool = False,
+    anonymize_progress: AnonymizeProgress | None = None,
 ) -> ExtractResult:
     """Extract local sessions for provider into output_dir."""
     source_candidates = list(sources) if sources is not None else default_session_sources(provider, home)
@@ -133,7 +144,7 @@ def extract_local_sessions(
     destination_dir.mkdir(parents=True, exist_ok=True)
     if clear_destination:
         _clear_extract_destination(destination_dir)
-    anonymizer = _InlineAnonymizer() if anonymize else None
+    anonymizer = _InlineAnonymizer(anonymize_progress) if anonymize else None
     if provider == "hermes":
         copied_files = _extract_hermes_state_dbs(
             resolved_sources, destination_dir, model_filter=model_filter, anonymizer=anonymizer
@@ -574,14 +585,17 @@ def _write_jsonl_dict_events(
     events: list[dict[str, Any]],
     anonymizer: _InlineAnonymizer | None = None,
 ) -> None:
+    replacements: dict[str, int] = {}
     if anonymizer is not None:
-        events = anonymizer.anonymize_events(events)
+        events, replacements = anonymizer.anonymize_events(events)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for event in events:
             line = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
             line = line.replace("\u0085", "\\u0085").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
             handle.write(line + "\n")
+    if anonymizer is not None:
+        anonymizer.record_events_file(path, replacements)
 
 
 def _write_individual_jsonl_rows(

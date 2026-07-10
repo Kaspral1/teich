@@ -13,7 +13,11 @@ import shutil
 import string
 import sys
 from tempfile import NamedTemporaryFile
-from typing import Any
+from typing import Any, Callable
+
+# Called after each file with (file_report, files_done, files_total). The total
+# is unknown while extraction is discovering and writing traces inline.
+AnonymizeProgress = Callable[["AnonymizeFileReport", int, int | None], None]
 
 
 TEXT_EXTENSIONS = {
@@ -70,7 +74,13 @@ class AnonymizeReport:
         return totals
 
 
-def anonymize_path(input_path: Path, output_path: Path, *, in_place: bool = False) -> AnonymizeReport:
+def anonymize_path(
+    input_path: Path,
+    output_path: Path,
+    *,
+    in_place: bool = False,
+    progress: AnonymizeProgress | None = None,
+) -> AnonymizeReport:
     """Anonymize trace files under input_path."""
     input_path = input_path.expanduser()
     output_path = output_path.expanduser()
@@ -86,6 +96,8 @@ def anonymize_path(input_path: Path, output_path: Path, *, in_place: bool = Fals
         destination = output_path / input_path.name if output_path.exists() and output_path.is_dir() else output_path
         file_report = anonymize_file(input_path, destination)
         report.files.append(file_report)
+        if progress is not None:
+            progress(file_report, 1, 1)
         return report
 
     source_files = sorted(path for path in input_path.rglob("*") if path.is_file())
@@ -95,10 +107,16 @@ def anonymize_path(input_path: Path, output_path: Path, *, in_place: bool = Fals
         # Each file is anonymized independently (fresh TraceAnonymizer per
         # file), so files can be processed in parallel safely.
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            report.files.extend(executor.map(anonymize_file, source_files, destinations))
+            for file_report in executor.map(anonymize_file, source_files, destinations):
+                report.files.append(file_report)
+                if progress is not None:
+                    progress(file_report, len(report.files), len(source_files))
     else:
         for source_file, destination in zip(source_files, destinations):
-            report.files.append(anonymize_file(source_file, destination))
+            file_report = anonymize_file(source_file, destination)
+            report.files.append(file_report)
+            if progress is not None:
+                progress(file_report, len(report.files), len(source_files))
     return report
 
 

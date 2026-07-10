@@ -1242,6 +1242,7 @@ def test_extract_inline_anonymization_scrubs_traces_and_leftover_text(tmp_path: 
     stale_text.write_text(f"alice@example.com {original_key}\n", encoding="utf-8")
     stale_binary = output_dir / "archive.bin"
     stale_binary.write_bytes(b"alice@example.com sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456")
+    progress_updates: list[tuple[str, int, int | None, dict[str, int]]] = []
 
     result = extract_local_sessions(
         "codex",
@@ -1249,9 +1250,24 @@ def test_extract_inline_anonymization_scrubs_traces_and_leftover_text(tmp_path: 
         sources=[sessions_dir],
         clear_destination=True,
         anonymize=True,
+        anonymize_progress=lambda report, done, total: progress_updates.append(
+            (report.path.name, done, total, dict(report.replacements))
+        ),
     )
 
     assert result.anonymize_totals == {"email": 3, "username": 2, "api_key": 3}
+    assert [update[0] for update in progress_updates] == [
+        "session-0.jsonl",
+        "session-1.jsonl",
+        "archive.bin",
+        "notes.txt",
+    ]
+    assert [update[1] for update in progress_updates] == [1, 2, 3, 4]
+    assert all(update[2] is None for update in progress_updates)
+    assert {
+        key: sum(update[3].get(key, 0) for update in progress_updates)
+        for key in ("email", "username", "api_key")
+    } == result.anonymize_totals
     for trace in result.copied_files:
         text = trace.read_text(encoding="utf-8")
         assert "/home/user1/project" in text
@@ -1710,6 +1726,51 @@ def test_anonymize_parallel_worker_count_caps_windows(monkeypatch):
     monkeypatch.setattr(anonymize_module.sys, "platform", "win32")
 
     assert anonymize_module._process_worker_count(100) == 61
+
+
+def test_anonymize_path_progress_preserves_parallel_report_order(tmp_path: Path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    for index in reversed(range(9)):
+        (input_dir / f"trace-{index}.jsonl").write_text(
+            json.dumps({"message": f"user{index}@example.com"}) + "\n",
+            encoding="utf-8",
+        )
+    updates = []
+
+    report = anonymize_module.anonymize_path(
+        input_dir,
+        tmp_path / "output",
+        progress=lambda file_report, done, total: updates.append((file_report, done, total)),
+    )
+
+    assert [update[0].path.name for update in updates] == [f"trace-{index}.jsonl" for index in range(9)]
+    assert [update[1] for update in updates] == list(range(1, 10))
+    assert [update[2] for update in updates] == [9] * 9
+    assert sum(update[0].replacements.get("email", 0) for update in updates) == report.totals["email"] == 9
+
+
+def test_anonymize_cli_updates_tqdm_progress(tmp_path: Path):
+    source = tmp_path / "trace.jsonl"
+    source.write_text(json.dumps({"message": "alice@example.com"}) + "\n", encoding="utf-8")
+    bar = MagicMock()
+    bar.n = 0
+
+    with patch("teich.cli.tqdm") as mock_tqdm:
+        mock_tqdm.return_value.__enter__.return_value = bar
+        result = runner.invoke(app, ["anonymize", str(source), "--output", str(tmp_path / "output.jsonl")])
+
+    assert result.exit_code == 0, result.output
+    mock_tqdm.assert_called_once_with(desc="Anonymizing", unit="file", dynamic_ncols=True, leave=False)
+    assert bar.total == 1
+    bar.update.assert_called_once_with(1)
+    bar.set_postfix.assert_called_once_with(
+        keys=0,
+        emails=1,
+        users=0,
+        file="trace.jsonl",
+        refresh=False,
+    )
 
 
 def test_anonymize_jsonl_preserves_valid_json_after_escaped_path_replacements(tmp_path: Path):
