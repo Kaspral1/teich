@@ -104,9 +104,19 @@ def test_claude_prepare_home_writes_stop_hook(tmp_path: Path):
         assert cmd.endswith("langfuse_hook.py")
 
 
-def test_claude_prepare_home_noop_when_disabled(tmp_path: Path):
+def test_claude_prepare_home_noop_when_all_settings_disabled(tmp_path: Path):
     with patch.object(ClaudeCodeRunner, "_ensure_image"):
-        runner = ClaudeCodeRunner(Config(model=ModelConfig(model="claude-sonnet-4-6")))
+        runner = ClaudeCodeRunner(
+            Config(
+                agent={
+                    "claude": {
+                        "always_thinking": None,
+                        "show_thinking_summaries": None,
+                    }
+                },
+                model=ModelConfig(model="claude-sonnet-4-6"),
+            )
+        )
     home = tmp_path / "home"
     home.mkdir()
     runner._prepare_agent_home(home)

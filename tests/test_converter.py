@@ -178,6 +178,65 @@ def test_convert_structured_cursor_rows_preserves_messages_tools_and_trace_type(
     assert tools_by_name["read_file"]["function"]["description"] == "Read file contents from the workspace."
 
 
+def test_convert_top_level_chat_completion_rows_builds_messages_and_preserves_capture_metadata(tmp_path: Path):
+    trace_file = tmp_path / "opus-reasoning.jsonl"
+    rows = [
+        {
+            "schema_version": 1,
+            "id": "sample-1",
+            "system": "Answer carefully.",
+            "prompt": "What is 2 + 2?",
+            "thinking": "I should add the two values.",
+            "thinking_blocks": [
+                {"type": "thinking", "thinking": "I should add the two values.", "signature": "opaque-provider-data"}
+            ],
+            "response": "4",
+            "model": "claude-opus-5",
+            "provider": "anthropic",
+            "effort": "max",
+            "category": "math",
+            "reasoning_capture": "claude_interactive_summary",
+            "auth": "claude_subscription",
+            "completed_at": "2026-07-26T01:28:46-04:00",
+            "duration_ms": 13954,
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 8},
+            "request_id": "req-1",
+            "message_id": "msg-1",
+        },
+        {
+            "id": "sample-2",
+            "prompt": "Name a primary color.",
+            "thinking": "Choose a common example.",
+            "response": "Red.",
+            "model": "claude-opus-5",
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    examples = convert_traces_to_training_data(trace_file)
+
+    assert len(examples) == 2
+    assert examples[0]["messages"] == [
+        {"role": "system", "content": "Answer carefully."},
+        {"role": "user", "content": "What is 2 + 2?"},
+        {"role": "assistant", "content": "4", "reasoning_content": "I should add the two values."},
+    ]
+    assert examples[1]["messages"] == [
+        {"role": "user", "content": "Name a primary color."},
+        {"role": "assistant", "content": "Red.", "reasoning_content": "Choose a common example."},
+    ]
+    assert examples[0]["metadata"]["trace_type"] == "chat"
+    assert examples[0]["metadata"]["model"] == "claude-opus-5"
+    assert examples[0]["metadata"]["model_provider"] == "anthropic"
+    assert examples[0]["metadata"]["id"] == "sample-1"
+    assert examples[0]["category"] == "math"
+    assert examples[0]["metadata"]["category"] == "math"
+    assert examples[0]["metadata"]["reasoning_capture"] == "claude_interactive_summary"
+    assert examples[0]["metadata"]["usage"] == {"input_tokens": 5, "output_tokens": 8}
+    assert "thinking_blocks" not in examples[0]["metadata"]
+
+
 def test_convert_cursor_session_events_preserves_messages_tools_and_trace_type(tmp_path: Path):
     trace_file = tmp_path / "cursor-session.jsonl"
     events = [

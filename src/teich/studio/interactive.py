@@ -41,6 +41,7 @@ from ..runner import (
     HermesRunner,
     PiRunner,
     _make_tree_world_writable,
+    _terminate_process_tree,
 )
 from .events import display_event
 
@@ -85,14 +86,10 @@ class EventLog:
 
 
 def _terminate(process: subprocess.Popen | None) -> None:
-    if process is None or process.poll() is not None:
+    if process is None:
         return
     try:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
+        _terminate_process_tree(process)
     except OSError:
         pass
 
@@ -143,6 +140,11 @@ class TerminalBridge:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 bufsize=0,
+                creationflags=(
+                    subprocess.CREATE_NO_WINDOW
+                    if os.name == "nt"
+                    else 0
+                ),
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
@@ -336,6 +338,7 @@ class InteractiveSession:
             if self.provider == "hermes":
                 runner._write_hermes_runtime_config(self._home_dir)
             else:
+                runner._prepare_agent_home(self._home_dir)
                 self._claude_existing_sessions = {
                     p.resolve() for p in runner._list_native_session_files(self._home_dir)
                 }

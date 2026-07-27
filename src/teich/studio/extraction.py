@@ -89,13 +89,34 @@ class ExtractionJob:
                 self.events.append({"kind": "extract_warning", "text": CURSOR_EXTRACTION_NOTICE})
             last_progress_at = 0.0
 
-            def emit_progress(event: dict[str, Any]) -> None:
+            def emit_progress(event: dict[str, Any], *, force: bool = False) -> None:
                 nonlocal last_progress_at
                 now = time.monotonic()
-                if now - last_progress_at < 2.0:
+                if not force and now - last_progress_at < 2.0:
                     return
                 last_progress_at = now
                 self.events.append(event)
+
+            def emit_anonymize_progress(report, done: int, total: int | None) -> None:
+                counts = report.replacements
+                total_text = str(total) if total is not None else "?"
+                emit_progress(
+                    {
+                        "kind": "extract_progress",
+                        "text": (
+                            f"Anonymized {done}/{total_text} files · "
+                            f"{counts.get('api_key', 0)} keys, "
+                            f"{counts.get('email', 0)} emails, "
+                            f"{counts.get('username', 0)} usernames in {report.path.name}"
+                        ),
+                        "phase": "anonymize",
+                        "files_done": done,
+                        "files_total": total,
+                        "file": report.path.name,
+                        "replacements": counts,
+                    },
+                    force=total is not None and done >= total,
+                )
 
             if not self.skip_anonymize:
                 self._emit_status("running", "Extracting and anonymizing traces...")
@@ -107,6 +128,7 @@ class ExtractionJob:
                 clear_destination=True,
                 progress=emit_progress,
                 anonymize=not self.skip_anonymize,
+                anonymize_progress=emit_anonymize_progress,
             )
             self.detected_sources = [str(path) for path in result.source_paths]
             self.result_files = [path.name for path in result.copied_files]

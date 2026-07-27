@@ -134,7 +134,47 @@ def _is_non_data_trace_path(path: Path, traces_dir: Path, excluded_dirs: list[Pa
     return False
 
 
-TEXT_SUBPROCESS_KWARGS = {"text": True, "encoding": "utf-8", "errors": "replace"}
+TEXT_SUBPROCESS_KWARGS: dict[str, Any] = {
+    "text": True,
+    "encoding": "utf-8",
+    "errors": "replace",
+}
+if os.name == "nt":
+    # Teich owns these background CLI processes and consumes their output via
+    # pipes. They do not need a host console, and suppressing one prevents
+    # conhost.exe accumulation in long Windows generation runs.
+    TEXT_SUBPROCESS_KWARGS["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[Any],
+    *,
+    timeout: float = 5,
+    windows: bool | None = None,
+) -> None:
+    """Terminate an owned subprocess and its descendants."""
+    if process.poll() is not None:
+        return
+    use_taskkill = os.name == "nt" if windows is None else windows
+    if use_taskkill:
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+            check=False,
+            **TEXT_SUBPROCESS_KWARGS,
+        )
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 LOCAL_PROVIDER_PROXY_SCRIPT_NAME = "local_provider_proxy.js"
 CLAUDE_OPENROUTER_PROXY_SCRIPT_NAME = "claude_openrouter_proxy.js"
 CLAUDE_OPENROUTER_PROXY_PORT = 17891
@@ -1114,13 +1154,7 @@ class DockerRuntimeRunner:
         remove_container: bool = True,
     ) -> None:
         try:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+            _terminate_process_tree(process)
         finally:
             if remove_container:
                 self._remove_container(container_name)
@@ -2272,6 +2306,9 @@ class CodexRunner(DockerRuntimeRunner):
             lines.append(
                 f"model_reasoning_summary = {self._toml_string(self.config.model.reasoning_summary)}"
             )
+        if self.config.model.reasoning_summaries_enabled is not None:
+            enabled = str(self.config.model.reasoning_summaries_enabled).lower()
+            lines.append(f"model_supports_reasoning_summaries = {enabled}")
         if self.config.model.service_tier:
             lines.append(
                 f"service_tier = {self._toml_string(self.config.model.service_tier)}"
@@ -3221,13 +3258,35 @@ class ExternalCliRunner(DockerRuntimeRunner):
 
 
 class ClaudeCodeRunner(ExternalCliRunner):
-    """Runs Claude Code in non-interactive stream-json mode."""
+    """Runs Claude Code through an interactive PTY and exports its native trace."""
 
     provider_name = "claude-code"
     container_kind = "claude"
     home_in_container = CLAUDE_HOME_IN_CONTAINER
     source_name = "claude-code"
     default_model_provider = "anthropic"
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self._subscription_request_lock = threading.Lock()
+        self._last_subscription_request_at: float | None = None
+
+    def _wait_for_subscription_request_slot(self) -> float:
+        """Space Claude subscription request starts without affecting API runs."""
+        delay = self.config.agent.claude.subscription_request_delay_seconds
+        if delay <= 0 or not self.config.claude_host_auth_active():
+            return 0.0
+
+        waited = 0.0
+        with self._subscription_request_lock:
+            now = time.monotonic()
+            if self._last_subscription_request_at is not None:
+                remaining = self._last_subscription_request_at + delay - now
+                if remaining > 0:
+                    time.sleep(remaining)
+                    waited = remaining
+            self._last_subscription_request_at = time.monotonic()
+        return waited
 
     def _runtime_image_name(self) -> str:
         if self.config.agent.langfuse.enabled:
@@ -3270,6 +3329,10 @@ class ClaudeCodeRunner(ExternalCliRunner):
         settings: dict[str, object] = {}
         if self.config.agent.claude.always_thinking is not None:
             settings["alwaysThinkingEnabled"] = self.config.agent.claude.always_thinking
+        if self.config.agent.claude.show_thinking_summaries is not None:
+            settings["showThinkingSummaries"] = (
+                self.config.agent.claude.show_thinking_summaries
+            )
         if self.config.agent.langfuse.enabled:
             hook = {"hooks": [{"type": "command", "command": CLAUDE_LANGFUSE_HOOK_COMMAND}]}
             settings["hooks"] = {"Stop": [hook], "SessionEnd": [hook]}
@@ -3335,10 +3398,35 @@ class ClaudeCodeRunner(ExternalCliRunner):
         model = self.config.get_effective_model().strip().lower()
         return not (model.startswith("claude-") or model.startswith("anthropic/claude-"))
 
-    def _claude_visible_model(self) -> str:
+    def _claude_visible_model(self, model_override: str | None = None) -> str:
         if self._needs_openrouter_model_proxy():
             return CLAUDE_OPENROUTER_SURROGATE_MODEL
-        return self.config.get_effective_model()
+        return model_override or self.config.get_effective_model()
+
+    def _claude_retry_models(self) -> list[str | None]:
+        """Return first-party models to try across Teich's interactive retries."""
+        models: list[str | None] = [None]
+        # Claude's native --fallback-model flag is print-mode-only. For the
+        # interactive capture path, Teich switches --model itself on retries.
+        # Custom proxy targets are fixed in the container environment and
+        # therefore cannot be changed safely between turns.
+        if self.config.get_base_url():
+            return models
+        fallback = self.config.get_claude_fallback_model()
+        if not fallback:
+            return models
+        primary = self.config.get_effective_model().strip().casefold()
+        seen = {primary}
+        for name in fallback.split(","):
+            normalized = name.strip()
+            key = normalized.casefold()
+            if not normalized or key in seen:
+                continue
+            seen.add(key)
+            models.append(normalized)
+            if len(models) >= AGENT_TURN_RETRY_LIMIT + 1:
+                break
+        return models
 
     def _base_url_env_items(self) -> list[tuple[str, str]]:
         if not self._needs_openrouter_model_proxy():
@@ -3412,8 +3500,6 @@ class ClaudeCodeRunner(ExternalCliRunner):
         args: list[str] = []
         if self.config.model.reasoning_effort:
             args.extend(["--effort", self.config.model.reasoning_effort])
-        if fallback_model := self.config.get_claude_fallback_model():
-            args.extend(["--fallback-model", fallback_model])
         return args
 
     def _build_shell_command(
@@ -3421,15 +3507,13 @@ class ClaudeCodeRunner(ExternalCliRunner):
         *,
         continue_session: bool = False,
         resume_session_id: str | None = None,
+        model_override: str | None = None,
     ) -> str:
         claude_command = [
             "claude",
-            "-p",
-            "--output-format",
-            "stream-json",
-            "--verbose",
+            "--ax-screen-reader",
             "--model",
-            self._claude_visible_model(),
+            self._claude_visible_model(model_override),
         ]
         permission_mode = self._permission_mode()
         if permission_mode:
@@ -3441,7 +3525,51 @@ class ClaudeCodeRunner(ExternalCliRunner):
             claude_command.extend(["--resume", resume_session_id])
         elif continue_session:
             claude_command.append("--continue")
-        return f"{shlex.join(claude_command)} < {shlex.quote(WORKSPACE_IN_CONTAINER + '/' + TEICH_PROMPT_FILE_NAME)}"
+        prompt_path = shlex.quote(WORKSPACE_IN_CONTAINER + "/" + TEICH_PROMPT_FILE_NAME)
+        interactive_command = f"exec {shlex.join(claude_command)} \"$(cat {prompt_path})\""
+        return f"script -qfec {shlex.quote(interactive_command)} /dev/null"
+
+    def _build_external_docker_base_command(
+        self,
+        workspace: Path,
+        home_dir: Path,
+        container_name: str,
+        *,
+        detached: bool = False,
+    ) -> list[str]:
+        command = super()._build_external_docker_base_command(
+            workspace,
+            home_dir,
+            container_name,
+            detached=detached,
+        )
+        if not detached:
+            command.insert(2, "-i")
+        return command
+
+    def _build_external_exec_command(
+        self,
+        container_name: str,
+        *,
+        continue_session: bool = False,
+        resume_session_id: str | None = None,
+        model_override: str | None = None,
+    ) -> list[str]:
+        command = super()._build_external_exec_command(
+            container_name,
+            continue_session=continue_session,
+            resume_session_id=resume_session_id,
+        )
+        if model_override is not None:
+            command[-1] = self._wrap_external_shell_command(
+                self._build_shell_command(
+                    continue_session=continue_session,
+                    resume_session_id=resume_session_id,
+                    model_override=model_override,
+                )
+            )
+        command.insert(2, "-i")
+        return command
 
     def _build_external_command(
         self,
@@ -3451,20 +3579,37 @@ class ClaudeCodeRunner(ExternalCliRunner):
         *,
         continue_session: bool = False,
         resume_session_id: str | None = None,
+        model_override: str | None = None,
     ) -> list[str]:
         if not self._needs_openrouter_model_proxy():
-            return super()._build_external_command(
-                workspace,
-                home_dir,
-                container_name,
-                continue_session=continue_session,
-                resume_session_id=resume_session_id,
+            if model_override is None:
+                return super()._build_external_command(
+                    workspace,
+                    home_dir,
+                    container_name,
+                    continue_session=continue_session,
+                    resume_session_id=resume_session_id,
+                )
+            command = self._build_external_docker_base_command(workspace, home_dir, container_name)
+            command.extend(
+                [
+                    "bash",
+                    "-lc",
+                    self._wrap_external_shell_command(
+                        self._build_shell_command(
+                            continue_session=continue_session,
+                            resume_session_id=resume_session_id,
+                            model_override=model_override,
+                        )
+                    ),
+                ]
             )
+            return command
         self._write_openrouter_proxy(home_dir)
         command = self._build_external_docker_base_command(workspace, home_dir, container_name)
         shell_command = self._wrap_external_shell_command(
             f"{self._openrouter_proxy_shell_prefix()}"
-            f"{self._build_shell_command(continue_session=continue_session, resume_session_id=resume_session_id)}"
+            f"{self._build_shell_command(continue_session=continue_session, resume_session_id=resume_session_id, model_override=model_override)}"
         )
         command.extend(
             [
@@ -3499,6 +3644,23 @@ class ClaudeCodeRunner(ExternalCliRunner):
                 return session_id.strip()
         return None
 
+    def _native_interactive_turns_complete(
+        self,
+        trace_path: Path,
+        turn_prompts: list[str],
+    ) -> bool:
+        events = _read_jsonl_dict_events(trace_path)
+        if not events:
+            return False
+        completed_turn_markers = sum(
+            1
+            for event in events
+            if event.get("type") == "system" and event.get("subtype") == "turn_duration"
+        )
+        if completed_turn_markers < len(turn_prompts):
+            return False
+        return self._trace_contains_completed_turns(trace_path, turn_prompts)
+
     def _run_native_process_with_progress(
         self,
         command: list[str],
@@ -3510,14 +3672,19 @@ class ClaudeCodeRunner(ExternalCliRunner):
         started_at: datetime,
         progress_callback: SessionProgressCallback | None,
         progress_base: SessionProgressUpdate | None,
+        expected_turns: list[str] | None = None,
+        remove_container_on_error: bool = True,
     ) -> tuple[str, str]:
         process: subprocess.Popen[str] | None = None
         stdout_handle = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
         stderr_handle = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
+        exit_requested_at: float | None = None
+        exit_enter_repeated = False
         try:
             try:
                 process = subprocess.Popen(
                     command,
+                    stdin=subprocess.PIPE,
                     stdout=stdout_handle,
                     stderr=stderr_handle,
                     **TEXT_SUBPROCESS_KWARGS,
@@ -3566,6 +3733,21 @@ class ClaudeCodeRunner(ExternalCliRunner):
                                         metrics=metrics,
                                     )
                                 )
+                            if (
+                                expected_turns
+                                and exit_requested_at is None
+                                and self._native_interactive_turns_complete(
+                                    trace_path,
+                                    expected_turns,
+                                )
+                            ):
+                                if process.stdin is None:
+                                    raise RuntimeError(
+                                        "Claude interactive process has no stdin for graceful exit"
+                                    )
+                                process.stdin.write("/exit\r")
+                                process.stdin.flush()
+                                exit_requested_at = time.monotonic()
                 elif progress_callback and progress_base and time.monotonic() - last_heartbeat >= 5.0:
                     last_heartbeat = time.monotonic()
                     progress_callback(
@@ -3581,6 +3763,15 @@ class ClaudeCodeRunner(ExternalCliRunner):
                             details="waiting for Claude Code trace",
                         )
                     )
+
+                if exit_requested_at is not None and process.stdin is not None:
+                    exit_wait = time.monotonic() - exit_requested_at
+                    if exit_wait >= 2.0 and not exit_enter_repeated:
+                        process.stdin.write("\r")
+                        process.stdin.flush()
+                        exit_enter_repeated = True
+                    if exit_wait >= 10.0:
+                        process.terminate()
 
                 if return_code is not None:
                     stdout_handle.flush()
@@ -3604,7 +3795,11 @@ class ClaudeCodeRunner(ExternalCliRunner):
                 time.sleep(0.5)
         except BaseException:
             if process is not None:
-                self._terminate_process(process, container_name)
+                self._terminate_process(
+                    process,
+                    container_name,
+                    remove_container=remove_container_on_error,
+                )
             raise
         finally:
             if process is not None:
@@ -3645,14 +3840,17 @@ class ClaudeCodeRunner(ExternalCliRunner):
                 (workspace / TEICH_PROMPT_FILE_NAME).write_text(turn_prompt, encoding="utf-8")
                 (workspace / TEICH_PROMPT_FILE_NAME).chmod(0o666)
                 expected_turns = turn_prompts[: turn_index + 1]
+                retry_models = self._claude_retry_models()
                 for attempt in range(AGENT_TURN_RETRY_LIMIT + 1):
                     continue_session = turn_index > 0 or attempt > 0
                     resume_session_id = native_resume_session_id if continue_session else None
+                    model_override = retry_models[min(attempt, len(retry_models) - 1)]
                     if len(turn_prompts) > 1:
                         command = self._build_external_exec_command(
                             container_name,
                             continue_session=continue_session,
                             resume_session_id=resume_session_id,
+                            model_override=model_override,
                         )
                     else:
                         command = self._build_external_command(
@@ -3661,10 +3859,12 @@ class ClaudeCodeRunner(ExternalCliRunner):
                             container_name,
                             continue_session=continue_session,
                             resume_session_id=resume_session_id,
+                            model_override=model_override,
                         )
                     process_error: subprocess.CalledProcessError | None = None
                     details = ""
                     try:
+                        self._wait_for_subscription_request_slot()
                         self._run_native_process_with_progress(
                             command,
                             container_name,
@@ -3674,6 +3874,8 @@ class ClaudeCodeRunner(ExternalCliRunner):
                             started_at=started_at,
                             progress_callback=progress_callback,
                             progress_base=progress_base,
+                            expected_turns=expected_turns,
+                            remove_container_on_error=len(turn_prompts) <= 1,
                         )
                     except subprocess.CalledProcessError as exc:
                         process_error = exc
@@ -4954,7 +5156,6 @@ class ChatRunner(DockerRuntimeRunner):
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt, "thinking": None})
         responses: list[str] = []
-        thinking_parts: list[str | None] = []
         usages: list[dict[str, Any] | None] = []
         model = self.config.get_effective_model()
 
@@ -4965,16 +5166,11 @@ class ChatRunner(DockerRuntimeRunner):
             history.append({"role": "user", "content": prompt})
             history.append({"role": "assistant", "content": content})
             responses.append(content)
-            thinking_parts.append(thinking)
             usages.append(usage)
 
-        thinking_text = "\n\n".join(part for part in thinking_parts if isinstance(part, str) and part.strip()) or None
         row: dict[str, Any] = {
             "messages": messages,
-            "prompt": prompt_input.prompt,
             "follow_up_prompts": prompt_input.follow_up_prompts,
-            "thinking": thinking_text,
-            "response": responses[-1] if responses else "",
             "responses": responses,
             "model": model,
             "provider": self.config.api.provider,
@@ -5001,7 +5197,6 @@ class ChatRunner(DockerRuntimeRunner):
         messages = self._chat_messages_from_row(existing_row, prompt_input)
         history = self._chat_history_from_messages(messages)
         responses = self._chat_row_responses(existing_row, messages)
-        thinking_parts = self._chat_thinking_parts_from_messages(messages)
         usages: list[dict[str, Any] | None] = [
             existing_row.get("usage") if isinstance(existing_row.get("usage"), dict) else None
         ]
@@ -5015,11 +5210,8 @@ class ChatRunner(DockerRuntimeRunner):
             history.append({"role": "user", "content": prompt})
             history.append({"role": "assistant", "content": content})
             responses.append(content)
-            if isinstance(thinking, str) and thinking.strip():
-                thinking_parts.append(thinking.strip())
             usages.append(usage)
 
-        thinking_text = "\n\n".join(thinking_parts) or None
         metadata = existing_row.get("metadata") if isinstance(existing_row.get("metadata"), dict) else {}
         metadata = {
             **metadata,
@@ -5030,10 +5222,7 @@ class ChatRunner(DockerRuntimeRunner):
         }
         row = {
             "messages": messages,
-            "prompt": prompt_input.prompt,
             "follow_up_prompts": prompt_input.follow_up_prompts,
-            "thinking": thinking_text,
-            "response": responses[-1] if responses else "",
             "responses": responses,
             "model": model,
             "provider": self.config.api.provider,

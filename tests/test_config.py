@@ -408,6 +408,16 @@ def test_model_reasoning_summary_is_free_string_passthrough():
     assert ModelConfig(reasoning_summary="concise").reasoning_summary == "concise"
 
 
+def test_model_reasoning_summaries_enabled_defaults_to_none():
+    """Codex keeps its model-catalog capability unless explicitly overridden."""
+    assert Config().model.reasoning_summaries_enabled is None
+
+
+def test_model_reasoning_summaries_enabled_accepts_boolean():
+    assert ModelConfig(reasoning_summaries_enabled=True).reasoning_summaries_enabled is True
+    assert ModelConfig(reasoning_summaries_enabled=False).reasoning_summaries_enabled is False
+
+
 def test_codex_auth_config_defaults():
     """Codex host-auth is off by default with a project-local auth dir."""
     codex = Config().agent.codex
@@ -477,11 +487,13 @@ def test_codex_host_auth_source_defaults_to_home(monkeypatch):
 
 
 def test_claude_config_defaults():
-    """No token, no passthroughs: everything under agent.claude is opt-in."""
+    """Claude defaults to interactive thinking capture and safe subscription pacing."""
     claude = Config().agent.claude
     assert claude.oauth_token is None
+    assert claude.subscription_request_delay_seconds == 45.0
     assert claude.fallback_model is None
-    assert claude.always_thinking is None
+    assert claude.always_thinking is True
+    assert claude.show_thinking_summaries is True
     assert claude.max_thinking_tokens is None
 
 
@@ -616,6 +628,11 @@ def test_claude_max_thinking_tokens_rejects_negative():
         Config(agent={"claude": {"max_thinking_tokens": -1}})
 
 
+def test_claude_subscription_request_delay_rejects_negative():
+    with pytest.raises(ValueError):
+        Config(agent={"claude": {"subscription_request_delay_seconds": -0.1}})
+
+
 def test_claude_settings_from_yaml(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("TEICH_MODEL", raising=False)
     config_file = tmp_path / "config.yaml"
@@ -625,8 +642,10 @@ agent:
   provider: claude-code
   claude:
     oauth_token: sk-ant-oat01-test
+    subscription_request_delay_seconds: 60
     fallback_model: [sonnet, haiku]
     always_thinking: true
+    show_thinking_summaries: true
     max_thinking_tokens: 31999
 model:
   model: claude-opus-4-8
@@ -635,10 +654,35 @@ model:
     )
     config = Config.from_yaml(config_file)
     assert config.claude_host_auth_active() is True
+    assert config.agent.claude.subscription_request_delay_seconds == 60
     assert config.model.reasoning_effort == "xhigh"
     assert config.get_claude_fallback_model() == "sonnet,haiku"
     assert config.agent.claude.always_thinking is True
+    assert config.agent.claude.show_thinking_summaries is True
     assert config.agent.claude.max_thinking_tokens == 31999
+
+
+def test_reasoning_example_configs_load(monkeypatch):
+    """The provider-specific example files stay runnable as the schema evolves."""
+    monkeypatch.delenv("TEICH_MODEL", raising=False)
+    monkeypatch.delenv("TEICH_BASE_URL", raising=False)
+    monkeypatch.delenv("TEICH_API_KEY", raising=False)
+    monkeypatch.delenv("TEICH_PROVIDER", raising=False)
+    examples_dir = Path(__file__).parents[1] / "examples"
+
+    codex = Config.from_yaml(examples_dir / "config.codex-reasoning.yaml")
+    assert codex.get_agent_provider() == "codex"
+    assert codex.model.reasoning_effort == "xhigh"
+    assert codex.model.reasoning_summary == "detailed"
+    assert codex.model.reasoning_summaries_enabled is True
+    assert codex.prompts_file == (examples_dir / "prompts.jsonl").resolve()
+
+    claude = Config.from_yaml(examples_dir / "config.claude-code-thinking.yaml")
+    assert claude.get_agent_provider() == "claude-code"
+    assert claude.model.reasoning_effort == "max"
+    assert claude.agent.claude.always_thinking is True
+    assert claude.agent.claude.show_thinking_summaries is True
+    assert claude.prompts_file == (examples_dir / "prompts.jsonl").resolve()
 
 
 def test_mcp_config():

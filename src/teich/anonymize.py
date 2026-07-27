@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 import hashlib
@@ -102,22 +102,42 @@ def anonymize_path(
 
     source_files = sorted(path for path in input_path.rglob("*") if path.is_file())
     destinations = [source if in_place else output_path / source.relative_to(input_path) for source in source_files]
+    report.files.extend(anonymize_files(source_files, destinations, progress=progress))
+    return report
+
+
+def anonymize_files(
+    source_files: list[Path],
+    destinations: list[Path],
+    *,
+    progress: AnonymizeProgress | None = None,
+) -> list[AnonymizeFileReport]:
+    """Anonymize a known file set, reporting files as workers complete."""
+    if len(source_files) != len(destinations):
+        raise ValueError("source_files and destinations must have the same length")
+    reports: list[AnonymizeFileReport] = []
     workers = _process_worker_count(len(source_files))
     if workers > 1 and len(source_files) >= _MIN_FILES_FOR_PARALLEL:
         # Each file is anonymized independently (fresh TraceAnonymizer per
         # file), so files can be processed in parallel safely.
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            for file_report in executor.map(anonymize_file, source_files, destinations):
-                report.files.append(file_report)
+            futures = {
+                executor.submit(anonymize_file, source, destination): source
+                for source, destination in zip(source_files, destinations)
+            }
+            for future in as_completed(futures):
+                file_report = future.result()
+                reports.append(file_report)
                 if progress is not None:
-                    progress(file_report, len(report.files), len(source_files))
+                    progress(file_report, len(reports), len(source_files))
+        reports.sort(key=lambda item: item.path)
     else:
         for source_file, destination in zip(source_files, destinations):
             file_report = anonymize_file(source_file, destination)
-            report.files.append(file_report)
+            reports.append(file_report)
             if progress is not None:
-                progress(file_report, len(report.files), len(source_files))
-    return report
+                progress(file_report, len(reports), len(source_files))
+    return reports
 
 
 def _path_contains(parent: Path, child: Path) -> bool:

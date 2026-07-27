@@ -1,0 +1,35 @@
+# Codex generation with the richest readable reasoning summaries Codex exposes.
+#
+# Prerequisite:
+#   codex login
+#
+# Run from the repository root:
+#   uvx teich generate -c examples/config.codex-reasoning.yaml
+#
+# Codex does not expose its hidden raw chain-of-thought. Teich records the
+# provider-supported detailed summaries and preserves the native trace.
+
+agent:
+  provider: codex
+  codex:
+    use_host_auth: true
+    auth_dir: ./.teich/codex-auth
+
+model:
+  model: gpt-5.6
+  approval_policy: never
+  sandbox: danger-full-access
+  reasoning_effort: xhigh
+  reasoning_summary: detailed
+  reasoning_summaries_enabled: true
+
+prompts_file: prompts.jsonl
+
+output:
+  traces_dir: ./output/codex-reasoning
+  sandbox_dir: ./sandbox/codex-reasoning
+  failures_dir: ./failures/codex-reasoning
+  pretty_name: Codex Detailed Reasoning Summaries
+
+max_concurrency: 1
+timeout_seconds: 1800

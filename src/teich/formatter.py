@@ -413,6 +413,76 @@ def _tokenize_trainer_text_with_offsets(
     return list(input_ids), list(attention_mask), normalized_offsets
 
 
+def _tokenize_trainer_text_batch_with_offsets(
+    text_tokenizer: Any,
+    texts: list[str],
+) -> list[tuple[list[int], list[int], list[tuple[int, int]]]] | None:
+    """Tokenize one map batch at once when the tokenizer supports batching."""
+    if not texts:
+        return []
+    call_variants = (
+        ((), {"text": texts, "add_special_tokens": False, "return_attention_mask": True, "return_offsets_mapping": True}),
+        ((texts,), {"add_special_tokens": False, "return_attention_mask": True, "return_offsets_mapping": True}),
+    )
+    encoded = None
+    for args, kwargs in call_variants:
+        try:
+            encoded = text_tokenizer(*args, **kwargs)
+            break
+        except TypeError:
+            continue
+        except (ValueError, NotImplementedError):
+            return None
+    if encoded is None:
+        return None
+    input_ids_batch = encoded.get("input_ids")
+    offsets_batch = encoded.get("offset_mapping")
+    if input_ids_batch is None or offsets_batch is None or len(input_ids_batch) != len(texts):
+        return None
+    if not input_ids_batch or not isinstance(input_ids_batch[0], (list, tuple)):
+        return None
+    if not offsets_batch or not isinstance(offsets_batch[0], (list, tuple)):
+        return None
+    attention_batch = encoded.get("attention_mask")
+    if attention_batch is None:
+        attention_batch = [[1] * len(input_ids) for input_ids in input_ids_batch]
+    if len(attention_batch) != len(texts) or len(offsets_batch) != len(texts):
+        return None
+    rows: list[tuple[list[int], list[int], list[tuple[int, int]]]] = []
+    for input_ids, attention_mask, offsets in zip(
+        input_ids_batch,
+        attention_batch,
+        offsets_batch,
+        strict=True,
+    ):
+        if hasattr(input_ids, "tolist"):
+            input_ids = input_ids.tolist()
+        if hasattr(attention_mask, "tolist"):
+            attention_mask = attention_mask.tolist()
+        if hasattr(offsets, "tolist"):
+            offsets = offsets.tolist()
+        if (
+            not isinstance(input_ids, (list, tuple))
+            or not isinstance(attention_mask, (list, tuple))
+            or not isinstance(offsets, (list, tuple))
+            or len(input_ids) != len(attention_mask)
+            or len(input_ids) != len(offsets)
+            or any(mask != 1 for mask in attention_mask)
+            or any(not isinstance(offset, (list, tuple)) or len(offset) != 2 for offset in offsets)
+        ):
+            # Padding or malformed per-row shapes can make a batch encoding
+            # disagree with the trainer's independently tokenized rows.
+            return None
+        rows.append(
+            (
+                list(input_ids),
+                list(attention_mask),
+                [tuple(offset) for offset in offsets],
+            )
+        )
+    return rows
+
+
 def _tokenize_trainer_text(text_tokenizer: Any, text: str) -> tuple[list[int], list[int]] | None:
     call_variants = (
         ((), {"text": text, "add_special_tokens": False, "return_attention_mask": True}),
@@ -1536,6 +1606,40 @@ def _drop_last_user_turn(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     return trimmed
 
 
+def _followup_trim_candidates(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Return the same prefixes as repeated _drop_last_user_turn, longest first."""
+    user_indexes: list[int] = []
+    last_assistant_before: list[int | None] = []
+    last_assistant: int | None = None
+    for index, message in enumerate(messages):
+        last_assistant_before.append(last_assistant)
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "user":
+            user_indexes.append(index)
+        elif role == "assistant":
+            last_assistant = index
+    if len(user_indexes) < 2:
+        return []
+
+    candidates: list[list[dict[str, Any]]] = []
+    seen_ends: set[int] = set()
+    for user_index in reversed(user_indexes[1:]):
+        assistant_index = last_assistant_before[user_index]
+        if assistant_index is None or assistant_index in seen_ends:
+            continue
+        candidate = messages[: assistant_index + 1]
+        if not any(
+            isinstance(message, dict) and message.get("role") == "user"
+            for message in candidate
+        ):
+            continue
+        seen_ends.add(assistant_index)
+        candidates.append(candidate)
+    return candidates
+
+
 def _tool_schema_names(tools: list[dict[str, Any]]) -> set[str]:
     names: set[str] = set()
     for tool in tools:
@@ -2001,28 +2105,59 @@ def format_data(
                         report.record_dropped_row(row_info, "oversized", initial_token_length)
                     continue
                 if rendered.token_length > effective_max_length:
-                    while effective_oversized_policy == "trim_followups":
-                        trimmed_messages = _drop_last_user_turn(messages)
-                        if trimmed_messages is None:
-                            break
-                        messages = trimmed_messages
-                        did_trim = True
-                        rendered = _render_training_row(
-                            renderer=renderer,
-                            text_tokenizer=text_tokenizer,
-                            messages=messages,
-                            tools=tools,
-                            template_kwargs=template_kwargs,
-                            teich_masking=teich_masking,
-                            tokenize=tokenize,
-                            measure_token_length=measure_token_length,
-                            assistant_prompt_prefix_cache=assistant_prompt_prefix_cache,
-                            strict=strict,
-                        )
-                        if rendered is None:
-                            break
-                        if rendered.token_length is not None and rendered.token_length <= effective_max_length:
-                            break
+                    if effective_oversized_policy == "trim_followups":
+                        candidates = _followup_trim_candidates(messages)
+                        candidate_cache: dict[int, _RenderedRow | None] = {}
+
+                        def render_candidate(candidate_index: int) -> _RenderedRow | None:
+                            candidate_rendered = candidate_cache.get(candidate_index)
+                            if candidate_index not in candidate_cache:
+                                candidate_rendered = _render_training_row(
+                                    renderer=renderer,
+                                    text_tokenizer=text_tokenizer,
+                                    messages=candidates[candidate_index],
+                                    tools=tools,
+                                    template_kwargs=template_kwargs,
+                                    teich_masking=teich_masking,
+                                    tokenize=tokenize,
+                                    measure_token_length=measure_token_length,
+                                    assistant_prompt_prefix_cache=assistant_prompt_prefix_cache,
+                                    strict=strict,
+                                )
+                                candidate_cache[candidate_index] = candidate_rendered
+                            return candidate_rendered
+
+                        first_fitting_index: int | None = None
+                        low = 0
+                        high = len(candidates) - 1
+                        while low <= high:
+                            middle = (low + high) // 2
+                            candidate_rendered = render_candidate(middle)
+                            candidate_length = (
+                                candidate_rendered.token_length
+                                if candidate_rendered is not None
+                                else None
+                            )
+                            if candidate_length is not None and candidate_length <= effective_max_length:
+                                first_fitting_index = middle
+                                high = middle - 1
+                            else:
+                                low = middle + 1
+                        if first_fitting_index is not None:
+                            # Check the immediate boundary so tokenizer/template
+                            # edge effects cannot skip a longer fitting prefix.
+                            while first_fitting_index > 0:
+                                previous = render_candidate(first_fitting_index - 1)
+                                if (
+                                    previous is None
+                                    or previous.token_length is None
+                                    or previous.token_length > effective_max_length
+                                ):
+                                    break
+                                first_fitting_index -= 1
+                            messages = candidates[first_fitting_index]
+                            rendered = render_candidate(first_fitting_index)
+                            did_trim = True
                     if rendered is None or rendered.token_length is None or rendered.token_length > effective_max_length:
                         dropped_oversized_count += 1
                         if report is not None:
@@ -2096,6 +2231,7 @@ def _mask_tokenized_row(
     train_on_system: bool,
     train_on_developer: bool,
     train_on_tool_responses: bool,
+    encoded_with_offsets: tuple[list[int], list[int], list[tuple[int, int]]] | None = None,
 ) -> dict[str, Any] | None:
     input_ids = _extract_token_sequence(row.get("input_ids"))
     if input_ids is None:
@@ -2116,7 +2252,7 @@ def _mask_tokenized_row(
         )
         if not supervised_spans:
             return None
-        encoded = _tokenize_trainer_text_with_offsets(text_tokenizer, text)
+        encoded = encoded_with_offsets or _tokenize_trainer_text_with_offsets(text_tokenizer, text)
         if encoded is None:
             decoded_text, offsets = _token_text_and_offsets(text_tokenizer, input_ids)
             if decoded_text != text and not text.startswith(decoded_text):
@@ -2129,6 +2265,15 @@ def _mask_tokenized_row(
             full_input_ids, _, offsets = encoded
             full_labels = _labels_from_offsets(full_input_ids, offsets, supervised_spans)
             labels = _align_labels_to_input_ids(input_ids, full_input_ids, full_labels)
+            if labels is None and encoded_with_offsets is not None:
+                # Some tokenizer wrappers implicitly pad or otherwise alter
+                # batch calls even when padding was not requested. Retry this
+                # row independently before declaring the trainer data invalid.
+                encoded = _tokenize_trainer_text_with_offsets(text_tokenizer, text)
+                if encoded is not None:
+                    full_input_ids, _, offsets = encoded
+                    full_labels = _labels_from_offsets(full_input_ids, offsets, supervised_spans)
+                    labels = _align_labels_to_input_ids(input_ids, full_input_ids, full_labels)
             if labels is None:
                 raise ValueError("Trainer tokenized input_ids do not align with the original Teich-rendered text.")
     else:
@@ -2330,6 +2475,15 @@ def mask_data(
             nonlocal dropped_untrainable_count
             output_batch = _empty_output_batch()
             batch_size = len(batch["input_ids"])
+            texts = batch.get(dataset_text_field)
+            batched_offsets = (
+                _tokenize_trainer_text_batch_with_offsets(text_tokenizer, texts)
+                if isinstance(texts, list)
+                and len(texts) == batch_size
+                and all(isinstance(text, str) for text in texts)
+                and TEICH_SUPERVISED_SPANS_COLUMN in batch
+                else None
+            )
             for index in range(batch_size):
                 row = {column_name: batch[column_name][index] for column_name in dataset.column_names}
                 masked_row = _mask_tokenized_row(
@@ -2343,6 +2497,7 @@ def mask_data(
                     train_on_system=train_on_system,
                     train_on_developer=train_on_developer,
                     train_on_tool_responses=train_on_tool_responses,
+                    encoded_with_offsets=batched_offsets[index] if batched_offsets is not None else None,
                 )
                 if masked_row is None:
                     dropped_untrainable_count += 1

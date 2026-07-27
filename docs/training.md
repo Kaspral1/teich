@@ -76,6 +76,9 @@ Where:
 - prompt, user, system, developer, and tool-output context stays masked by default
 - assistant reasoning, final answers, and tool calls become supervised by default
 
+When the tokenizer supports batched offset mappings, `mask_data()` tokenizes
+each dataset-map batch together instead of issuing one tokenizer call per row.
+
 For Qwen-style templates, the initial `<think>` tag is intentionally included in supervision.
 
 ## Masking Policy

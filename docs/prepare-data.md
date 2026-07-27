@@ -57,7 +57,10 @@ Original columns are removed after formatting unless `preserve_columns=True` or 
 When `max_length` is set, use one of:
 
 - `oversized_policy="drop"`: drop oversized rows
-- `oversized_policy="trim_followups"`: for multi-turn rows, remove the final user follow-up and everything after it before dropping the whole row
+- `oversized_policy="trim_followups"`: for multi-turn rows, keep the longest
+  complete conversation prefix that fits. Teich searches the possible
+  follow-up boundaries logarithmically, avoiding a full rerender and
+  retokenization for every removed turn.
 - `oversized_policy="error"`: raise instead of filtering
 
 The older `drop_oversized_examples` and `trim_oversized_followups` flags still work as compatibility aliases, but `oversized_policy` is the preferred API.

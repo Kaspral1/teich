@@ -11,6 +11,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     git \
     curl \
     ca-certificates \
+    util-linux \
     sudo \
     python3 \
     python3-dev \

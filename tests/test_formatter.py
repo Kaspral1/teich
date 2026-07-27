@@ -191,6 +191,56 @@ class OffsetCountingTokenizer(CountingTokenizer):
         return output
 
 
+class BatchOffsetCountingTokenizer(OffsetCountingTokenizer):
+    def __init__(self):
+        super().__init__()
+        self.batch_tokenize_count = 0
+
+    def __call__(self, text, add_special_tokens=False, return_attention_mask=True, return_offsets_mapping=False):
+        if not isinstance(text, list):
+            return super().__call__(
+                text,
+                add_special_tokens=add_special_tokens,
+                return_attention_mask=return_attention_mask,
+                return_offsets_mapping=return_offsets_mapping,
+            )
+        self.batch_tokenize_count += 1
+        rows = [
+            OffsetCountingTokenizer.__call__(
+                self,
+                item,
+                add_special_tokens=add_special_tokens,
+                return_attention_mask=return_attention_mask,
+                return_offsets_mapping=return_offsets_mapping,
+            )
+            for item in text
+        ]
+        output = {"input_ids": [row["input_ids"] for row in rows]}
+        if return_attention_mask:
+            output["attention_mask"] = [row["attention_mask"] for row in rows]
+        if return_offsets_mapping:
+            output["offset_mapping"] = [row["offset_mapping"] for row in rows]
+        return output
+
+
+class PaddedBatchOffsetTokenizer(BatchOffsetCountingTokenizer):
+    def __call__(self, text, add_special_tokens=False, return_attention_mask=True, return_offsets_mapping=False):
+        output = super().__call__(
+            text,
+            add_special_tokens=add_special_tokens,
+            return_attention_mask=return_attention_mask,
+            return_offsets_mapping=return_offsets_mapping,
+        )
+        if isinstance(text, list):
+            for index in range(len(text)):
+                output["input_ids"][index].append(0)
+                if return_attention_mask:
+                    output["attention_mask"][index].append(0)
+                if return_offsets_mapping:
+                    output["offset_mapping"][index].append((0, 0))
+        return output
+
+
 class TrainerStyleTokenizer(OffsetCountingTokenizer):
     eos_token = ""
     pad_token = "<pad>"
@@ -1617,6 +1667,96 @@ def test_prepare_data_trims_oversized_followups_before_dropping():
     assert "follow up" not in prepared[0]["text"]
     assert "later" not in prepared[0]["text"]
     assert len(prepared[0]["input_ids"]) <= 60
+
+
+def test_prepare_data_finds_longest_fitting_followup_prefix_without_linear_rerenders():
+    tokenizer = LengthFilteringTokenizer()
+    messages = []
+    for index in range(64):
+        messages.extend(
+            [
+                {"role": "user", "content": f"question-{index}-" + ("x" * 20)},
+                {"role": "assistant", "content": f"answer-{index}-" + ("y" * 20)},
+            ]
+        )
+    dataset = Dataset.from_list([{"messages": messages, "tools": []}])
+
+    prepared = prepare_data(
+        dataset,
+        tokenizer,
+        max_length=180,
+        oversized_policy="trim_followups",
+        tokenize=True,
+        verbose=False,
+    )
+
+    assert prepared.num_rows == 1
+    assert len(prepared[0]["input_ids"]) <= 180
+    assert "question-0-" in prepared[0]["text"]
+    assert "question-63-" not in prepared[0]["text"]
+    # Initial render + O(log(turns)) candidate renders. The old loop rendered
+    # all 63 prefixes and took quadratic time as conversations grew.
+    assert tokenizer.render_count < 30
+
+
+def test_mask_data_batches_offset_tokenization_across_rows():
+    tokenizer = BatchOffsetCountingTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": f"question {index}"},
+                    {"role": "assistant", "content": f"answer {index}", "reasoning_content": "reason"},
+                ],
+                "tools": [],
+            }
+            for index in range(4)
+        ]
+    )
+    prepared = prepare_data(dataset, tokenizer, tokenize=True, verbose=False)
+    trainer = SimpleNamespace(
+        train_dataset=prepared,
+        eval_dataset=None,
+        args=SimpleNamespace(dataset_text_field="text", max_length=None, packing=False),
+        tokenizer=tokenizer,
+    )
+
+    trainer = mask_data(trainer, tokenizer=tokenizer, audit=False, verbose=False)
+
+    assert trainer.train_dataset.num_rows == 4
+    assert tokenizer.batch_tokenize_count == 1
+
+
+def test_mask_data_falls_back_when_batch_offset_tokenization_adds_padding():
+    tokenizer = PaddedBatchOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": f"question {index}"},
+                    {"role": "assistant", "content": f"answer {index}", "reasoning_content": "reason"},
+                ],
+                "tools": [],
+            }
+            for index in range(2)
+        ]
+    )
+    prepared = prepare_data(dataset, tokenizer, tokenize=True, verbose=False)
+    trainer = SimpleNamespace(
+        train_dataset=prepared,
+        eval_dataset=None,
+        args=SimpleNamespace(dataset_text_field="text", max_length=None, packing=False),
+        tokenizer=tokenizer,
+    )
+
+    trainer = mask_data(trainer, tokenizer=tokenizer, audit=False, verbose=False)
+
+    assert trainer.train_dataset.num_rows == 2
+    assert tokenizer.batch_tokenize_count == 1
+    assert all(
+        len(row["input_ids"]) == len(row["labels"])
+        for row in trainer.train_dataset
+    )
 
 
 def test_prepare_data_only_trims_rows_with_multiple_user_turns():

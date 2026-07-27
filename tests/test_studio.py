@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -19,7 +20,7 @@ from teich.extract import CURSOR_EXTRACTION_NOTICE
 from teich.runner import ClaudeCodeRunner, SessionProgressUpdate
 from teich.studio.events import summarize_chat_row, summarize_event, summarize_trace_events
 from teich.studio.generation import RUNNER_CLASSES, GenerationJob
-from teich.studio.interactive import InteractiveSession
+from teich.studio.interactive import InteractiveSession, TerminalBridge
 from teich.studio.project import ProjectState
 from teich.studio import server as server_module
 from teich.studio.server import (
@@ -804,12 +805,23 @@ def test_extract_endpoint_warns_cursor_may_take_a_while(client):
     source = client.project_dir / "state.vscdb"
     source.write_text("", encoding="utf-8")
 
-    def fake_extract(provider, *, output_dir, sources=None, model_filter=None, clear_destination=False, progress=None, anonymize=False):
+    def fake_extract(
+        provider,
+        *,
+        output_dir,
+        sources=None,
+        model_filter=None,
+        clear_destination=False,
+        progress=None,
+        anonymize=False,
+        anonymize_progress=None,
+    ):
         assert provider == "cursor"
         assert sources == [source]
         assert model_filter is None
         assert clear_destination is True
         assert progress is not None
+        assert anonymize_progress is not None
         progress({"kind": "extract_progress", "text": "Scanning Cursor database..."})
         output_dir.mkdir(parents=True, exist_ok=True)
         trace = output_dir / "cursor-session.jsonl"
@@ -853,6 +865,38 @@ def test_extract_endpoint_warns_cursor_may_take_a_while(client):
     )
 
 
+def test_extract_endpoint_streams_anonymization_file_progress(client):
+    sessions_dir = client.project_dir / ".codex" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    for index in range(9):
+        (sessions_dir / f"trace-{index}.jsonl").write_text(
+            json.dumps({"message": f"alice{index}@example.com"}) + "\n",
+            encoding="utf-8",
+        )
+
+    response = client.post(
+        "/api/extract",
+        json={
+            "provider": "codex",
+            "output": "staged-progress",
+            "sessions_dirs": [str(sessions_dir)],
+        },
+    )
+
+    assert response.status_code == 200
+    job = _wait_for_extract_job(client)
+    assert job["status"] == "completed"
+    events = client.app.state.extraction.current().events.snapshot()
+    progress_events = [
+        event
+        for event in events
+        if event.get("kind") == "extract_progress" and event.get("phase") == "anonymize"
+    ]
+    assert progress_events
+    assert progress_events[-1]["files_done"] == 9
+    assert progress_events[-1]["files_total"] == 9
+
+
 def test_extract_sources_rejects_unknown_provider(client):
     response = client.get("/api/extract/sources", params={"provider": "unknown"})
 
@@ -889,7 +933,20 @@ def test_chat_session_discard_rejected_while_turn_running(tmp_path):
     assert session.status == "running"
 
 
-def test_claude_terminal_forwards_effort_and_fallback_model(tmp_path):
+def test_windows_terminal_bridge_suppresses_host_console():
+    process = MagicMock()
+    process.poll.return_value = None
+    with patch("teich.studio.interactive.os.name", "nt"), patch(
+        "teich.studio.interactive.subprocess.Popen",
+        return_value=process,
+    ) as mock_popen, patch("teich.studio.interactive.threading.Thread") as mock_thread:
+        TerminalBridge().start(["docker", "exec"])
+
+    assert mock_popen.call_args.kwargs["creationflags"] == subprocess.CREATE_NO_WINDOW
+    mock_thread.return_value.start.assert_called_once()
+
+
+def test_claude_terminal_forwards_effort_but_omits_print_only_fallback_flag(tmp_path):
     config = Config(
         agent={"provider": "claude-code", "claude": {"fallback_model": ["sonnet", "haiku"]}},
         model={"model": "claude-opus-4-8", "reasoning_effort": "high"},
@@ -909,9 +966,49 @@ def test_claude_terminal_forwards_effort_and_fallback_model(tmp_path):
         "bypassPermissions",
         "--effort",
         "high",
-        "--fallback-model",
-        "sonnet,haiku",
     ]
+
+
+def test_claude_studio_seeds_default_thinking_summary_settings(tmp_path):
+    config = Config(
+        agent={"provider": "claude-code"},
+        model={"model": "claude-opus-4-8"},
+        output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"},
+    )
+    session = InteractiveSession(config)
+    with patch.object(ClaudeCodeRunner, "_ensure_image"):
+        runner = ClaudeCodeRunner(config)
+    session._runner = runner
+    workspace_root = tmp_path / "workspace-root"
+    workspace = workspace_root / "workspace"
+    claude_home = tmp_path / "claude-home"
+    workspace.mkdir(parents=True)
+    claude_home.mkdir()
+
+    with patch.object(
+        runner,
+        "_prepare_workspace",
+        return_value=(workspace_root, workspace),
+    ), patch.object(
+        runner,
+        "_build_external_persistent_container_command",
+        return_value=["docker", "run"],
+    ), patch.object(
+        runner,
+        "_start_container",
+    ), patch(
+        "teich.studio.interactive.tempfile_mkdtemp",
+        return_value=str(claude_home),
+    ):
+        session._prepare_environment()
+
+    settings = json.loads(
+        (claude_home / "settings.json").read_text(encoding="utf-8")
+    )
+    assert settings == {
+        "alwaysThinkingEnabled": True,
+        "showThinkingSummaries": True,
+    }
 
 
 def test_generation_stop_prevents_later_prompt_starts(tmp_path, monkeypatch):

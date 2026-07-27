@@ -289,6 +289,48 @@ def test_load_traces_loads_structured_chat_dataset_file(tmp_path: Path):
     assert row["metadata"]["first_message_timestamp"] == "2026-05-18T00:00:02.000Z"
 
 
+def test_load_traces_loads_top_level_chat_completion_dataset_file(tmp_path: Path):
+    dataset_file = tmp_path / "chat-completions.jsonl"
+    dataset_file.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "id": "sample-1",
+                        "system": "Be concise.",
+                        "prompt": "Say hello.",
+                        "thinking": "I should greet the user.",
+                        "response": "Hello!",
+                        "model": "claude-opus-5",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "id": "sample-2",
+                        "prompt": "Say goodbye.",
+                        "thinking": "I should close politely.",
+                        "response": "Goodbye!",
+                        "model": "claude-opus-5",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    dataset = load_traces(dataset_file)
+
+    assert dataset.num_rows == 2
+    assert dataset[0]["messages"][-1] == {
+        "role": "assistant",
+        "content": "Hello!",
+        "reasoning_content": "I should greet the user.",
+    }
+    assert dataset[0]["metadata"]["id"] == "sample-1"
+    assert dataset[1]["prompt"] == "Say goodbye."
+
+
 def test_load_traces_normalizes_separate_assistant_thinking_field(tmp_path: Path):
     dataset_file = tmp_path / "opus-reasoning.jsonl"
     dataset_file.write_text(

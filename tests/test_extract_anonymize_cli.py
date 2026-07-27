@@ -1263,7 +1263,7 @@ def test_extract_inline_anonymization_scrubs_traces_and_leftover_text(tmp_path: 
         "notes.txt",
     ]
     assert [update[1] for update in progress_updates] == [1, 2, 3, 4]
-    assert all(update[2] is None for update in progress_updates)
+    assert [update[2] for update in progress_updates] == [2, 2, None, None]
     assert {
         key: sum(update[3].get(key, 0) for update in progress_updates)
         for key in ("email", "username", "api_key")
@@ -1728,7 +1728,7 @@ def test_anonymize_parallel_worker_count_caps_windows(monkeypatch):
     assert anonymize_module._process_worker_count(100) == 61
 
 
-def test_anonymize_path_progress_preserves_parallel_report_order(tmp_path: Path):
+def test_anonymize_path_progress_reports_parallel_completions_and_sorts_final_report(tmp_path: Path):
     input_dir = tmp_path / "input"
     input_dir.mkdir()
     for index in reversed(range(9)):
@@ -1744,10 +1744,29 @@ def test_anonymize_path_progress_preserves_parallel_report_order(tmp_path: Path)
         progress=lambda file_report, done, total: updates.append((file_report, done, total)),
     )
 
-    assert [update[0].path.name for update in updates] == [f"trace-{index}.jsonl" for index in range(9)]
+    assert {update[0].path.name for update in updates} == {f"trace-{index}.jsonl" for index in range(9)}
     assert [update[1] for update in updates] == list(range(1, 10))
     assert [update[2] for update in updates] == [9] * 9
+    assert [item.path.name for item in report.files] == [f"trace-{index}.jsonl" for index in range(9)]
     assert sum(update[0].replacements.get("email", 0) for update in updates) == report.totals["email"] == 9
+
+
+def test_extract_without_model_filter_does_not_parse_each_jsonl_before_anonymizing(tmp_path: Path):
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    source = sessions_dir / "trace.jsonl"
+    source.write_text(json.dumps({"message": "alice@example.com"}) + "\n", encoding="utf-8")
+
+    with patch("teich.extract._read_jsonl_dict_events", side_effect=AssertionError("redundant parse")):
+        result = extract_local_sessions(
+            "codex",
+            output_dir=tmp_path / "output",
+            sources=[sessions_dir],
+            anonymize=True,
+        )
+
+    assert result.count == 1
+    assert "alice@example.com" not in result.copied_files[0].read_text(encoding="utf-8")
 
 
 def test_anonymize_cli_updates_tqdm_progress(tmp_path: Path):

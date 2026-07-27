@@ -14,6 +14,7 @@ Core fields:
 - `follow_up_prompts`: optional additional user turns after the initial prompt
 - `messages`: chat history
 - `tools`: tool schemas available to the session, including tools that were not called
+- `category`: optional prompt category, also retained in `metadata.category`
 - `metadata`: session info, model, timestamps, usage, and provenance when available
 
 ## Messages
@@ -149,11 +150,21 @@ Single-turn rows can include:
 - `response`
 - `model`
 
+Existing chat-completion JSONL can omit `messages` when each row has `prompt`
+plus `response` or `thinking`. `teich convert` builds the system, user, and
+assistant messages for every line, maps assistant `thinking` to
+`reasoning_content`, and keeps supported capture/provenance fields in
+`metadata`. Provider-only opaque thinking signatures are not copied into the
+training row.
+
 Multi-turn follow-up rows can also include:
 
 - `follow_up_prompts`
 - `responses`
-- final `response`
+
+For these multi-turn chat-only rows, `messages` is authoritative. Teich omits
+the single-turn `prompt`, `thinking`, and `response` convenience columns because
+they do not describe the full conversation.
 
 `system` is prompt-specific when provided. If a prompt row does not include `system`, Teich does not inject a default system prompt.
 

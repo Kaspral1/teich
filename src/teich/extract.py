@@ -15,7 +15,7 @@ import sqlite3
 from tempfile import TemporaryDirectory
 from typing import Any, Literal
 
-from .anonymize import AnonymizeFileReport, AnonymizeProgress, TraceAnonymizer, anonymize_file
+from .anonymize import AnonymizeFileReport, AnonymizeProgress, TraceAnonymizer, anonymize_file, anonymize_files
 from .tool_schema import CURSOR_BUILTIN_TOOLS
 
 ExtractProvider = Literal["claude", "codex", "cursor", "hermes", "pi"]
@@ -59,14 +59,21 @@ class _InlineAnonymizer:
         for key, count in counts.items():
             self.totals[key] = self.totals.get(key, 0) + count
 
-    def _record(self, report: AnonymizeFileReport) -> None:
+    def _record(self, report: AnonymizeFileReport, total: int | None = None) -> None:
         self._add(report.replacements)
         self.files_done += 1
         if self.progress is not None:
-            self.progress(report, self.files_done, None)
+            self.progress(report, self.files_done, total)
 
     def copy_file(self, source: Path, destination: Path) -> None:
         self._record(anonymize_file(source, destination))
+
+    def copy_files(self, sources: list[Path], destinations: list[Path]) -> None:
+        anonymize_files(
+            sources,
+            destinations,
+            progress=lambda report, _done, total: self._record(report, total),
+        )
 
     def anonymize_events(self, events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
         anonymizer = TraceAnonymizer()
@@ -522,6 +529,19 @@ def _extract_jsonl_session_files(
     model_filter: str | None = None,
     anonymizer: _InlineAnonymizer | None = None,
 ) -> list[Path]:
+    if anonymizer is not None and model_filter is None:
+        source_files = [
+            path
+            for source in sources
+            for path in _jsonl_files(source)
+        ]
+        destinations = _planned_unique_destinations(
+            destination_dir,
+            [path.name for path in source_files],
+        )
+        anonymizer.copy_files(source_files, destinations)
+        return destinations
+
     copied: list[Path] = []
     for source in sources:
         for path in _jsonl_files(source):
@@ -529,6 +549,24 @@ def _extract_jsonl_session_files(
             if _copy_provider_jsonl(provider, path, destination, model_filter=model_filter, anonymizer=anonymizer):
                 copied.append(destination)
     return copied
+
+
+def _planned_unique_destinations(destination_dir: Path, file_names: list[str]) -> list[Path]:
+    """Reserve collision-free destination names before parallel file writes."""
+    reserved: set[str] = set()
+    destinations: list[Path] = []
+    for file_name in file_names:
+        original = destination_dir / file_name
+        candidate = original
+        stem = original.stem
+        suffix = original.suffix
+        counter = 1
+        while candidate.exists() or candidate.name.casefold() in reserved:
+            candidate = original.with_name(f"{stem}_{counter}{suffix}")
+            counter += 1
+        reserved.add(candidate.name.casefold())
+        destinations.append(candidate)
+    return destinations
 
 
 def _copy_provider_jsonl(
@@ -539,18 +577,13 @@ def _copy_provider_jsonl(
     model_filter: str | None = None,
     anonymizer: _InlineAnonymizer | None = None,
 ) -> bool:
-    events = _read_jsonl_dict_events(source)
-    if events is None:
-        if model_filter:
+    # Without a model filter, parsing the complete trace here is redundant:
+    # anonymize_file will stream and parse it immediately afterward. Large
+    # extracted histories otherwise pay for two full JSON passes per file.
+    if model_filter:
+        events = _read_jsonl_dict_events(source)
+        if events is None or not trace_matches_model(events, model_filter):
             return False
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if anonymizer is not None:
-            anonymizer.copy_file(source, destination)
-        else:
-            shutil.copy2(source, destination)
-        return True
-    if model_filter and not trace_matches_model(events, model_filter):
-        return False
     destination.parent.mkdir(parents=True, exist_ok=True)
     if anonymizer is not None:
         anonymizer.copy_file(source, destination)

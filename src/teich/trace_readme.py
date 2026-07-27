@@ -449,7 +449,7 @@ def build_traces_readme(
         lines.extend(
             [
                 "Each file is newline-delimited JSON where every line is already a training example.",
-                "Chat-only datasets include `messages` plus convenience fields like optional `system`, `prompt`, `follow_up_prompts`, `thinking`, `response`, and `responses`.",
+                "Chat-only datasets use `messages` as the authoritative conversation. Single-turn rows may include `prompt`, `thinking`, and `response`; multi-turn rows include `follow_up_prompts` and `responses` instead.",
                 "Tool datasets can include the same normalized `messages` structure together with a `tools` field.",
                 "",
             ]

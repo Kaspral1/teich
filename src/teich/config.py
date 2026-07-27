@@ -169,15 +169,24 @@ class ClaudeConfig(BaseModel):
     pay-per-token API credits, and the token is safe to share across any
     ``max_concurrency`` (no rotation, unlike Codex).
 
-    ``fallback_model``, ``always_thinking``, and ``max_thinking_tokens`` are
-    Claude Code passthroughs: ``--fallback-model`` (a single model/alias or a
-    list; Claude Code uses up to 3 after dedup), ``alwaysThinkingEnabled`` in
-    the container's ``~/.claude/settings.json``, and the ``MAX_THINKING_TOKENS``
-    container env (0 disables thinking on models that allow it).
+    ``subscription_request_delay_seconds`` spaces request starts when
+    subscription auth is active, including follow-ups and Teich retries. It is
+    ignored for API-key and custom-base-URL runs. The remaining fields are
+    Claude Code controls: ``fallback_model`` is a single model/alias or list
+    that Teich tries across interactive batch retries (up to 3 after dedup),
+    ``always_thinking`` and ``show_thinking_summaries`` default to true and become
+    ``alwaysThinkingEnabled`` and ``showThinkingSummaries`` in the container's
+    ``~/.claude/settings.json``. Claude Code batch generation runs through a
+    real interactive PTY because readable summaries are unavailable in
+    non-interactive ``-p`` mode. Set either field to false to opt out.
+    ``max_thinking_tokens`` becomes the ``MAX_THINKING_TOKENS`` container env
+    (0 disables thinking where allowed).
     """
     oauth_token: str | None = None
+    subscription_request_delay_seconds: float = Field(default=45.0, ge=0)
     fallback_model: str | list[str] | None = None
-    always_thinking: bool | None = None
+    always_thinking: bool | None = True
+    show_thinking_summaries: bool | None = True
     max_thinking_tokens: int | None = Field(default=None, ge=0)
 
 
@@ -197,6 +206,7 @@ class ModelConfig(BaseModel):
     sandbox: str = "danger-full-access"
     reasoning_effort: str | None = None
     reasoning_summary: str | None = None
+    reasoning_summaries_enabled: bool | None = None
     service_tier: str | None = None
     context_length: int | None = None
     approval_mode: str | None = "none"

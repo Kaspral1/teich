@@ -875,12 +875,16 @@ class TrainingExample:
     metadata: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        row = {
             "prompt": self.prompt,
             "messages": self.messages,
             "tools": self.tools,
             "metadata": self.metadata,
         }
+        category = self.metadata.get("category")
+        if isinstance(category, str) and category.strip():
+            row["category"] = category.strip()
+        return row
 
 
 def _normalize_timestamp_value(value: Any) -> str | None:
@@ -3789,8 +3793,50 @@ def _is_hermes_export_session(value: Any) -> bool:
     )
 
 
+def _is_chat_completion_training_row(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return isinstance(value.get("prompt"), str) and (
+        isinstance(value.get("response"), str)
+        or isinstance(value.get("thinking"), str)
+    )
+
+
 def _is_structured_training_row(value: Any) -> bool:
-    return isinstance(value, dict) and isinstance(value.get("messages"), list) and not _is_hermes_export_session(value)
+    return (
+        isinstance(value, dict)
+        and not _is_hermes_export_session(value)
+        and (
+            isinstance(value.get("messages"), list)
+            or _is_chat_completion_training_row(value)
+        )
+    )
+
+
+_STRUCTURED_ROW_METADATA_KEYS = (
+    "id",
+    "schema_version",
+    "provider",
+    "source_system",
+    "effort",
+    "reasoning_capture",
+    "auth",
+    "completed_at",
+    "duration_ms",
+    "stop_reason",
+    "request_id",
+    "message_id",
+    "reported_cost_usd",
+    "authorship",
+    "family",
+    "category",
+    "domain",
+    "capability",
+    "subcategory",
+    "mode",
+    "difficulty",
+    "source",
+)
 
 
 def _normalize_training_message(message: Any) -> dict[str, Any] | None:
@@ -3881,8 +3927,13 @@ def _structured_training_example_from_row(
     metadata = dict(row.get("metadata")) if isinstance(row.get("metadata"), dict) else {}
     if isinstance(row.get("model"), str) and row.get("model"):
         metadata.setdefault("model", row["model"])
+    if isinstance(row.get("provider"), str) and row.get("provider"):
+        metadata.setdefault("model_provider", row["provider"])
     if isinstance(row.get("usage"), dict) and row.get("usage"):
         metadata.setdefault("usage", row["usage"])
+    for key in _STRUCTURED_ROW_METADATA_KEYS:
+        if key in row and row[key] is not None:
+            metadata.setdefault(key, row[key])
     metadata.setdefault("source_file", source_file.name)
     metadata.setdefault("source_line", row_index)
     metadata.setdefault(

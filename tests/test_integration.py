@@ -53,6 +53,7 @@ class TestDockerImage:
         assert "python3-pip" in content
         assert "python3-venv" in content
         assert "python3-dev" in content
+        assert "util-linux" in content
         assert "python3 -m venv /opt/venv" in content
         assert 'ENV VIRTUAL_ENV=/opt/venv' in content
         assert 'ENV PATH="/opt/venv/bin:/usr/local/bin:$PATH"' in content
