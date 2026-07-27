@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -20,7 +19,11 @@ from teich.extract import CURSOR_EXTRACTION_NOTICE
 from teich.runner import ClaudeCodeRunner, SessionProgressUpdate
 from teich.studio.events import summarize_chat_row, summarize_event, summarize_trace_events
 from teich.studio.generation import RUNNER_CLASSES, GenerationJob
-from teich.studio.interactive import InteractiveSession, TerminalBridge
+from teich.studio.interactive import (
+    SUBPROCESS_CREATE_NO_WINDOW,
+    InteractiveSession,
+    TerminalBridge,
+)
 from teich.studio.project import ProjectState
 from teich.studio import server as server_module
 from teich.studio.server import (
@@ -942,7 +945,7 @@ def test_windows_terminal_bridge_suppresses_host_console():
     ) as mock_popen, patch("teich.studio.interactive.threading.Thread") as mock_thread:
         TerminalBridge().start(["docker", "exec"])
 
-    assert mock_popen.call_args.kwargs["creationflags"] == subprocess.CREATE_NO_WINDOW
+    assert mock_popen.call_args.kwargs["creationflags"] == SUBPROCESS_CREATE_NO_WINDOW
     mock_thread.return_value.start.assert_called_once()
 
 

@@ -45,6 +45,8 @@ from ..runner import (
 )
 from .events import display_event
 
+SUBPROCESS_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 TEXT_SUBPROCESS_KWARGS: dict[str, Any] = {
     "text": True,
     "encoding": "utf-8",
@@ -141,7 +143,7 @@ class TerminalBridge:
                 stderr=subprocess.STDOUT,
                 bufsize=0,
                 creationflags=(
-                    subprocess.CREATE_NO_WINDOW
+                    SUBPROCESS_CREATE_NO_WINDOW
                     if os.name == "nt"
                     else 0
                 ),

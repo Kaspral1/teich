@@ -6,6 +6,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 import hashlib
+import multiprocessing
 import os
 import json
 import re
@@ -120,7 +121,13 @@ def anonymize_files(
     if workers > 1 and len(source_files) >= _MIN_FILES_FOR_PARALLEL:
         # Each file is anonymized independently (fresh TraceAnonymizer per
         # file), so files can be processed in parallel safely.
-        with ProcessPoolExecutor(max_workers=workers) as executor:
+        # Extraction can run from a Studio background thread. Explicit spawn
+        # avoids forking a multithreaded server process on POSIX, which Python
+        # warns can deadlock before any file reaches a worker.
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=multiprocessing.get_context("spawn"),
+        ) as executor:
             futures = {
                 executor.submit(anonymize_file, source, destination): source
                 for source, destination in zip(source_files, destinations)
