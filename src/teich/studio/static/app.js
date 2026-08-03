@@ -1218,7 +1218,7 @@ function refreshDatasetIfVisible() {
 
 function featureColumns(preview) {
   const names = (preview.dataset.features || []).map((feature) => feature.name);
-  const preferred = ["prompt", "response", "model", "messages", "tools", "metadata"];
+  const preferred = ["prompt", "system", "response", "model", "messages", "tools", "metadata"];
   const columns = preferred.filter((name) => names.includes(name));
   for (const name of names) {
     if (!columns.includes(name) && columns.length < 7) columns.push(name);

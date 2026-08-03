@@ -21,6 +21,9 @@ def test_default_config():
     assert config.timeout_seconds == 600
     assert config.mcp_servers == []
     assert config.prompts == []
+    assert config.capture_harness_context.enabled is False
+    assert config.capture_harness_context.required is True
+    assert config.capture_harness_context.timeout_seconds == 45
     assert config.get_dataset_tags() == [
         "agent-traces",
         "format:agent-traces",

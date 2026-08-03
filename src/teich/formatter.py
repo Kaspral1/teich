@@ -1317,7 +1317,7 @@ def _span_kind_enabled(
     train_on_developer: bool,
     train_on_tool_responses: bool,
 ) -> bool:
-    if kind in (None, ""):
+    if not kind:
         return True
     return {
         _SPAN_KIND_REASONING: train_on_reasoning,
@@ -2477,7 +2477,9 @@ class _TeichLabelPaddingCollator:
             features_without_labels.append(feature_without_labels)
         batch = self.base_collator(features_without_labels, *args, **kwargs)
         input_ids = batch.get("input_ids") if isinstance(batch, Mapping) else None
-        target_length = _sequence_length(input_ids) or max((len(row_labels) for row_labels in labels), default=0)
+        target_length = _sequence_length(input_ids)
+        if target_length is None:
+            target_length = max((len(row_labels) for row_labels in labels), default=0)
         padded_labels = _tensor_like_padded_labels(input_ids, labels, target_length, self.padding_side) if input_ids is not None else None
         batch["labels"] = padded_labels if padded_labels is not None else _list_padded_labels(labels, target_length, self.padding_side)
         return batch

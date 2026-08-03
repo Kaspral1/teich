@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from .harness_capture import TEICH_HARNESS_CONTEXT_EVENT_TYPE
 from .tool_schema import (
     CODEX_BUILTIN_TOOLS,
     CURSOR_BUILTIN_TOOLS,
@@ -873,6 +874,7 @@ class TrainingExample:
     messages: list[dict[str, Any]]
     tools: list[dict[str, Any]]
     metadata: dict[str, Any]
+    system: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         row = {
@@ -881,10 +883,47 @@ class TrainingExample:
             "tools": self.tools,
             "metadata": self.metadata,
         }
+        if isinstance(self.system, str) and self.system.strip():
+            row["system"] = self.system.strip()
         category = self.metadata.get("category")
         if isinstance(category, str) and category.strip():
             row["category"] = category.strip()
         return row
+
+
+def _apply_harness_context_capture(
+    example: TrainingExample,
+    events: list[dict[str, Any]],
+) -> TrainingExample:
+    payload: dict[str, Any] | None = None
+    for event in events:
+        if event.get("type") != TEICH_HARNESS_CONTEXT_EVENT_TYPE:
+            continue
+        candidate = event.get("payload")
+        if isinstance(candidate, dict):
+            payload = candidate
+    if payload is None:
+        return example
+    system = payload.get("system")
+    if isinstance(system, str) and system.strip():
+        example.system = system.strip()
+    example.tools = _merge_harness_capture_tools(example.tools, payload.get("tools"))
+    context_metadata = {
+        key: deepcopy(payload[key])
+        for key in (
+            "source",
+            "harness",
+            "harness_version",
+            "wire_api",
+            "model",
+            "captured_at",
+            "context_hash",
+        )
+        if payload.get(key) is not None
+    }
+    context_metadata["tool_count"] = len(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else 0
+    example.metadata["harness_context"] = context_metadata
+    return example
 
 
 def _normalize_timestamp_value(value: Any) -> str | None:
@@ -1695,6 +1734,41 @@ def _merge_tools_with_builtin_trace_tools(raw_tools: Any, trace_type: Any) -> li
     _add_builtin_tools_for_trace_type(trace_type, explicit_tools, tool_names, tool_schemas)
     _add_explicit_tools(row_tools, explicit_tools, tool_names, tool_schemas)
     return _build_tools_from_snapshots_and_calls(tool_names, tool_schemas, {}, explicit_tools)
+
+
+def _merge_harness_capture_tools(
+    existing_tools: list[dict[str, Any]],
+    captured_tools: Any,
+) -> list[dict[str, Any]]:
+    """Add request-captured tools without replacing trace-native schemas."""
+    merged = deepcopy(existing_tools)
+    named = {
+        name
+        for tool in merged
+        if isinstance(tool, dict) and (name := _tool_entry_name(tool)) is not None
+    }
+    unnamed = {
+        json.dumps(tool, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        for tool in merged
+        if isinstance(tool, dict) and _tool_entry_name(tool) is None
+    }
+    if not isinstance(captured_tools, list):
+        return merged
+    for raw_tool in captured_tools:
+        if not isinstance(raw_tool, dict):
+            continue
+        tool = deepcopy(raw_tool)
+        name = _tool_entry_name(tool)
+        if name is not None:
+            if name not in named:
+                merged.append(tool)
+                named.add(name)
+            continue
+        signature = json.dumps(tool, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        if signature not in unnamed:
+            merged.append(tool)
+            unnamed.add(signature)
+    return merged
 
 
 def _build_tools_from_snapshots_and_calls(
@@ -3906,6 +3980,8 @@ def _structured_training_example_from_row(
     row: dict[str, Any],
     row_index: int,
 ) -> TrainingExample:
+    raw_system = row.get("system")
+    system = raw_system.strip() if isinstance(raw_system, str) and raw_system.strip() else None
     raw_messages = row.get("messages")
     first_message_timestamp = _first_message_timestamp_from_events(
         raw_messages if isinstance(raw_messages, list) else [],
@@ -3913,9 +3989,8 @@ def _structured_training_example_from_row(
     )
     messages = normalize_training_messages(raw_messages)
     if not messages:
-        system = row.get("system")
-        if isinstance(system, str) and system.strip():
-            messages.append({"role": "system", "content": system.strip()})
+        if system:
+            messages.append({"role": "system", "content": system})
         prompt = row.get("prompt")
         if isinstance(prompt, str) and prompt.strip():
             messages.append({"role": "user", "content": prompt.strip()})
@@ -3957,6 +4032,7 @@ def _structured_training_example_from_row(
         messages=messages,
         tools=tools,
         metadata=metadata,
+        system=system,
     )
 
 
@@ -3970,20 +4046,22 @@ def convert_trace_to_training_example(trace_file: Path) -> TrainingExample:
         return _structured_training_example_from_row(trace_file, events[0], 1)
     trace_type = _detect_trace_type(events)
     if trace_type == "claude_code":
-        return _convert_claude_code_trace_to_training_example(trace_file, events)
-    if trace_type == "droid":
-        return _convert_droid_trace_to_training_example(trace_file, events)
-    if trace_type == "hermes":
-        return _convert_hermes_trace_to_training_example(trace_file, events)
-    if trace_type == "cursor":
-        return _convert_cursor_trace_to_training_example(trace_file, events)
-    if trace_type == "external_agent":
-        return _convert_external_agent_trace_to_training_example(trace_file, events)
-    if trace_type == "openclaw":
-        return _convert_pi_trace_to_training_example(trace_file, events, trace_type="openclaw")
-    if trace_type == "pi":
-        return _convert_pi_trace_to_training_example(trace_file, events)
-    return _convert_codex_trace_to_training_example(trace_file, events)
+        example = _convert_claude_code_trace_to_training_example(trace_file, events)
+    elif trace_type == "droid":
+        example = _convert_droid_trace_to_training_example(trace_file, events)
+    elif trace_type == "hermes":
+        example = _convert_hermes_trace_to_training_example(trace_file, events)
+    elif trace_type == "cursor":
+        example = _convert_cursor_trace_to_training_example(trace_file, events)
+    elif trace_type == "external_agent":
+        example = _convert_external_agent_trace_to_training_example(trace_file, events)
+    elif trace_type == "openclaw":
+        example = _convert_pi_trace_to_training_example(trace_file, events, trace_type="openclaw")
+    elif trace_type == "pi":
+        example = _convert_pi_trace_to_training_example(trace_file, events)
+    else:
+        example = _convert_codex_trace_to_training_example(trace_file, events)
+    return _apply_harness_context_capture(example, events)
 
 
 def _jsonl_files(source: Path) -> list[Path]:
@@ -4007,7 +4085,8 @@ def _convert_jsonl_file_to_training_rows(jsonl_file: Path, *, skip_invalid_lines
         ]
     trace_type = _detect_trace_type(rows)
     if trace_type == "claude_code":
-        return [_convert_claude_code_trace_to_training_example(jsonl_file, rows).to_dict()]
+        example = _convert_claude_code_trace_to_training_example(jsonl_file, rows)
+        return [_apply_harness_context_capture(example, rows).to_dict()]
     if trace_type == "droid":
         return [_convert_droid_trace_to_training_example(jsonl_file, rows).to_dict()]
     if trace_type == "hermes":
@@ -4030,7 +4109,8 @@ def _convert_jsonl_file_to_training_rows(jsonl_file: Path, *, skip_invalid_lines
         return [_convert_pi_trace_to_training_example(jsonl_file, rows, trace_type="openclaw").to_dict()]
     if trace_type == "pi":
         return [_convert_pi_trace_to_training_example(jsonl_file, rows).to_dict()]
-    return [_convert_codex_trace_to_training_example(jsonl_file, rows).to_dict()]
+    example = _convert_codex_trace_to_training_example(jsonl_file, rows)
+    return [_apply_harness_context_capture(example, rows).to_dict()]
 
 
 def convert_traces_to_training_data(traces_dir: Path | str, *, skip_invalid_lines: bool = False) -> list[dict[str, Any]]:

@@ -33,7 +33,10 @@ def test_build_traces_readme_includes_model_and_references_tools(tmp_path: Path)
     assert '"name": "bash"' in readme
     assert "## Training" in readme
     assert "run `teich convert`" in readme
-    assert "OpenAI-style JSONL rows with `prompt`, `messages`, `tools`, and `metadata`" in readme
+    assert (
+        "OpenAI-style JSONL rows with `prompt`, `messages`, `tools`, `metadata`, "
+        "and an optional captured `system` field"
+    ) in readme
     assert "https://github.com/TeichAI/teich/blob/main/docs/training.md" in readme
     assert "https://github.com/TeichAI/teich/blob/main/docs/prepare-data.md" in readme
     assert "from unsloth import FastLanguageModel" not in readme

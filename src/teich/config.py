@@ -190,6 +190,20 @@ class ClaudeConfig(BaseModel):
     max_thinking_tokens: int | None = Field(default=None, ge=0)
 
 
+class HarnessContextCaptureConfig(BaseModel):
+    """Safe simulated capture of client-visible harness instructions and tools.
+
+    When enabled, Teich points the configured harness at a local fake provider
+    for one preflight request before generation. No real provider request or
+    subscription quota is used. The captured context is appended to every raw
+    trace and exposed as the top-level ``system`` field during conversion.
+    """
+
+    enabled: bool = False
+    required: bool = True
+    timeout_seconds: int = Field(default=45, gt=0, le=300)
+
+
 class AgentConfig(BaseModel):
     """Agent runtime selection."""
     provider: str = "codex"
@@ -337,6 +351,9 @@ class Config(BaseModel):
     timeout_seconds: int = Field(default=600, gt=0)
     openai_api_key: str | None = None
     developer_instructions: str | None = None
+    capture_harness_context: HarnessContextCaptureConfig = Field(
+        default_factory=HarnessContextCaptureConfig
+    )
 
     @field_validator("prompts_file")
     @classmethod

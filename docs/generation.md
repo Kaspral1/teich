@@ -97,7 +97,7 @@ To turn raw or extracted traces into standalone OpenAI-style JSONL rows that do 
 teich convert data --out teich-training.jsonl
 ```
 
-The output file is newline-delimited JSON with `prompt`, `messages`, `tools`, and `metadata` fields. Use this when another trainer already knows how to consume standalone OpenAI-style message rows. Use `prepare_data()` and `mask_data()` when you want Teich to render a specific tokenizer chat template and create exact response-only labels.
+The output file is newline-delimited JSON with `prompt`, `messages`, `tools`, `metadata`, and an optional captured `system` field. Use this when another trainer already knows how to consume standalone OpenAI-style message rows. Use `prepare_data()` and `mask_data()` when you want Teich to render a specific tokenizer chat template and create exact response-only labels.
 
 ## Browser UI
 
@@ -164,6 +164,29 @@ Generated-run dataset tags are generated from provider and model. Extraction dat
 - `chat`: `conversational`, model, `distillation`, `teich`
 
 If `publish.hf_token` is omitted, Teich also accepts `HF_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, or `TEICH_HF_TOKEN`.
+
+### Capture harness context without provider traffic
+
+Codex and Claude Code add substantial client-side instructions and tool schemas before a request reaches the model. Teich can capture that client-visible context with one preflight request to a local fake provider:
+
+```yaml
+capture_harness_context:
+  enabled: true
+  required: true
+  timeout_seconds: 45
+```
+
+The preflight uses the same installed harness, model, reasoning settings, developer instructions, MCP configuration, permission mode, and an empty isolated workspace. It supports Codex's Responses wire protocol and Claude Code's Anthropic Messages protocol. It sends dummy credentials only to a random authenticated local endpoint, does not contact the real provider, and does not consume API or subscription quota. Authentication headers, user messages, and arbitrary request metadata are never retained.
+
+Teich appends the normalized capture and its deterministic hash to every raw trace. `teich convert` exposes captured instructions as a top-level `system` field and adds request-visible tool declarations that were missing from the native trace without replacing trace-native schemas. Per-session context such as repository instructions, skills, hooks, MCP state, and recaps remains in the converted `messages` where the native trace recorded it.
+
+To inspect a capture without running a generation batch:
+
+```bash
+teich capture-context -c config.yaml -o harness-context.json
+```
+
+This captures only what the harness sends over the client-provider boundary. It cannot recover provider-side instructions, server-added policy, or hidden raw chain-of-thought that never reaches the client.
 
 ## Outputs
 

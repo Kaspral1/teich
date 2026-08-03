@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 from threading import Event, RLock, Thread
 from typing import Any
+import uuid
 
 import click
 import typer
@@ -46,6 +47,7 @@ ROOT_EXTRA_HELP = """\
 Common workflows:
   teich init my-project
   teich generate -c config.yaml
+  teich capture-context -c config.yaml
   teich extract claude --model fable-5 --out data
   teich convert data --out teich-training.jsonl
   teich studio
@@ -82,7 +84,8 @@ Default stores:
 
 After extraction:
   teich convert data --out teich-training.jsonl
-  This writes standalone OpenAI-style JSONL rows with prompt, messages, tools, and metadata for trainers that do not import Teich.
+  This writes standalone OpenAI-style JSONL rows with prompt, messages, tools,
+  metadata, and an optional captured system field for trainers that do not import Teich.
 """
 GENERATE_EXTRA_HELP = """\
 Typical generated project flow:
@@ -105,7 +108,8 @@ Examples:
   teich convert output/session.jsonl --out session.training.jsonl
 
 Output format:
-  Newline-delimited JSON rows with prompt, messages, tools, and metadata.
+  Newline-delimited JSON rows with prompt, messages, tools, metadata, and an
+  optional captured system field.
   This is useful when your trainer can consume standalone OpenAI-style message rows without importing Teich.
 
 Use prepare_data() and mask_data() when you want tokenizer-specific rendering and exact response-only labels.
@@ -646,7 +650,10 @@ def convert(
             handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     console.print(f"[green]Converted {len(rows)} trace row{'s' if len(rows) != 1 else ''} to {output}[/green]")
-    console.print("[cyan]Output format:[/cyan] Teich JSONL with prompt, messages, tools, and metadata.")
+    console.print(
+        "[cyan]Output format:[/cyan] Teich JSONL with prompt, messages, tools, metadata, "
+        "and an optional captured system field."
+    )
 
 
 @pool_app.command(
@@ -662,6 +669,61 @@ def pool_upload(
     console.print(f"[cyan]Ready path:[/cyan] {path}")
     console.print("[dim]The command is reserved until the site has its database and upload API deployed.[/dim]")
     raise typer.Exit(1)
+
+
+@app.command(
+    "capture-context",
+    help="Simulate one local provider request and save client-visible harness context.",
+    short_help="Capture harness instructions and tool schemas locally.",
+)
+def capture_context(
+    config: Path = typer.Option(
+        Path("config.yaml"),
+        "--config",
+        "-c",
+        help="Generation config whose harness settings should be simulated",
+    ),
+    output: Path = typer.Option(
+        Path("harness-context.json"),
+        "--output",
+        "-o",
+        help="Destination JSON file",
+    ),
+) -> None:
+    """Capture context without contacting or consuming quota from a real provider."""
+    if not config.exists():
+        console.print(f"[red]Config file not found: {config}[/red]")
+        raise typer.Exit(1)
+    cfg = Config.from_yaml(config)
+    provider = cfg.get_agent_provider()
+    if provider == "codex":
+        runner: DockerRuntimeRunner = CodexRunner(cfg)
+    elif provider in CLAUDE_PROVIDER_ALIASES:
+        runner = ClaudeCodeRunner(cfg)
+    else:
+        console.print("[red]Harness capture currently supports codex and claude-code.[/red]")
+        raise typer.Exit(1)
+    console.print(
+        f"[cyan]Simulating one {provider} request locally; no provider credentials or quota are used.[/cyan]"
+    )
+    try:
+        capture = runner.capture_harness_context()
+    except Exception as exc:
+        console.print(f"[red]Harness capture failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(capture.to_dict(), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    console.print(
+        f"[green]Captured {len(capture.tools)} tools and {len(capture.system)} system characters to {output}.[/green]"
+    )
 
 
 @app.command(
@@ -1288,6 +1350,16 @@ openai_api_key: null
 #     call or edit, briefly explain what you're doing and why; after a command or
 #     test runs, state what you concluded before the next step.
 developer_instructions: null
+
+# Codex/Claude Code only. Simulate one request against Teich's local fake
+# provider before generation and append the client-visible harness instructions
+# and tool schemas to each raw trace. This never contacts the real provider and
+# never stores authentication headers or user messages. The converter exposes
+# the captured instructions as a top-level `system` column.
+capture_harness_context:
+  enabled: false
+  required: true
+  timeout_seconds: 45
 '''
 
 

@@ -39,6 +39,7 @@ from .converter import (
     normalize_codex_trace_event,
     normalize_codex_trace_events,
 )
+from .harness_capture import HarnessCaptureServer, HarnessContextCapture
 from .tool_schema import snapshot_configured_tools
 
 RUNTIME_IMAGE_NAME = "teich-runtime:v3"
@@ -47,6 +48,8 @@ RUNTIME_DOCKERFILE_NAME = "codex-runtime.Dockerfile"
 RUNTIME_CONTAINER_USER = "codex"
 CODEX_HOME_IN_CONTAINER = "/home/codex/.codex"
 CLAUDE_HOME_IN_CONTAINER = "/home/codex/.claude"
+CLAUDE_STATE_FILE_NAME = "teich-claude-state.json"
+CLAUDE_STATE_IN_CONTAINER = "/home/codex/.claude.json"
 HERMES_HOME_IN_CONTAINER = "/home/codex/.hermes"
 
 # Langfuse Codex observability plugin: baked into the tracing-enabled runtime
@@ -984,15 +987,19 @@ def prompt_inputs_for_run(
 class DockerRuntimeRunner:
     """Shared Docker runtime used by agent runners."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, *, _ensure_image: bool = True):
         self.config = config
         self.image_name = self._runtime_image_name()
         self._configured_tools_snapshot: list[dict[str, Any]] | None = None
+        self._harness_context_capture: HarnessContextCapture | None = None
+        self._harness_context_capture_attempted = False
+        self._harness_context_capture_lock = threading.Lock()
         self._active_processes: dict[subprocess.Popen[str], str | None] = {}
         self._active_processes_lock = threading.Lock()
         self._active_containers: set[str] = set()
         self._active_containers_lock = threading.Lock()
-        self._ensure_image()
+        if _ensure_image:
+            self._ensure_image()
 
     def _runtime_image_name(self) -> str:
         return RUNTIME_IMAGE_NAME
@@ -1013,8 +1020,106 @@ class DockerRuntimeRunner:
             for event in events:
                 handle.write(json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n")
 
+    def _append_harness_context_metadata(self, trace_path: Path) -> None:
+        capture = self._harness_context_capture
+        if capture is None or not trace_path.exists():
+            return
+        events = _read_jsonl_dict_events(trace_path) or []
+        if any(event.get("type") == "teich_harness_context" for event in events):
+            return
+        self._append_jsonl_events(trace_path, [capture.to_trace_event()])
+
     def _finalize_trace_export(self, trace_path: Path, prompt_input: PromptInput | None = None) -> None:
-        return
+        self._append_harness_context_metadata(trace_path)
+
+    def capture_harness_context(self) -> HarnessContextCapture:
+        raise RuntimeError(
+            f"Harness-context capture is not supported for {self.config.get_agent_provider()}. "
+            "Use agent.provider: codex or claude-code."
+        )
+
+    def _ensure_harness_context_capture(self) -> HarnessContextCapture | None:
+        capture_config = self.config.capture_harness_context
+        if not capture_config.enabled:
+            return None
+        if self._harness_context_capture_attempted:
+            return self._harness_context_capture
+        with self._harness_context_capture_lock:
+            if self._harness_context_capture_attempted:
+                return self._harness_context_capture
+            try:
+                capture = self.capture_harness_context()
+                if not capture.system.strip():
+                    raise RuntimeError(
+                        f"{self.config.get_agent_provider()} simulated request contained no system instructions"
+                    )
+                self._harness_context_capture = capture
+            except Exception:
+                if capture_config.required:
+                    raise
+            self._harness_context_capture_attempted = True
+            return self._harness_context_capture
+
+    def _harness_cli_version(self, executable: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["docker", "run", "--rm", self.image_name, executable, "--version"],
+                capture_output=True,
+                check=False,
+                timeout=DOCKER_CONTROL_TIMEOUT_SECONDS,
+                **TEXT_SUBPROCESS_KWARGS,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        version = (result.stdout or result.stderr).strip()
+        return version.splitlines()[0].strip() if version else None
+
+    def _run_harness_capture_command(
+        self,
+        command: list[str],
+        server: HarnessCaptureServer,
+        *,
+        container_name: str,
+        stdin_text: str | None = None,
+    ) -> HarnessContextCapture:
+        process: subprocess.Popen[str] | None = None
+        stdout_handle = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
+        stderr_handle = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE if stdin_text is not None else None,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                **TEXT_SUBPROCESS_KWARGS,
+            )
+            if stdin_text is not None and process.stdin is not None:
+                process.stdin.write(stdin_text)
+                process.stdin.close()
+            deadline = time.monotonic() + self.config.capture_harness_context.timeout_seconds
+            while time.monotonic() < deadline:
+                capture = server.wait(min(0.1, max(0.0, deadline - time.monotonic())))
+                if capture is not None:
+                    return capture
+                if process.poll() is not None:
+                    break
+            stdout_handle.flush()
+            stderr_handle.flush()
+            stdout_handle.seek(0)
+            stderr_handle.seek(0)
+            details = stderr_handle.read().strip() or stdout_handle.read().strip()
+            suffix = f": {details[-2000:]}" if details else ""
+            raise RuntimeError(
+                f"{self.config.get_agent_provider()} did not send a simulated provider request "
+                f"within {self.config.capture_harness_context.timeout_seconds}s{suffix}"
+            )
+        finally:
+            if process is not None and process.poll() is None:
+                self._terminate_process(process, container_name)
+            else:
+                self._remove_container(container_name)
+            stdout_handle.close()
+            stderr_handle.close()
 
     def run_session(
         self,
@@ -1981,6 +2086,7 @@ class DockerRuntimeRunner:
         prompt_inputs: list[PromptInput] | None = None,
         resume: bool = False,
     ) -> list[Path]:
+        self._ensure_harness_context_capture()
         prompt_inputs = prompt_inputs if prompt_inputs is not None else self.config.get_prompt_inputs()
         prompt_inputs = prompt_inputs_for_run(
             prompt_inputs,
@@ -2118,12 +2224,12 @@ class DockerRuntimeRunner:
 class CodexRunner(DockerRuntimeRunner):
     """Manages Docker-based Codex sessions."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, *, _ensure_image: bool = True):
         self._broker: CodexTokenBroker | None = None
         self._broker_lock = threading.Lock()
         self._langfuse_plugin_cache: Path | None = None
         self._langfuse_plugin_lock = threading.Lock()
-        super().__init__(config)
+        super().__init__(config, _ensure_image=_ensure_image)
 
     def _runtime_image_name(self) -> str:
         if self.config.agent.langfuse.enabled:
@@ -2507,7 +2613,55 @@ class CodexRunner(DockerRuntimeRunner):
         self._append_jsonl_events(trace_path, metadata_events)
 
     def _finalize_trace_export(self, trace_path: Path, prompt_input: PromptInput | None = None) -> None:
+        super()._finalize_trace_export(trace_path, prompt_input)
         self._append_codex_available_tool_schemas(trace_path)
+
+    def capture_harness_context(self) -> HarnessContextCapture:
+        """Run Codex once against Teich's local Responses-compatible recorder."""
+        capture_config = self.config.model_copy(deep=True)
+        capture_config.capture_harness_context.enabled = False
+        capture_config.api.provider = "teich-capture"
+        capture_config.api.wire_api = "responses"
+        capture_config.agent.codex.use_host_auth = False
+        capture_config.agent.langfuse.enabled = False
+        capture_config.openai_api_key = None
+        version = self._harness_cli_version("codex")
+        with HarnessCaptureServer(
+            harness="codex",
+            harness_version=version,
+            minimum_tools=1,
+        ) as server:
+            capture_config.api.base_url = server.base_url
+            capture_config.api.api_key = server.secret
+            capture_runner = CodexRunner(capture_config, _ensure_image=False)
+            capture_runner.image_name = self.image_name
+            workspace_root = Path(tempfile.mkdtemp(prefix="teich-codex-context-workspace-"))
+            workspace = workspace_root / "workspace"
+            codex_home = Path(tempfile.mkdtemp(prefix="teich-codex-context-home-"))
+            container_name = self._container_name("codex-context", uuid.uuid4().hex)
+            prompt = (
+                "This is a local Teich harness-context capture preflight. "
+                "Return the completion marker; do not call tools or modify files."
+            )
+            try:
+                workspace.mkdir(parents=True, exist_ok=True)
+                _make_tree_world_writable(workspace_root)
+                capture_runner._write_codex_config(codex_home)
+                command = capture_runner._build_codex_command(
+                    prompt,
+                    workspace,
+                    codex_home,
+                    container_name,
+                )
+                return capture_runner._run_harness_capture_command(
+                    command,
+                    server,
+                    container_name=container_name,
+                    stdin_text=prompt,
+                )
+            finally:
+                shutil.rmtree(workspace_root, ignore_errors=True)
+                shutil.rmtree(codex_home, ignore_errors=True)
 
     def _codex_base_url_and_proxy_target(self) -> tuple[str | None, str | None]:
         configured_base_url = self.config.get_base_url()
@@ -3303,8 +3457,8 @@ class ClaudeCodeRunner(ExternalCliRunner):
     source_name = "claude-code"
     default_model_provider = "anthropic"
 
-    def __init__(self, config: Config):
-        super().__init__(config)
+    def __init__(self, config: Config, *, _ensure_image: bool = True):
+        super().__init__(config, _ensure_image=_ensure_image)
         self._subscription_request_lock = threading.Lock()
         self._last_subscription_request_at: float | None = None
 
@@ -3335,6 +3489,68 @@ class ClaudeCodeRunner(ExternalCliRunner):
             return ["--build-arg", "TEICH_INSTALL_LANGFUSE=1"]
         return []
 
+    def capture_harness_context(self) -> HarnessContextCapture:
+        """Run Claude Code once against Teich's local Messages recorder."""
+        capture_config = self.config.model_copy(deep=True)
+        capture_config.capture_harness_context.enabled = False
+        capture_config.api.provider = "anthropic"
+        capture_config.api.wire_api = "messages"
+        capture_config.api.api_key = None
+        capture_config.openai_api_key = None
+        capture_config.agent.claude.oauth_token = None
+        capture_config.agent.langfuse.enabled = False
+        version = self._harness_cli_version("claude")
+        with HarnessCaptureServer(
+            harness="claude-code",
+            harness_version=version,
+            minimum_tools=1,
+        ) as server:
+            capture_config.api.base_url = server.base_url
+            capture_config.api.api_key = server.secret
+            capture_runner = ClaudeCodeRunner(capture_config, _ensure_image=False)
+            capture_runner.image_name = self.image_name
+            workspace_root = Path(tempfile.mkdtemp(prefix="teich-claude-context-workspace-"))
+            workspace = workspace_root / "workspace"
+            home_dir = Path(tempfile.mkdtemp(prefix="teich-claude-context-home-"))
+            container_name = self._container_name("claude-context", uuid.uuid4().hex)
+            prompt = (
+                "This is a local Teich harness-context capture preflight. "
+                "Return the completion marker; do not call tools or modify files."
+            )
+            try:
+                workspace.mkdir(parents=True, exist_ok=True)
+                _make_tree_world_writable(workspace_root)
+                capture_runner._prepare_agent_home(home_dir)
+                prompt_file = workspace / TEICH_PROMPT_FILE_NAME
+                prompt_file.write_text(prompt, encoding="utf-8")
+                prompt_file.chmod(0o666)
+                command = capture_runner._build_external_command(
+                    workspace,
+                    home_dir,
+                    container_name,
+                )
+                # ANTHROPIC_API_KEY triggers Claude Code's interactive
+                # first-use approval dialog. The equivalent custom gateway
+                # bearer-token path avoids that UI and is scoped to this local
+                # recorder only.
+                api_key_assignment = f"ANTHROPIC_API_KEY={server.secret}"
+                command = [
+                    f"ANTHROPIC_AUTH_TOKEN={server.secret}"
+                    if argument == api_key_assignment
+                    else argument
+                    for argument in command
+                ]
+                image_index = command.index(capture_runner.image_name)
+                command[image_index:image_index] = ["-e", "ANTHROPIC_API_KEY="]
+                return capture_runner._run_harness_capture_command(
+                    command,
+                    server,
+                    container_name=container_name,
+                )
+            finally:
+                shutil.rmtree(workspace_root, ignore_errors=True)
+                shutil.rmtree(home_dir, ignore_errors=True)
+
     def _langfuse_env_items(self) -> list[tuple[str, str]]:
         langfuse = self.config.agent.langfuse
         if not langfuse.enabled:
@@ -3355,11 +3571,33 @@ class ClaudeCodeRunner(ExternalCliRunner):
 
     def _prepare_agent_home(self, home_dir: Path) -> None:
         settings = self._claude_settings()
-        if not settings:
-            return
-        settings_path = home_dir / "settings.json"
-        settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
-        settings_path.chmod(0o666)
+        if settings:
+            settings_path = home_dir / "settings.json"
+            settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+            settings_path.chmod(0o666)
+        # Claude Code 2.1.220+ stores onboarding state in ~/.claude.json rather
+        # than ~/.claude/settings.json. Containers use a fresh HOME each run,
+        # so seed and mount only the non-secret UI state or the CLI blocks at
+        # the theme picker before it can send a provider request.
+        state_path = home_dir / CLAUDE_STATE_FILE_NAME
+        state_path.write_text(
+            json.dumps(
+                {
+                    "hasCompletedOnboarding": True,
+                    "bypassPermissionsModeAccepted": True,
+                    "theme": "dark",
+                    "projects": {
+                        WORKSPACE_IN_CONTAINER: {
+                            "hasTrustDialogAccepted": True,
+                        }
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        state_path.chmod(0o666)
 
     def _claude_settings(self) -> dict[str, object]:
         """Compose the container's ~/.claude/settings.json from config."""
@@ -3580,6 +3818,8 @@ class ClaudeCodeRunner(ExternalCliRunner):
             container_name,
             detached=detached,
         )
+        state_path = home_dir / CLAUDE_STATE_FILE_NAME
+        command[-1:-1] = ["-v", f"{state_path}:{CLAUDE_STATE_IN_CONTAINER}"]
         if not detached:
             command.insert(2, "-i")
         return command
@@ -3956,6 +4196,7 @@ class ClaudeCodeRunner(ExternalCliRunner):
                 self._discard_output_file(trace_path)
                 failure_trace_saved = True
                 raise RuntimeError(f"Session {session_id[:8]} stopped before completing all Claude Code turns")
+            self._finalize_trace_export(trace_path, prompt_input)
             self._copy_workspace_snapshot(workspace, self._sandbox_destination(trace_path))
             return trace_path
         except BaseException:
@@ -4488,15 +4729,19 @@ class HermesRunner(ExternalCliRunner):
             if not final_exports:
                 raise RuntimeError(f"Session {session_id[:8]} failed: Hermes did not write any state.db sessions")
             parsed_session_id = self._parse_hermes_stdout_session_id("\n".join(stdout_parts))
-            destination = (
-                (final_exports.get(parsed_session_id) if parsed_session_id else None)
-                or next((path for sid, path in final_exports.items() if sid.startswith(session_id)), None)
-                or next(
-                    (path for sid, path in final_exports.items() if self._trace_has_no_parent(path)),
+            destination = final_exports.get(parsed_session_id) if parsed_session_id else None
+            if destination is None:
+                destination = next(
+                    (path for sid, path in final_exports.items() if sid.startswith(session_id)),
                     None,
                 )
-                or next(iter(final_exports.values()), fallback_destination)
-            )
+            if destination is None:
+                destination = next(
+                    (path for path in final_exports.values() if self._trace_has_no_parent(path)),
+                    None,
+                )
+            if destination is None:
+                destination = next(iter(final_exports.values()), fallback_destination)
             self._copy_workspace_snapshot(workspace, self._sandbox_destination(destination))
             return destination
         except BaseException:

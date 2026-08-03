@@ -210,3 +210,13 @@ openai_api_key: null
 #     call or edit, briefly explain what you're doing and why; after a command or
 #     test runs, state what you concluded before the next step.
 developer_instructions: null
+
+# Codex/Claude Code only. Simulate one request against Teich's local fake
+# provider before generation and append the client-visible harness instructions
+# and tool schemas to each raw trace. This never contacts the real provider and
+# never stores authentication headers or user messages. The converter exposes
+# the captured instructions as a top-level `system` column.
+capture_harness_context:
+  enabled: false
+  required: true
+  timeout_seconds: 45

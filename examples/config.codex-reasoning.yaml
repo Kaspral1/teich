@@ -23,6 +23,12 @@ model:
   reasoning_summary: detailed
   reasoning_summaries_enabled: true
 
+# One local fake Responses request records the client-visible Codex developer
+# instructions and tool declarations without consuming provider quota.
+capture_harness_context:
+  enabled: true
+  required: true
+
 prompts_file: prompts.jsonl
 
 output:

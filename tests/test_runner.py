@@ -22,6 +22,7 @@ import pytest
 
 import teich.runner as runner_module
 from teich.config import APIConfig, Config, MCPConfig, ModelConfig, PromptInput
+from teich.harness_capture import HarnessContextCapture
 from teich.runner import (
     ChatRunner,
     ClaudeCodeRunner,
@@ -2045,6 +2046,47 @@ def test_claude_prepare_agent_home_enables_interactive_thinking_capture_by_defau
         "alwaysThinkingEnabled": True,
         "showThinkingSummaries": True,
     }
+    state = json.loads((home_dir / "teich-claude-state.json").read_text(encoding="utf-8"))
+    assert state["hasCompletedOnboarding"] is True
+    assert state["bypassPermissionsModeAccepted"] is True
+    assert state["projects"]["/workspace"]["hasTrustDialogAccepted"] is True
+
+
+def test_claude_docker_command_mounts_seeded_global_state(tmp_path: Path):
+    runner = _claude_runner(tmp_path)
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    runner._prepare_agent_home(home_dir)
+
+    command = runner._build_external_docker_base_command(
+        tmp_path / "workspace", home_dir, "teich-claude-state"
+    )
+
+    assert f"{home_dir / 'teich-claude-state.json'}:/home/codex/.claude.json" in command
+
+
+def test_required_harness_capture_retries_after_failure(tmp_path: Path):
+    config = Config(
+        capture_harness_context={"enabled": True, "required": True},
+        output={"traces_dir": tmp_path / "output"},
+    )
+    with patch.object(CodexRunner, "_ensure_image"):
+        runner = CodexRunner(config)
+    capture = HarnessContextCapture.from_request(
+        harness="codex",
+        harness_version="test",
+        wire_api="openai-responses",
+        request={"model": "test", "instructions": "Captured system", "tools": []},
+    )
+    with patch.object(
+        runner,
+        "capture_harness_context",
+        side_effect=[RuntimeError("first attempt"), capture],
+    ) as mocked:
+        with pytest.raises(RuntimeError, match="first attempt"):
+            runner._ensure_harness_context_capture()
+        assert runner._ensure_harness_context_capture() == capture
+    assert mocked.call_count == 2
 
 
 def test_claude_max_thinking_tokens_env_in_docker_command(tmp_path: Path):

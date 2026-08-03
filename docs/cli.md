@@ -87,7 +87,7 @@ Convert raw or extracted traces into standalone OpenAI-style training JSONL:
 teich convert data --out teich-training.jsonl
 ```
 
-Each output line contains `prompt`, `messages`, `tools`, and `metadata`. Use this when your training stack can consume standalone OpenAI-style message rows without importing Teich. Use `prepare_data()` and `mask_data()` when you want tokenizer-specific rendering and exact response-only labels.
+Each output line contains `prompt`, `messages`, `tools`, `metadata`, and an optional captured `system` field. Use this when your training stack can consume standalone OpenAI-style message rows without importing Teich. Use `prepare_data()` and `mask_data()` when you want tokenizer-specific rendering and exact response-only labels.
 
 ## Anonymize
 

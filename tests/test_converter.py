@@ -894,6 +894,65 @@ def test_convert_claude_code_stream_json_trace(tmp_path: Path):
     assert todo_tool["function"]["parameters"]["properties"]["todos"]["type"] == "array"
 
 
+def test_convert_claude_context_capture_emits_system_column_and_merges_tools(tmp_path: Path):
+    trace_file = tmp_path / "claude-captured-context.jsonl"
+    events = [
+        {
+            "type": "external_session_meta",
+            "payload": {
+                "id": "session",
+                "source": "claude-code",
+                "model_provider": "anthropic",
+                "model": "claude-test",
+            },
+        },
+        {"type": "external_message", "role": "user", "content": "Inspect"},
+        {
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Done"}]},
+        },
+        {
+            "type": "teich_harness_context",
+            "payload": {
+                "source": "simulated_request_capture",
+                "harness": "claude-code",
+                "harness_version": "2.1.217",
+                "wire_api": "anthropic-messages",
+                "model": "claude-test",
+                "system": "Exact captured base system",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "CapturedOnly",
+                            "description": "Only visible in the request",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                "captured_at": "2026-08-03T00:00:00Z",
+                "context_hash": "abc123",
+            },
+        },
+    ]
+    trace_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+    row = convert_trace_to_training_example(trace_file).to_dict()
+
+    assert row["system"] == "Exact captured base system"
+    assert any(tool["function"]["name"] == "CapturedOnly" for tool in row["tools"])
+    assert row["metadata"]["harness_context"] == {
+        "source": "simulated_request_capture",
+        "harness": "claude-code",
+        "harness_version": "2.1.217",
+        "wire_api": "anthropic-messages",
+        "model": "claude-test",
+        "captured_at": "2026-08-03T00:00:00Z",
+        "context_hash": "abc123",
+        "tool_count": 1,
+    }
+
+
 def test_convert_claude_code_trace_ignores_tool_result_timestamp_for_first_message(tmp_path: Path):
     trace_file = tmp_path / "claude-code-tool-result-timestamp.jsonl"
     events = [

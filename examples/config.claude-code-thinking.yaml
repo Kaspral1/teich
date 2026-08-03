@@ -24,6 +24,12 @@ model:
   sandbox: danger-full-access
   reasoning_effort: max
 
+# One local fake Anthropic Messages request records Claude Code's client-visible
+# system prompt and tool declarations without consuming subscription quota.
+capture_harness_context:
+  enabled: true
+  required: true
+
 prompts_file: prompts.jsonl
 
 output:
