@@ -98,7 +98,7 @@ teich anonymize output --output output_anonymized
 teich anonymize data --in-place
 ```
 
-Anonymization replaces API keys, email addresses, and home-directory usernames with deterministic dummy values while preserving embedded base64 media payloads. It is a best-effort pass; review data before publishing.
+Anonymization replaces known credential formats, high-confidence secret assignments, personal email addresses, and home-directory usernames with deterministic dummy values while preserving embedded base64 media payloads. Reserved example-domain addresses, known public bot addresses, provider thinking signatures, placeholders, and common public IDs are preserved to avoid corrupting training data. Assistant-authored prose, reasoning, and code examples are also preserved from credential/email heuristics; local usernames in paths are still anonymized, and structured tool inputs continue through the full scanner. Reported totals are replacement occurrences rather than estimates of unique secrets. It is a best-effort pass; review data before publishing.
 
 ## Studio
 

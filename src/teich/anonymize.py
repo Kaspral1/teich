@@ -296,8 +296,20 @@ class TraceAnonymizer:
         r"\\?[\"']?[^\S\r\n]*[:=][^\S\r\n]*\\?[\"']?)"
         r"(?P<value>[A-Za-z0-9_~+/=-]{24,})"
     )
-    _quoted_assignment_pattern = re.compile(
-        r"(?P<prefix>(?<![A-Za-z0-9_.-])(?P<key_quote>[\"']?)(?P<name>[A-Za-z][A-Za-z0-9_.-]{1,120})(?P=key_quote)[ \t]*(?:=|:)[ \t]*)(?P<quote>[\"'])(?P<value>(?:\\.|(?!(?P=quote)).)*)(?P=quote)"
+    # Separate fixed-quote alternatives keep failure linear. A tempered-dot
+    # backreference here used to backtrack for seconds over ordinary code with
+    # many escaped quotes even when no assignment ultimately matched.
+    _quoted_assignment_patterns = (
+        re.compile(
+            r'(?P<prefix>(?<![A-Za-z0-9_.-])(?P<key_quote>[\"\']?)'
+            r"(?P<name>[A-Za-z][A-Za-z0-9_.-]{1,120})(?P=key_quote)[ \t]*(?:=|:)[ \t]*)"
+            r'(?P<quote>\")(?P<value>(?:\\.|[^\"\\\r\n])*)\"'
+        ),
+        re.compile(
+            r"(?P<prefix>(?<![A-Za-z0-9_.-])(?P<key_quote>[\"']?)"
+            r"(?P<name>[A-Za-z][A-Za-z0-9_.-]{1,120})(?P=key_quote)[ \t]*(?:=|:)[ \t]*)"
+            r"(?P<quote>')(?P<value>(?:\\.|[^'\\\r\n])*)'"
+        ),
     )
     _bare_assignment_pattern = re.compile(
         r"(?P<prefix>(?<![A-Za-z0-9_.-])(?P<key_quote>[\"']?)(?P<name>[A-Za-z][A-Za-z0-9_.-]{1,120})(?P=key_quote)[ \t]*(?:=|:)[ \t]*)(?P<value>[^\"'\s#]+)"
@@ -375,7 +387,6 @@ class TraceAnonymizer:
         "ssh_private_key",
         "supabase_anon_key",
         "supabase_service_role_key",
-        "token",
         "vault_enc_key",
         "webhook_secret",
     }
@@ -405,6 +416,7 @@ class TraceAnonymizer:
         "aws",
         "azure",
         "client",
+        "csrf",
         "dashboard",
         "enc",
         "encryption",
@@ -417,6 +429,7 @@ class TraceAnonymizer:
         "role",
         "secret",
         "service",
+        "session",
         "signing",
         "supabase",
         "vault",
@@ -442,24 +455,44 @@ class TraceAnonymizer:
         "smtp",
     }
     _non_secret_name_words = {
+        "allow",
+        "at",
+        "cache",
+        "changed",
+        "contains",
+        "control",
         "count",
+        "created",
+        "dedupe",
         "enabled",
         "enable",
+        "env",
         "expiry",
         "expires",
+        "fence",
+        "fencing",
         "has",
+        "id",
+        "idempotency",
         "length",
         "limit",
         "max",
         "min",
         "num",
         "number",
+        "placeholder",
+        "policy",
+        "publickey",
+        "require",
+        "required",
         "supports",
         "tokenizer",
         "tokens",
         "ttl",
+        "updated",
         "use",
         "uses",
+        "version",
     }
     _empty_secret_values = {
         "",
@@ -513,6 +546,54 @@ class TraceAnonymizer:
         "test",
         "timer",
     }
+    _reserved_email_domains = {
+        "example.com",
+        "example.net",
+        "example.org",
+    }
+    _known_public_email_addresses = {
+        "noreply@anthropic.com",
+        "noreply@github.com",
+    }
+    _placeholder_secret_values = {
+        "api-key-here",
+        "apikeyhere",
+        "change-me",
+        "changeme",
+        "dummy",
+        "example",
+        "example-key",
+        "fake",
+        "insert-key-here",
+        "placeholder",
+        "replace-me",
+        "replaceme",
+        "sample",
+        "test",
+        "your-api-key",
+        "your_api_key",
+        "your-key-here",
+        "your-secret-here",
+        "your-token-here",
+    }
+    _placeholder_secret_pattern = re.compile(
+        r"(?is)^(?:"
+        r"<[^<>\r\n]{1,120}>|"
+        r"\$\{?[A-Z_][A-Z0-9_]*\}?|"
+        r"\{\{[^{}\r\n]{1,120}\}\}|"
+        r"(?:process\.env|os\.environ|getenv|env)\b.*|"
+        r"(?:your|insert|replace|example|sample|dummy|fake|test)[-_ .]*(?:api[-_ ]*)?(?:key|token|secret|password).*"
+        r")$"
+    )
+    _public_identifier_patterns = (
+        re.compile(
+            r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        ),
+        re.compile(r"(?i)^(?:sha(?:1|224|256|384|512):)?[0-9a-f]{7,128}$"),
+        re.compile(
+            r"(?i)^(?:call|chatcmpl|cmpl|event|msg|req|request|resp|run|session|step|task|tool|toolu|trace)[_-][A-Za-z0-9_-]{8,}$"
+        ),
+    )
 
     # ponytail: literal gates — each entry pairs the regexes above with cheap
     # substring checks so the expensive lookbehind patterns only run on text
@@ -580,6 +661,8 @@ class TraceAnonymizer:
 
     def _anonymize_mapping(self, value: dict[Any, Any]) -> dict[Any, Any]:
         should_preserve_base64_data = self._looks_like_base64_media_source(value)
+        role = value.get("role")
+        is_assistant_message = isinstance(role, str) and role.lower() == "assistant"
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
             redacted_key = self.anonymize_value(key)
@@ -590,11 +673,46 @@ class TraceAnonymizer:
                 and self._looks_like_base64_blob(item)
             ):
                 redacted[redacted_key] = item
+            elif is_assistant_message and key in {"content", "reasoning_content", "thinking"}:
+                # Assistant-authored prose and code frequently demonstrate
+                # credentials, JWTs, connection strings, and email addresses.
+                # Treating those examples as private input corrupts otherwise
+                # valid training targets. Identity-bearing local paths still
+                # get scrubbed; structured tool inputs remain on the full path.
+                redacted[redacted_key] = self._anonymize_assistant_generated_value(item)
             elif isinstance(key, str) and self._should_redact_mapping_value(key, item):
                 redacted[redacted_key] = self._redact_mapping_value(key, item)
             else:
                 redacted[redacted_key] = self.anonymize_value(item)
         return redacted
+
+    def _anonymize_assistant_generated_value(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self._anonymize_identity_text(value)
+        if isinstance(value, list):
+            return [self._anonymize_assistant_content_block(item) for item in value]
+        if isinstance(value, dict):
+            return self._anonymize_assistant_content_block(value)
+        return value
+
+    def _anonymize_assistant_content_block(self, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return self._anonymize_assistant_generated_value(value)
+        block_type = value.get("type")
+        if not isinstance(block_type, str) or block_type.lower() not in {
+            "analysis",
+            "reasoning",
+            "redacted_thinking",
+            "text",
+            "thinking",
+        }:
+            # Tool calls and unknown structured blocks can contain credentials
+            # copied from the environment, so retain full anonymization there.
+            return self.anonymize_value(value)
+        return {
+            self.anonymize_value(key): self._anonymize_assistant_generated_value(item)
+            for key, item in value.items()
+        }
 
     def _should_redact_mapping_value(self, key: str, item: Any) -> bool:
         if isinstance(item, str):
@@ -633,12 +751,17 @@ class TraceAnonymizer:
         lowered = text.lower()
         if "@" in text:
             text = self._replace_emails(text)
+        text = self._anonymize_identity_text(text, lowered=lowered)
+        text = self._replace_api_keys(text)
+        return text
+
+    def _anonymize_identity_text(self, text: str, *, lowered: str | None = None) -> str:
+        lowered = text.lower() if lowered is None else lowered
         if "home" in lowered or "users" in lowered:
             text = self._replace_usernames_in_paths(text)
             text = self._replace_encoded_home_usernames(text)
         if self._username_map:
             text = self._replace_known_unix_owner_group_usernames(text)
-        text = self._replace_api_keys(text)
         return text
 
     def _replace_emails(self, text: str) -> str:
@@ -666,10 +789,14 @@ class TraceAnonymizer:
         if self._looks_like_uri_userinfo(match, text):
             return True
         lowered = value.lower()
+        if lowered in self._known_public_email_addresses:
+            return True
         if lowered.endswith(self._systemd_unit_suffixes):
             return True
         domain = lowered.rsplit("@", maxsplit=1)[-1]
         tld = domain.rsplit(".", maxsplit=1)[-1]
+        if domain in self._reserved_email_domains or domain.endswith(".example"):
+            return True
         if tld in self._non_email_tlds:
             return True
         if lowered in self._known_git_remote_addresses:
@@ -774,7 +901,8 @@ class TraceAnonymizer:
             if "=" in text:
                 text = self._connection_component_secret_pattern.sub(self._replace_connection_component_secret, text)
             if "=" in text or ":" in text:
-                text = self._quoted_assignment_pattern.sub(self._replace_sensitive_quoted_assignment, text)
+                for pattern in self._quoted_assignment_patterns:
+                    text = pattern.sub(self._replace_sensitive_quoted_assignment, text)
                 text = self._bare_assignment_pattern.sub(self._replace_sensitive_bare_assignment, text)
                 text = self._generic_secret_pattern.sub(self._replace_generic_secret, text)
         return text
@@ -837,9 +965,16 @@ class TraceAnonymizer:
 
     def _replace_query_secret(self, match: re.Match[str]) -> str:
         value = match.group("value")
-        if self._is_redacted_secret_value(value):
+        name = match.group("name")
+        normalized = self._normalize_secret_name(name)
+        should_redact = (
+            self._looks_like_secret_value(value)
+            if normalized in {"sig", "signature"}
+            else self._should_redact_assignment(name, value)
+        )
+        if not should_redact:
             return match.group(0)
-        replacement = self._secret_replacement(f"{match.group('name')}={value}")
+        replacement = self._secret_replacement(f"{name}={value}")
         self.counts["api_key"] += 1
         return match.group("prefix") + replacement
 
@@ -911,7 +1046,12 @@ class TraceAnonymizer:
         return replacement
 
     def _should_redact_assignment(self, name: str, value: str) -> bool:
-        if not value or self._is_empty_secret_value(value) or self._is_redacted_secret_value(value):
+        if (
+            not value
+            or self._is_empty_secret_value(value)
+            or self._is_redacted_secret_value(value)
+            or self._is_placeholder_secret_value(value)
+        ):
             return False
         return self._is_sensitive_name(name, value)
 
@@ -920,17 +1060,27 @@ class TraceAnonymizer:
         words = self._secret_name_words(name)
         if normalized in self._sensitive_exact_names:
             return True
+        if words & self._non_secret_name_words:
+            return False
         if normalized.endswith("_connection_string") or "connection_string" in normalized:
             return self._looks_like_secret_value(value) or len(value.strip()) >= 8
-        if words & {"password", "passwd", "pwd", "secret", "credential", "credentials", "private"}:
+        if words & {"password", "passwd", "pwd", "secret", "credential", "credentials"}:
             return True
+        if "private" in words:
+            return bool(words & {"credential", "key", "secret", "token"}) or bool(
+                self._private_key_block_pattern.search(value)
+            )
         if "token" in words and not words & self._non_secret_name_words:
-            return True
+            if words == {"token"}:
+                return False
+            return bool(words & self._sensitive_key_context_words) or self._looks_like_secret_value(value)
         if "signature" in words or "sig" in words:
-            return True
+            return bool(words & {"access", "auth", "key", "secret", "shared", "signing", "webhook"})
         if "jwt" in words:
             return bool(words & {"secret", "token", "key", "auth"}) or self._looks_like_jwt(value)
         if "key" in words:
+            if words == {"key"}:
+                return False
             return bool(words & self._sensitive_key_context_words) or self._looks_like_secret_value(value)
         if words & {"url", "uri", "dsn"}:
             return bool(words & self._sensitive_url_context_words) or self._looks_like_credential_url(value)
@@ -956,7 +1106,11 @@ class TraceAnonymizer:
 
     def _looks_like_secret_value(self, value: str) -> bool:
         stripped = value.strip()
-        if self._is_empty_secret_value(stripped) or self._is_redacted_secret_value(stripped):
+        if (
+            self._is_empty_secret_value(stripped)
+            or self._is_redacted_secret_value(stripped)
+            or self._is_placeholder_secret_value(stripped)
+        ):
             return False
         if self._looks_like_jwt(stripped) or self._looks_like_credential_url(stripped):
             return True
@@ -965,9 +1119,28 @@ class TraceAnonymizer:
         for pattern in self._api_key_patterns:
             if pattern.search(stripped):
                 return True
-        if len(stripped) >= 20 and re.fullmatch(r"[A-Za-z0-9_~+/=.:-]+", stripped):
-            return True
+        if any(pattern.fullmatch(stripped) for pattern in self._public_identifier_patterns):
+            return False
+        if len(stripped) >= 24 and re.fullmatch(r"[A-Za-z0-9_~+/=-]+", stripped):
+            character_classes = sum(
+                (
+                    any(character.islower() for character in stripped),
+                    any(character.isupper() for character in stripped),
+                    any(character.isdigit() for character in stripped),
+                    any(character in "_~+/=-" for character in stripped),
+                )
+            )
+            return character_classes >= 2
         return False
+
+    @classmethod
+    def _is_placeholder_secret_value(cls, value: str) -> bool:
+        stripped = value.strip().strip("\"'")
+        lowered = stripped.lower()
+        return (
+            lowered in cls._placeholder_secret_values
+            or cls._placeholder_secret_pattern.fullmatch(stripped) is not None
+        )
 
     def _looks_like_jwt(self, value: str) -> bool:
         return self._jwt_pattern.fullmatch(value.strip()) is not None or self._jwe_pattern.fullmatch(value.strip()) is not None

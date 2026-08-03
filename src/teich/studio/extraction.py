@@ -105,8 +105,8 @@ class ExtractionJob:
                         "kind": "extract_progress",
                         "text": (
                             f"Anonymized {done}/{total_text} files · "
-                            f"{counts.get('api_key', 0)} keys, "
-                            f"{counts.get('email', 0)} emails, "
+                            f"{counts.get('api_key', 0)} credential hits, "
+                            f"{counts.get('email', 0)} email hits, "
                             f"{counts.get('username', 0)} usernames in {report.path.name}"
                         ),
                         "phase": "anonymize",
@@ -167,9 +167,9 @@ class ExtractionJob:
                         "kind": "extract_anonymize",
                         "text": (
                             "Scrambled "
-                            f"{self.anonymize_totals.get('api_key', 0)} API keys, "
-                            f"{self.anonymize_totals.get('email', 0)} emails, and "
-                            f"{self.anonymize_totals.get('username', 0)} usernames."
+                            f"{self.anonymize_totals.get('api_key', 0)} credential-like value occurrences, "
+                            f"{self.anonymize_totals.get('email', 0)} email occurrences, and "
+                            f"{self.anonymize_totals.get('username', 0)} username references."
                         ),
                         "totals": self.anonymize_totals,
                     }

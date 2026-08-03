@@ -120,8 +120,11 @@ Examples:
   teich anonymize data --in-place
 
 What is scrubbed:
-  API keys, email addresses, and home-directory usernames.
+  Known credential formats, high-confidence secret assignments, personal email
+  addresses, and home-directory usernames.
   Embedded base64 media payloads are preserved for conversation context.
+
+Reported totals are replacement occurrences, not estimates of unique secrets.
 
 This is a best-effort safety pass. Review data before publishing or uploading.
 """
@@ -216,7 +219,7 @@ def _anonymize_progress_bar():
             for key, count in file_report.replacements.items():
                 totals[key] = totals.get(key, 0) + count
             bar.set_postfix(
-                keys=totals["api_key"],
+                credentials=totals["api_key"],
                 emails=totals["email"],
                 users=totals["username"],
                 file=file_report.path.name,
@@ -522,8 +525,8 @@ def _run_extract_command(
         totals = result.anonymize_totals
         console.print(
             "[cyan]Automatically scrambled[/cyan] "
-            f"{totals.get('api_key', 0)} API keys, "
-            f"{totals.get('email', 0)} email addresses, and "
+            f"{totals.get('api_key', 0)} credential-like value occurrences, "
+            f"{totals.get('email', 0)} email address occurrences, and "
             f"{totals.get('username', 0)} username references",
             soft_wrap=True,
         )
@@ -597,7 +600,7 @@ def anonymize(
     ),
     in_place: bool = typer.Option(False, "--in-place", help="Overwrite files in the input path"),
 ) -> None:
-    """Replace emails, home-directory usernames, and API keys with deterministic dummy values."""
+    """Replace likely credentials, personal emails, and home usernames with dummy values."""
     try:
         report = _anonymize_with_progress(input_path, output, in_place=in_place)
     except (FileNotFoundError, ValueError) as exc:
@@ -608,12 +611,20 @@ def anonymize(
     destination = report.input_path if in_place else report.output_path
     console.print(f"[green]Anonymized {report.files_changed}/{len(report.files)} file(s) into {destination}[/green]")
     if totals:
+        display_names = {
+            "api_key": "credential_occurrences",
+            "email": "email_occurrences",
+            "username": "username_references",
+        }
         console.print(
             "[cyan]Replacements:[/cyan] "
-            + " ".join(f"{key}={value}" for key, value in sorted(totals.items()))
+            + " ".join(
+                f"{display_names.get(key, key)}={value}"
+                for key, value in sorted(totals.items())
+            )
         )
     else:
-        console.print("[yellow]No emails, usernames, or API keys were detected.[/yellow]")
+        console.print("[yellow]No likely credentials, personal emails, or usernames were detected.[/yellow]")
 
 
 @app.command(
