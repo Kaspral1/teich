@@ -315,6 +315,22 @@ def test_prepare_data_rejects_conflicting_token_aliases():
         )
 
 
+@pytest.mark.parametrize("max_examples", [-1, 1.5, True])
+def test_prepare_data_rejects_invalid_global_max_examples(max_examples):
+    with pytest.raises(ValueError, match="max_examples must be a non-negative integer"):
+        prepare_data(_dataset(), TinyChatTokenizer(), max_examples=max_examples, verbose=False)
+
+
+@pytest.mark.parametrize("weight", [float("nan"), float("inf"), True])
+def test_prepare_data_rejects_non_finite_or_boolean_mix_weights(weight):
+    with pytest.raises(ValueError, match="finite positive number"):
+        prepare_data(
+            {"bad": {"source": _dataset(), "weight": weight}},
+            TinyChatTokenizer(),
+            verbose=False,
+        )
+
+
 def test_prepare_data_accepts_source_mix_with_percentages_and_caps():
     tokenizer = TinyChatTokenizer()
 

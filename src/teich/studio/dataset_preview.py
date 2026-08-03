@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -10,15 +12,38 @@ from ..converter import convert_traces_to_training_data
 from ..loader import trace_is_complete
 
 MAX_README_CHARS = 24_000
-MAX_TRACE_EVENTS = 5_000
 
 
 def _write_jsonl_rows(path: Path, rows: list[dict[str, Any]]) -> None:
-    if rows:
-        text = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n"
-        path.write_text(text, encoding="utf-8")
-    else:
+    if not rows:
         path.unlink(missing_ok=True)
+        return
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False))
+                handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _remove_trace_metadata(path: Path) -> None:
+    path.with_suffix(".metadata.json").unlink(missing_ok=True)
 
 
 def _jsonl_files(root: Path) -> list[Path]:
@@ -80,8 +105,10 @@ def _stringify_for_search(row: dict[str, Any]) -> str:
 
 
 def _row_preview(row: dict[str, Any]) -> dict[str, Any]:
-    messages = row.get("messages") if isinstance(row.get("messages"), list) else []
-    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    raw_messages = row.get("messages")
+    messages = raw_messages if isinstance(raw_messages, list) else []
+    raw_metadata = row.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     return {
         "prompt": row.get("prompt") or _first_message_text(messages, "user"),
         "response": row.get("response") or _last_message_text(messages, "assistant"),
@@ -162,15 +189,14 @@ def _read_trace_events(path: Path) -> list[dict[str, Any]]:
                     raise ValueError(message) from exc
                 if isinstance(event, dict):
                     events.append(event)
-                if len(events) >= MAX_TRACE_EVENTS:
-                    break
     except OSError:
         return []
     return events
 
 
 def _resolve_source_path(root: Path, row: dict[str, Any]) -> Path | None:
-    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    raw_metadata = row.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     source_file = metadata.get("source_file")
     if not isinstance(source_file, str) or not source_file.strip():
         return None
@@ -212,7 +238,8 @@ def _resolve_source_path(root: Path, row: dict[str, Any]) -> Path | None:
 
 
 def _row_source_line(row: dict[str, Any]) -> int | None:
-    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    raw_metadata = row.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     source_line = metadata.get("source_line")
     if isinstance(source_line, int) and source_line > 0:
         return source_line
@@ -279,7 +306,8 @@ def update_dataset_row(root: Path, row_idx: int, updated_row: dict[str, Any]) ->
         raise ValueError("This dataset row does not have a resolvable source file.")
 
     row_to_write = dict(updated_row)
-    metadata = dict(row_to_write.get("metadata")) if isinstance(row_to_write.get("metadata"), dict) else {}
+    raw_metadata = row_to_write.get("metadata")
+    metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
     metadata.setdefault("source_file", source_path.name)
     row_to_write["metadata"] = metadata
 
@@ -317,12 +345,12 @@ def delete_dataset_row(root: Path, row_idx: int) -> dict[str, Any]:
     if source_line is not None and source_line <= len(source_rows) and _structured_row(source_rows[source_line - 1]):
         del source_rows[source_line - 1]
         _write_jsonl_rows(source_path, source_rows)
+        if not source_rows:
+            _remove_trace_metadata(source_path)
         mode = "line"
     elif _source_usage_count(root, rows, source_path) == 1:
         source_path.unlink()
-        metadata_path = source_path.with_suffix(".metadata.json")
-        if metadata_path.exists():
-            metadata_path.unlink()
+        _remove_trace_metadata(source_path)
         mode = "file"
     else:
         raise ValueError("This source file maps to multiple dataset rows; refusing to delete it as one row.")

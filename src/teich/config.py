@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import re
 import sys
-from typing import Any
+from typing import Any, cast
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -75,8 +75,8 @@ class MCPConfig(BaseModel):
     bearer_token_env_var: str | None = None
     http_headers: dict[str, str] = Field(default_factory=dict)
     env_http_headers: dict[str, str] = Field(default_factory=dict)
-    startup_timeout_sec: int | None = None
-    tool_timeout_sec: int | None = None
+    startup_timeout_sec: int | None = Field(default=None, gt=0)
+    tool_timeout_sec: int | None = Field(default=None, gt=0)
     enabled: bool = True
     required: bool = False
     enabled_tools: list[str] = Field(default_factory=list)
@@ -210,7 +210,9 @@ class ModelConfig(BaseModel):
     service_tier: str | None = None
     context_length: int | None = None
     approval_mode: str | None = "none"
-    pi_model_overrides: dict[str, object] = Field(default_factory=lambda: {"maxTokens": 131072})
+    pi_model_overrides: dict[str, object] = Field(
+        default_factory=lambda: {"maxTokens": cast(object, 131072)}
+    )
 
     @model_validator(mode="after")
     def normalize_legacy_approval_mode(self) -> ModelConfig:
@@ -332,7 +334,7 @@ class Config(BaseModel):
     output: OutputConfig = Field(default_factory=OutputConfig)
     publish: PublishConfig = Field(default_factory=PublishConfig)
     max_concurrency: int = Field(default=1, ge=1)
-    timeout_seconds: int = 600
+    timeout_seconds: int = Field(default=600, gt=0)
     openai_api_key: str | None = None
     developer_instructions: str | None = None
 
@@ -648,13 +650,7 @@ class Config(BaseModel):
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError(f"{source} has an empty or missing 'prompt' value")
         try:
-            return PromptInput(
-                image=normalized_row.get("image"),
-                github_repo=normalized_row.get("github_repo"),
-                system=normalized_row.get("system"),
-                prompt=prompt,
-                follow_up_prompts=normalized_row.get("follow_up_prompts"),
-            )
+            return PromptInput.model_validate(normalized_row)
         except ValueError as exc:
             raise ValueError(f"Invalid {source}: {exc}") from exc
 

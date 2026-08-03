@@ -11,6 +11,7 @@ from teich import load_traces, mask_data, prepare_data, preview_sft_example, row
 from teich.converter import convert_trace_to_training_example
 from teich.formatter import (
     PrepareReport,
+    _expand_typed_spans,
     _labels_from_offsets,
     _reconcile_marker_boundary_whitespace,
     _strip_markers_and_collect_spans,
@@ -3735,6 +3736,103 @@ def test_strip_markers_collects_json_escaped_marker_variants():
             "role": "assistant",
         }
     ]
+
+
+def test_strip_markers_scales_to_thousands_of_raw_and_escaped_markers():
+    marker_count = 4_000
+    markers = [
+        {
+            "start_marker": f"\ue000AGD{index}S\ue001",
+            "end_marker": f"\ue000AGD{index}E\ue001",
+            "kind": "final_answer",
+            "role": "assistant",
+        }
+        for index in range(marker_count)
+    ]
+    marked_parts: list[str] = []
+    expected_parts: list[str] = []
+    expected_spans: list[dict[str, object]] = []
+    cleaned_length = 0
+    for index, marker in enumerate(markers):
+        payload = f"answer-{index}-" + ("x" * 192)
+        if index % 2:
+            start_marker = json.dumps(marker["start_marker"])[1:-1]
+            end_marker = json.dumps(marker["end_marker"])[1:-1]
+        else:
+            start_marker = marker["start_marker"]
+            end_marker = marker["end_marker"]
+        marked_parts.extend((start_marker, payload, end_marker))
+        expected_parts.append(payload)
+        expected_spans.append(
+            {
+                "start": cleaned_length,
+                "end": cleaned_length + len(payload),
+                "source_start": cleaned_length,
+                "source_end": cleaned_length + len(payload),
+                "kind": "final_answer",
+                "role": "assistant",
+            }
+        )
+        cleaned_length += len(payload)
+
+    stripped = _strip_markers_and_collect_spans("".join(marked_parts), markers)
+
+    assert stripped == ("".join(expected_parts), expected_spans)
+
+
+def test_expand_typed_spans_indexes_large_conversations_once():
+    block_count = 1_200
+    assistant_prefix = "<|im_start|>assistant\n"
+    assistant_suffix = "<|im_end|>\n"
+    text_parts: list[str] = []
+    spans: list[dict[str, object]] = []
+    expected_bounds: list[tuple[int, int]] = []
+    cursor = 0
+    for index in range(block_count):
+        reasoning_prefix = "<think>\n"
+        reasoning = f"reason-{index}"
+        reasoning_suffix = "</think>\n"
+        answer = f"answer-{index}-" + ("y" * 448)
+        block = (
+            assistant_prefix
+            + reasoning_prefix
+            + reasoning
+            + reasoning_suffix
+            + answer
+            + assistant_suffix
+        )
+        block_end = cursor + len(block)
+        expected_bounds.append((cursor + len(assistant_prefix), block_end))
+        reasoning_start = cursor + len(assistant_prefix) + len(reasoning_prefix)
+        answer_start = reasoning_start + len(reasoning) + len(reasoning_suffix)
+        spans.extend(
+            (
+                {
+                    "start": reasoning_start,
+                    "end": reasoning_start + len(reasoning),
+                    "kind": "reasoning",
+                    "role": "assistant",
+                },
+                {
+                    "start": answer_start,
+                    "end": answer_start + len(answer),
+                    "kind": "final_answer",
+                    "role": "assistant",
+                },
+            )
+        )
+        text_parts.append(block)
+        cursor = block_end
+    text = "".join(text_parts)
+
+    expanded = _expand_typed_spans(text, spans, (assistant_prefix,))
+
+    assert len(expanded) == block_count * 2
+    for index, expected in enumerate(expected_bounds):
+        reasoning_span = expanded[index * 2]
+        final_span = expanded[index * 2 + 1]
+        assert (reasoning_span["start"], reasoning_span["end"]) == expected
+        assert (final_span["start"], final_span["end"]) == expected
 
 
 def test_actual_qwen_template_receives_normalized_mapping_tool_arguments():

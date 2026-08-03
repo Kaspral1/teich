@@ -277,6 +277,12 @@ def test_tracked_container_cleans_up_when_start_fails():
     assert "teich-broken-start" not in runner._active_containers
 
 
+def test_start_container_reports_docker_control_timeout():
+    with patch("teich.runner.subprocess.run", side_effect=subprocess.TimeoutExpired("docker", 30)):
+        with pytest.raises(RuntimeError, match="did not start the runtime container"):
+            DockerRuntimeRunner._start_container(["docker", "run"])
+
+
 def test_copy_workspace_snapshot_ignores_dangling_symlinks(tmp_path: Path):
     workspace = tmp_path / "workspace"
     destination = tmp_path / "snapshot"
@@ -2586,6 +2592,7 @@ def test_run_process_removes_named_container_on_failure():
         ["docker", "rm", "-f", "teich-codex-test"],
         capture_output=True,
         check=False,
+        timeout=runner_module.DOCKER_CLEANUP_TIMEOUT_SECONDS,
         **runner_module.TEXT_SUBPROCESS_KWARGS,
     )
 
@@ -4914,6 +4921,35 @@ def test_chat_runner_normalizes_openrouter_chat_completion_reasoning_usage():
     }
 
 
+def test_chat_runner_does_not_double_count_reasoning_when_total_is_missing():
+    usage = ChatRunner._normalize_usage(
+        {
+            "prompt_tokens": 263,
+            "completion_tokens": 80,
+            "completion_tokens_details": {"reasoning_tokens": 67},
+        }
+    )
+
+    assert usage == {
+        "input": 263,
+        "output": 80,
+        "reasoning": 67,
+        "totalTokens": 343,
+    }
+
+
+def test_chat_runner_ignores_malformed_token_detail_objects():
+    usage = ChatRunner._normalize_usage(
+        {
+            "input_tokens": 4,
+            "output_tokens": 3,
+            "output_tokens_details": ["not", "an", "object"],
+        }
+    )
+
+    assert usage == {"input": 4, "output": 3, "reasoning": 0, "totalTokens": 7}
+
+
 def test_chat_runner_uses_prompt_level_system_prompt(tmp_path: Path):
     config = Config(
         agent={"provider": "chat"},
@@ -6044,6 +6080,65 @@ def test_chat_run_all_times_out_hung_worker_without_waiting_forever(tmp_path: Pa
             assert time.monotonic() - start < 3
     finally:
         release.set()
+
+
+def test_chat_run_all_does_not_write_a_response_after_returning_timeout(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini"),
+        api=APIConfig(provider="openai", api_key="sk-test", wire_api="responses"),
+        prompts=["hung"],
+        output={"traces_dir": tmp_path / "output"},
+        timeout_seconds=1,
+    )
+    runner = ChatRunner(config)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def blocked_conversation(prompt_input):
+        started.set()
+        release.wait(timeout=5)
+        finished.set()
+        return {
+            "prompt": prompt_input.prompt,
+            "response": "late response",
+            "messages": [
+                {"role": "user", "content": prompt_input.prompt},
+                {"role": "assistant", "content": "late response"},
+            ],
+        }
+
+    destination = tmp_path / "output" / "chat.jsonl"
+    try:
+        with patch.object(runner, "_request_chat_conversation", side_effect=blocked_conversation):
+            with pytest.raises(RuntimeError, match="timed out"):
+                runner.run_all(max_concurrency=1)
+            assert started.is_set()
+            release.set()
+            assert finished.wait(timeout=2)
+    finally:
+        release.set()
+
+    assert not destination.exists()
+
+
+def test_chat_runner_stop_signal_cancels_registered_batches(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini"),
+        api=APIConfig(provider="openai", api_key="sk-test", wire_api="responses"),
+        output={"traces_dir": tmp_path / "output"},
+    )
+    runner = ChatRunner(config)
+    cancel_event = threading.Event()
+    runner._register_chat_cancel_event(cancel_event)
+    try:
+        runner._terminate_active_processes()
+    finally:
+        runner._unregister_chat_cancel_event()
+
+    assert cancel_event.is_set()
 
 
 def test_chat_run_all_propagates_keyboard_interrupt_without_waiting_for_workers(tmp_path: Path):

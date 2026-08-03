@@ -99,6 +99,16 @@ def test_load_traces_downloads_dataset_repo_and_converts_split(tmp_path: Path):
     assert dataset[0]["prompt"] == "Inspect repo"
 
 
+def test_load_traces_does_not_treat_missing_path_object_as_huggingface_repo(tmp_path: Path):
+    missing = tmp_path / "missing-dataset"
+
+    with patch("teich.loader.snapshot_download") as mock_download:
+        with pytest.raises(FileNotFoundError, match="Local trace path not found"):
+            load_traces(missing)
+
+    mock_download.assert_not_called()
+
+
 def test_load_traces_forwards_hf_token_alias_to_snapshot_download(tmp_path: Path):
     repo_dir = tmp_path / "downloaded-repo"
     split_dir = repo_dir / "train"
@@ -158,6 +168,51 @@ def test_load_traces_applies_tools_snapshot_embedded_in_readme(tmp_path: Path):
 
     assert dataset.num_rows == 1
     assert dataset[0]["tools"][0]["function"]["name"] == "browser_open"
+
+
+def test_load_traces_does_not_replace_row_specific_tools_with_dataset_snapshot(tmp_path: Path):
+    row_tool = {
+        "type": "function",
+        "function": {
+            "name": "row_specific_tool",
+            "description": "Only this row can use it",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    snapshot_tool = {
+        "type": "function",
+        "function": {
+            "name": "dataset_fallback_tool",
+            "description": "Fallback for rows without tools",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    (tmp_path / "chat.jsonl").write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"role": "user", "content": "Use my tool"},
+                    {"role": "assistant", "content": "Done"},
+                ],
+                "tools": [row_tool],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "README.md").write_text(
+        "<details>\n"
+        "<summary>Training-ready tool schema snapshot</summary>\n\n"
+        "```json\n"
+        + json.dumps([snapshot_tool], indent=2)
+        + "\n```\n"
+        "</details>\n",
+        encoding="utf-8",
+    )
+
+    dataset = load_traces(tmp_path)
+
+    assert [tool["function"]["name"] for tool in dataset[0]["tools"]] == ["row_specific_tool"]
 
 
 def test_load_traces_raises_when_no_trace_files_exist(tmp_path: Path):
@@ -445,9 +500,10 @@ def test_load_traces_max_examples_shuffles_structured_rows_deterministically(tmp
     assert limited_prompts_a == expected_prompts
 
 
-def test_load_traces_rejects_negative_max_examples(tmp_path: Path):
-    with pytest.raises(ValueError, match="max_examples must be non-negative"):
-        load_traces(tmp_path, split="train", max_examples=-1)
+@pytest.mark.parametrize("max_examples", [-1, 1.5, True])
+def test_load_traces_rejects_invalid_max_examples(tmp_path: Path, max_examples):
+    with pytest.raises(ValueError, match="max_examples must be a non-negative integer"):
+        load_traces(tmp_path, split="train", max_examples=max_examples)
 
 
 def test_load_traces_filters_rows_without_assistant_training_signal(tmp_path: Path):

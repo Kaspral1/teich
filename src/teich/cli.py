@@ -10,6 +10,7 @@ import sys
 from threading import Event, RLock, Thread
 from typing import Any
 
+import click
 import typer
 from huggingface_hub import HfApi
 from rich.console import Console, Group
@@ -28,6 +29,7 @@ from .runner import (
     ChatRunner,
     ClaudeCodeRunner,
     CodexRunner,
+    DockerRuntimeRunner,
     HermesRunner,
     PiRunner,
     SessionProgressUpdate,
@@ -146,7 +148,7 @@ For Hugging Face dataset uploads today, use teich generate or teich extract and 
 class ExtraHelpCommand(TyperCommand):
     extra_help = ""
 
-    def format_help(self, ctx: typer.Context, formatter: typer.HelpFormatter) -> None:
+    def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         super().format_help(ctx, formatter)
         if self.extra_help:
             formatter.write("\n" + self.extra_help)
@@ -155,7 +157,7 @@ class ExtraHelpCommand(TyperCommand):
 class ExtraHelpGroup(TyperGroup):
     extra_help = ""
 
-    def format_help(self, ctx: typer.Context, formatter: typer.HelpFormatter) -> None:
+    def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         super().format_help(ctx, formatter)
         if self.extra_help:
             formatter.write("\n" + self.extra_help)
@@ -751,6 +753,7 @@ def generate(
 
     # Run generation
     try:
+        runner: DockerRuntimeRunner
         if agent_provider == "codex":
             runner = CodexRunner(cfg)
             if cfg.agent.codex.use_host_auth:
@@ -1295,13 +1298,16 @@ def _configure_studio_event_loop_policy(
 ) -> bool:
     if platform != "win32":
         return False
-    if asyncio_module is None:
-        import asyncio as asyncio_module
+    module = asyncio_module
+    if module is None:
+        import asyncio
 
-    policy_cls = getattr(asyncio_module, "WindowsSelectorEventLoopPolicy", None)
+        module = asyncio
+
+    policy_cls = getattr(module, "WindowsSelectorEventLoopPolicy", None)
     if policy_cls is None:
         return False
-    asyncio_module.set_event_loop_policy(policy_cls())
+    module.set_event_loop_policy(policy_cls())
     return True
 
 

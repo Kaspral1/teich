@@ -2,9 +2,12 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+import subprocess
+import sys
 import re
 from unittest.mock import MagicMock, patch
 
+import pytest
 from typer.testing import CliRunner
 
 from teich import anonymize as anonymize_module
@@ -1547,6 +1550,94 @@ def test_extract_refreshes_flat_output_before_writing(tmp_path: Path):
     assert len(list(output_dir.glob("*.jsonl"))) == 1
 
 
+def test_extract_refresh_preserves_existing_output_when_no_session_matches(tmp_path: Path):
+    sessions_dir = tmp_path / "codex"
+    sessions_dir.mkdir()
+    (sessions_dir / "other-model.jsonl").write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "other", "model": "other-model"}}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "data"
+    output_dir.mkdir()
+    previous = output_dir / "previous.jsonl"
+    previous_text = json.dumps({"prompt": "keep", "response": "me"}) + "\n"
+    previous.write_text(previous_text, encoding="utf-8")
+
+    result = extract_local_sessions(
+        "codex",
+        output_dir=output_dir,
+        sources=[sessions_dir],
+        model_filter="missing-model",
+        clear_destination=True,
+    )
+
+    assert result.copied_files == []
+    assert previous.read_text(encoding="utf-8") == previous_text
+
+
+def test_extract_refresh_refuses_output_that_contains_its_source(tmp_path: Path):
+    source = tmp_path / "data" / "sessions"
+    source.mkdir(parents=True)
+    trace = source / "session.jsonl"
+    trace.write_text(json.dumps({"type": "session_meta", "payload": {"id": "keep"}}) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="contains extraction source"):
+        extract_local_sessions(
+            "codex",
+            output_dir=tmp_path / "data",
+            sources=[source],
+            clear_destination=True,
+        )
+
+    assert trace.exists()
+
+
+def test_extract_refresh_skips_existing_output_inside_source(tmp_path: Path):
+    source = tmp_path / "sessions"
+    source.mkdir()
+    trace = source / "session.jsonl"
+    trace.write_text(json.dumps({"type": "session_meta", "payload": {"id": "keep"}}) + "\n", encoding="utf-8")
+    output_dir = source / "export"
+    output_dir.mkdir()
+    previous = output_dir / "previous.jsonl"
+    previous.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "previous"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    result = extract_local_sessions(
+        "codex",
+        output_dir=output_dir,
+        sources=[source],
+        clear_destination=True,
+    )
+
+    assert [path.name for path in result.copied_files] == ["session.jsonl"]
+    assert trace.exists()
+    assert not previous.exists()
+    assert (output_dir / "session.jsonl").exists()
+
+
+def test_extract_skips_existing_output_files_when_output_is_inside_source(tmp_path: Path):
+    source = tmp_path / "sessions"
+    source.mkdir()
+    trace = source / "session.jsonl"
+    trace.write_text(json.dumps({"type": "session_meta", "payload": {"id": "source"}}) + "\n", encoding="utf-8")
+    output_dir = source / "export"
+    output_dir.mkdir()
+    previous = output_dir / "previous.jsonl"
+    previous.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "previous"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    result = extract_local_sessions("codex", output_dir=output_dir, sources=[source])
+
+    assert [path.name for path in result.copied_files] == ["session.jsonl"]
+    assert previous.exists()
+    assert (output_dir / "session.jsonl").exists()
+
+
 def test_extract_can_upload_staged_anonymized_output_to_huggingface(tmp_path: Path):
     sessions_dir = tmp_path / "codex" / "sessions"
     sessions_dir.mkdir(parents=True)
@@ -2186,6 +2277,50 @@ def test_anonymize_does_not_treat_systemd_units_as_emails(tmp_path: Path):
     assert "lane@example.com" not in text
     assert "redacted-user1@example.com" in text
     assert "email=1" in result.output
+
+
+def test_anonymize_generic_secret_scan_is_bounded_on_long_hyphenated_ids():
+    script = """
+from teich.anonymize import TraceAnonymizer
+
+identifier_run = "segment-" * 20_000 + "tail"
+secret = "abcdefghijklmnopqrstuvwxyz012345"
+text = f"token metadata: {identifier_run}\\nservice_api_token={secret}"
+anonymizer = TraceAnonymizer()
+redacted = anonymizer.anonymize_text(text)
+assert identifier_run in redacted
+assert secret not in redacted
+assert "redacted_" in redacted
+assert anonymizer.counts["api_key"] == 1
+"""
+    env = os.environ.copy()
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (source_root, env.get("PYTHONPATH"))))
+
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+
+
+def test_anonymize_generic_secret_handles_escaped_json_and_ignores_non_secret_assignments():
+    secret = "abcdefghijklmnopqrstuvwxyz012345"
+    text = (
+        rf'\"service-api-token\":\"{secret}\"' + "\n"
+        + rf'\"tool-call-id\":\"{secret}\"'
+    )
+
+    anonymizer = anonymize_module.TraceAnonymizer()
+    redacted = anonymizer.anonymize_text(text)
+
+    assert secret not in redacted.splitlines()[0]
+    assert secret in redacted.splitlines()[1]
+    assert anonymizer.counts["api_key"] == 1
 
 
 def test_pool_upload_is_reserved_until_backend_exists(tmp_path: Path):

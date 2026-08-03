@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +70,10 @@ def prepare_data(
     return_report: bool = False,
     verbose: bool = True,
 ) -> Dataset | tuple[Dataset, PrepareReport]:
+    if max_examples is not None and (
+        not isinstance(max_examples, int) or isinstance(max_examples, bool) or max_examples < 0
+    ):
+        raise ValueError("max_examples must be a non-negative integer.")
     effective_token = _resolve_hf_token(token, hf_token)
     report = PrepareReport() if return_report else None
     dataset = _resolve_source_dataset(
@@ -326,7 +331,7 @@ def _validate_source_value(value: Any) -> str | Path | Dataset:
 def _optional_non_negative_int(value: Any, name: str) -> int | None:
     if value is None:
         return None
-    if not isinstance(value, int) or value < 0:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ValueError(f"{name} must be a non-negative integer.")
     return value
 
@@ -348,8 +353,13 @@ def _has_explicit_mix_value(value: Mapping[str, Any]) -> bool:
 def _optional_positive_float(value: Any, name: str) -> float | None:
     if value is None:
         return None
-    if not isinstance(value, int | float) or value <= 0:
-        raise ValueError(f"{name} must be a positive number.")
+    if (
+        not isinstance(value, int | float)
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{name} must be a finite positive number.")
     return float(value)
 
 

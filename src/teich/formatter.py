@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from copy import deepcopy
 from dataclasses import dataclass, field
 import json
@@ -61,6 +62,9 @@ _SPAN_KIND_SYSTEM = "system"
 _SPAN_KIND_DEVELOPER = "developer"
 _MARKER_PREFERRED_DICT_KEYS = ("text", "content", "value", "arguments", "name")
 _MARKER_STRUCTURAL_DICT_KEYS = {"type"}
+_TEICH_MARKER_PATTERN = re.compile(
+    r"\ue000AGD\d+[SE]\ue001|\\u[eE]000AGD\d+[SE]\\u[eE]001"
+)
 _TEICH_LABEL_PAD_TOKEN_ID = -100
 _TEICH_LABEL_PADDING_COLLATOR_NAMES = {
     "DataCollatorForLanguageModeling",
@@ -611,37 +615,22 @@ def _tool_response_spans(text: str) -> list[tuple[int, int]]:
     return _merge_spans(spans)
 
 
-def _expand_span_to_containing_span(
+def _extend_span_to_following_assistant_end(
+    text: str,
     span: tuple[int, int],
-    candidate_spans: list[tuple[int, int]],
+    assistant_blocks: _AssistantBlockIndex | None = None,
 ) -> tuple[int, int]:
     start, end = span
-    containing_spans = [
-        (candidate_start, candidate_end)
-        for candidate_start, candidate_end in candidate_spans
-        if candidate_start <= start and end <= candidate_end
-    ]
-    if not containing_spans:
+    assistant_blocks = assistant_blocks or _AssistantBlockIndex.build(text)
+    following_end = assistant_blocks.following_end(end)
+    if following_end is None:
         return span
-    return min(containing_spans, key=lambda item: item[1] - item[0])
-
-
-def _extend_span_to_following_assistant_end(text: str, span: tuple[int, int]) -> tuple[int, int]:
-    start, end = span
-    candidates: list[tuple[int, str]] = []
-    for end_token in _ASSISTANT_BLOCK_END_TOKENS:
-        end_start = text.find(end_token, end)
-        if end_start >= 0:
-            candidates.append((end_start, end_token))
-    if not candidates:
-        return span
-    end_start, end_token = min(candidates, key=lambda item: item[0])
+    end_start, span_end = following_end
     if text[end:end_start].strip():
         return span
-    block = _assistant_block_bounds(text, start, end)
+    block = assistant_blocks.bounds(start, end)
     if block is None or end_start >= block[1]:
         return span
-    span_end = end_start + len(end_token)
     while span_end < len(text) and text[span_end] in "\r\n":
         span_end += 1
     return start, span_end
@@ -667,21 +656,21 @@ def _prepend_marker(value: Any, marker: str) -> tuple[Any, bool]:
     if isinstance(value, str) and value:
         return marker + value, True
     if isinstance(value, list):
-        updated = list(value)
-        for index, item in enumerate(updated):
+        updated_list = list(value)
+        for index, item in enumerate(updated_list):
             new_item, changed = _prepend_marker(item, marker)
             if changed:
-                updated[index] = new_item
-                return updated, True
+                updated_list[index] = new_item
+                return updated_list, True
         return value, False
     if isinstance(value, dict):
-        updated = dict(value)
-        for key in _marker_dict_keys(updated):
-            item = updated[key]
+        updated_dict = dict(value)
+        for key in _marker_dict_keys(updated_dict):
+            item = updated_dict[key]
             new_item, changed = _prepend_marker(item, marker)
             if changed:
-                updated[key] = new_item
-                return updated, True
+                updated_dict[key] = new_item
+                return updated_dict, True
         return value, False
     return value, False
 
@@ -690,20 +679,20 @@ def _append_marker(value: Any, marker: str) -> tuple[Any, bool]:
     if isinstance(value, str) and value:
         return value + marker, True
     if isinstance(value, list):
-        updated = list(value)
-        for index in range(len(updated) - 1, -1, -1):
-            new_item, changed = _append_marker(updated[index], marker)
+        updated_list = list(value)
+        for index in range(len(updated_list) - 1, -1, -1):
+            new_item, changed = _append_marker(updated_list[index], marker)
             if changed:
-                updated[index] = new_item
-                return updated, True
+                updated_list[index] = new_item
+                return updated_list, True
         return value, False
     if isinstance(value, dict):
-        updated = dict(value)
-        for key in _marker_append_dict_keys(updated):
-            new_item, changed = _append_marker(updated[key], marker)
+        updated_dict = dict(value)
+        for key in _marker_append_dict_keys(updated_dict):
+            new_item, changed = _append_marker(updated_dict[key], marker)
             if changed:
-                updated[key] = new_item
-                return updated, True
+                updated_dict[key] = new_item
+                return updated_dict, True
         return value, False
     return value, False
 
@@ -801,29 +790,34 @@ def _strip_markers_and_collect_spans(text: str, markers: list[dict[str, str]]) -
     if not markers:
         return text, []
     marker_lookup: dict[str, tuple[str, int]] = {}
-    pattern_parts: list[str] = []
+    uses_teich_markers = True
     for index, marker in enumerate(markers):
         start_marker = marker["start_marker"]
         end_marker = marker["end_marker"]
+        if start_marker != f"\ue000AGD{index}S\ue001" or end_marker != f"\ue000AGD{index}E\ue001":
+            uses_teich_markers = False
         for marker_variant in _marker_text_variants(start_marker):
             marker_lookup[marker_variant] = ("start", index)
-            pattern_parts.append(re.escape(marker_variant))
         for marker_variant in _marker_text_variants(end_marker):
             marker_lookup[marker_variant] = ("end", index)
-            pattern_parts.append(re.escape(marker_variant))
-    pattern = re.compile("|".join(pattern_parts))
+    if uses_teich_markers:
+        pattern = _TEICH_MARKER_PATTERN
+    else:
+        pattern = re.compile("|".join(re.escape(marker_variant) for marker_variant in marker_lookup))
     cleaned_parts: list[str] = []
     active_starts: dict[int, list[int]] = {}
     spans: list[dict[str, Any]] = []
     cursor = 0
     cleaned_length = 0
     for match in pattern.finditer(text):
+        marker_info = marker_lookup.get(match.group(0))
+        if marker_info is None:
+            continue
         chunk = text[cursor:match.start()]
         if chunk:
             cleaned_parts.append(chunk)
             cleaned_length += len(chunk)
-        marker = match.group(0)
-        kind, index = marker_lookup[marker]
+        kind, index = marker_info
         if kind == "start":
             active_starts.setdefault(index, []).append(cleaned_length)
         else:
@@ -1128,37 +1122,133 @@ def _assistant_block_bounds(text: str, start: int, end: int) -> tuple[int, int] 
     return block_start, block_end
 
 
+@dataclass(slots=True)
+class _AssistantBlockIndex:
+    text: str
+    start_thresholds: list[int]
+    start_prefix_maxima: list[int]
+    end_starts: list[int]
+    end_positions: list[int]
+
+    @classmethod
+    def build(cls, text: str) -> _AssistantBlockIndex:
+        start_events: list[tuple[int, int]] = []
+        for token in _ASSISTANT_BLOCK_START_TOKENS:
+            cursor = 0
+            while True:
+                token_start = text.find(token, cursor)
+                if token_start < 0:
+                    break
+                start_events.append((token_start + len(token), token_start))
+                cursor = token_start + len(token)
+        start_events.sort()
+        start_thresholds: list[int] = []
+        start_prefix_maxima: list[int] = []
+        max_start = -1
+        for threshold, token_start in start_events:
+            max_start = max(max_start, token_start)
+            start_thresholds.append(threshold)
+            start_prefix_maxima.append(max_start)
+
+        end_by_start: dict[int, int] = {}
+        for token in _ASSISTANT_BLOCK_END_TOKENS:
+            cursor = 0
+            while True:
+                token_start = text.find(token, cursor)
+                if token_start < 0:
+                    break
+                end_by_start.setdefault(token_start, token_start + len(token))
+                cursor = token_start + len(token)
+        ordered_ends = sorted(end_by_start.items())
+        return cls(
+            text=text,
+            start_thresholds=start_thresholds,
+            start_prefix_maxima=start_prefix_maxima,
+            end_starts=[start for start, _ in ordered_ends],
+            end_positions=[end for _, end in ordered_ends],
+        )
+
+    def bounds(self, start: int, end: int) -> tuple[int, int] | None:
+        start_index = bisect_right(self.start_thresholds, start) - 1
+        if start_index < 0:
+            return None
+        block_start = self.start_prefix_maxima[start_index]
+        end_index = bisect_left(self.end_starts, end)
+        if end_index >= len(self.end_starts):
+            return None
+        block_end = self.end_positions[end_index]
+        while block_end < len(self.text) and self.text[block_end] in "\r\n":
+            block_end += 1
+        return block_start, block_end
+
+    def following_end(self, position: int) -> tuple[int, int] | None:
+        end_index = bisect_left(self.end_starts, position)
+        if end_index >= len(self.end_starts):
+            return None
+        return self.end_starts[end_index], self.end_positions[end_index]
+
+
+@dataclass(slots=True)
+class _ContainingSpanIndex:
+    spans: list[tuple[int, int]]
+    starts: list[int]
+
+    @classmethod
+    def build(cls, spans: list[tuple[int, int]]) -> _ContainingSpanIndex:
+        merged = _merge_spans(spans)
+        return cls(merged, [start for start, _ in merged])
+
+    def containing(self, span: tuple[int, int]) -> tuple[int, int]:
+        start, end = span
+        index = bisect_right(self.starts, start) - 1
+        if index < 0:
+            return span
+        candidate_start, candidate_end = self.spans[index]
+        if candidate_start <= start and end <= candidate_end:
+            return candidate_start, candidate_end
+        return span
+
+
+def _expand_supervised_span(
+    text: str,
+    span: tuple[int, int],
+    assistant_prompt_prefixes: tuple[str, ...],
+    assistant_blocks: _AssistantBlockIndex,
+) -> tuple[int, int]:
+    start, end = span
+    assistant_block = assistant_blocks.bounds(start, end)
+    if assistant_block is None:
+        return span
+    block_start, block_end = assistant_block
+    if not assistant_prompt_prefixes:
+        return block_start, block_end
+    block_text = text[block_start:block_end]
+    matched_prefix = next((prefix for prefix in assistant_prompt_prefixes if block_text.startswith(prefix)), None)
+    fallback_prefix = next((prefix for prefix in _ASSISTANT_BLOCK_START_TOKENS if block_text.startswith(prefix)), None)
+    if matched_prefix is not None:
+        supervised_prefix_length = len(matched_prefix)
+        for reasoning_start_token in _REASONING_START_TOKENS:
+            if matched_prefix.endswith(reasoning_start_token):
+                supervised_prefix_length -= len(reasoning_start_token)
+                break
+        return block_start + supervised_prefix_length, block_end
+    if fallback_prefix is not None:
+        return block_start + len(fallback_prefix), block_end
+    return span
+
+
 def _expand_supervised_spans(
     text: str,
     supervised_spans: list[tuple[int, int]],
     assistant_prompt_prefixes: tuple[str, ...],
     train_on_reasoning: bool,
 ) -> list[tuple[int, int]]:
-    expanded_spans: list[tuple[int, int]] = []
-    for start, end in supervised_spans:
-        assistant_block = _assistant_block_bounds(text, start, end)
-        if assistant_block is None:
-            expanded_spans.append((start, end))
-            continue
-        block_start, block_end = assistant_block
-        if not assistant_prompt_prefixes:
-            expanded_spans.append((block_start, block_end))
-            continue
-        block_text = text[block_start:block_end]
-        matched_prefix = next((prefix for prefix in assistant_prompt_prefixes if block_text.startswith(prefix)), None)
-        fallback_prefix = next((prefix for prefix in _ASSISTANT_BLOCK_START_TOKENS if block_text.startswith(prefix)), None)
-        if matched_prefix is not None:
-            supervised_prefix_length = len(matched_prefix)
-            for reasoning_start_token in _REASONING_START_TOKENS:
-                if matched_prefix.endswith(reasoning_start_token):
-                    supervised_prefix_length -= len(reasoning_start_token)
-                    break
-            expanded_spans.append((block_start + supervised_prefix_length, block_end))
-            continue
-        if fallback_prefix is not None:
-            expanded_spans.append((block_start + len(fallback_prefix), block_end))
-            continue
-        expanded_spans.append((start, end))
+    del train_on_reasoning
+    assistant_blocks = _AssistantBlockIndex.build(text)
+    expanded_spans = [
+        _expand_supervised_span(text, span, assistant_prompt_prefixes, assistant_blocks)
+        for span in supervised_spans
+    ]
     return _merge_spans(expanded_spans)
 
 
@@ -1167,6 +1257,15 @@ def _expand_typed_spans(
     spans: list[dict[str, Any]],
     assistant_prompt_prefixes: tuple[str, ...],
 ) -> list[dict[str, Any]]:
+    span_kinds = {span.get("kind") for span in spans}
+    assistant_blocks = _AssistantBlockIndex.build(text)
+    reasoning_spans = _ContainingSpanIndex.build(_reasoning_spans(text)) if _SPAN_KIND_REASONING in span_kinds else None
+    tool_call_spans = _ContainingSpanIndex.build(_tool_call_spans(text)) if _SPAN_KIND_TOOL_CALL in span_kinds else None
+    tool_response_spans = (
+        _ContainingSpanIndex.build(_tool_response_spans(text))
+        if _SPAN_KIND_TOOL_RESPONSE in span_kinds
+        else None
+    )
     expanded_spans: list[dict[str, Any]] = []
     for span in spans:
         start = span["start"]
@@ -1174,31 +1273,29 @@ def _expand_typed_spans(
         kind = span.get("kind")
         expanded_start, expanded_end = start, end
         if kind in {_SPAN_KIND_REASONING, _SPAN_KIND_FINAL_ANSWER}:
-            expanded = _expand_supervised_spans(
+            expanded_start, expanded_end = _expand_supervised_span(
                 text,
-                [(start, end)],
-                assistant_prompt_prefixes,
-                train_on_reasoning=True,
-            )
-            if expanded:
-                expanded_start, expanded_end = expanded[0]
-            if (expanded_start, expanded_end) == (start, end):
-                if kind == _SPAN_KIND_REASONING:
-                    expanded_start, expanded_end = _expand_span_to_containing_span(
-                        (start, end),
-                        _reasoning_spans(text),
-                    )
-        elif kind == _SPAN_KIND_TOOL_CALL:
-            expanded_start, expanded_end = _expand_span_to_containing_span(
                 (start, end),
-                _tool_call_spans(text),
+                assistant_prompt_prefixes,
+                assistant_blocks,
             )
+            if (
+                kind == _SPAN_KIND_REASONING
+                and reasoning_spans is not None
+                and (expanded_start, expanded_end) == (start, end)
+            ):
+                expanded_start, expanded_end = reasoning_spans.containing((start, end))
+        elif kind == _SPAN_KIND_TOOL_CALL:
+            if tool_call_spans is not None:
+                expanded_start, expanded_end = tool_call_spans.containing((start, end))
             expanded_start, expanded_end = _extend_span_to_following_assistant_end(
                 text,
                 (expanded_start, expanded_end),
+                assistant_blocks,
             )
         elif kind == _SPAN_KIND_TOOL_RESPONSE:
-            expanded_start, expanded_end = _expand_span_to_containing_span((start, end), _tool_response_spans(text))
+            if tool_response_spans is not None:
+                expanded_start, expanded_end = tool_response_spans.containing((start, end))
         updated = dict(span)
         updated["start"] = expanded_start
         updated["end"] = expanded_end
@@ -1510,7 +1607,7 @@ def _span_dicts(spans: list[tuple[int, int]] | list[dict[str, Any]]) -> list[dic
             end = item.get("end")
             if not isinstance(start, int) or not isinstance(end, int) or start >= end:
                 continue
-            span = {"start": start, "end": end}
+            span: dict[str, Any] = {"start": start, "end": end}
             source_start = item.get("source_start", start)
             source_end = item.get("source_end", end)
             if isinstance(source_start, int) and isinstance(source_end, int) and source_start < source_end:
@@ -1751,6 +1848,7 @@ def _resolve_preserved_columns(
 ) -> list[str]:
     if preserve_columns is None or preserve_columns is False:
         return []
+    candidates: tuple[str, ...]
     if preserve_columns is True:
         candidates = DEFAULT_PROVENANCE_COLUMNS
     else:
@@ -2238,6 +2336,7 @@ def _mask_tokenized_row(
         raise TypeError("Trainer dataset row is missing tokenized 'input_ids'.")
     text = row.get(text_column)
     span_metadata = _normalize_span_metadata(row.get(TEICH_SUPERVISED_SPANS_COLUMN))
+    labels: list[int] | None
     if isinstance(text, str) and span_metadata:
         supervised_spans = _select_supervised_spans(
             text,
@@ -2420,7 +2519,12 @@ def mask_data(
 
     text_tokenizer = _resolve_text_tokenizer(tokenizer or getattr(trainer, "processing_class", None) or getattr(trainer, "tokenizer", None))
     trainer_args = getattr(trainer, "args", None)
-    dataset_text_field = text_column or getattr(trainer_args, "dataset_text_field", "text")
+    raw_dataset_text_field = text_column or getattr(trainer_args, "dataset_text_field", "text")
+    dataset_text_field = (
+        raw_dataset_text_field
+        if isinstance(raw_dataset_text_field, str) and raw_dataset_text_field
+        else "text"
+    )
     trainer_max_length = getattr(trainer_args, "max_length", None)
     truncation_mode = getattr(trainer_args, "truncation_mode", None)
     effective_max_supervised_tokens = (

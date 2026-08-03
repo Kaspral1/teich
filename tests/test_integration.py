@@ -1,19 +1,18 @@
 """Integration tests for teich.
 
-These tests require:
-- Docker running
-- OPENAI_API_KEY environment variable set (for live tests)
+The runtime smoke tests require Docker. Provider process seams are mocked, so
+this module does not consume API credits.
 """
 
 import json
 import os
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from teich.config import APIConfig, Config, ModelConfig
+from teich.config import APIConfig, Config, ModelConfig, OutputConfig
 from teich.runner import CodexRunner, RUNTIME_CONTAINER_USER, RUNTIME_IMAGE_NAME
 
 
@@ -26,11 +25,6 @@ def require_docker():
         pytest.skip("Docker not available")
     if docker_info.returncode != 0:
         pytest.skip("Docker not available")
-
-requires_api_key = pytest.mark.skipif(
-    not os.getenv("OPENAI_API_KEY"),
-    reason="OPENAI_API_KEY not set"
-)
 
 requires_runtime_smoke = pytest.mark.skipif(
     os.getenv("TEICH_RUN_DOCKER_RUNTIME_SMOKE") != "1",
@@ -77,10 +71,10 @@ class TestDockerImage:
         assert "chmod +x /usr/local/bin/apt-get /usr/local/bin/apt" in content
         assert "USER codex" in content
 
-    @pytest.mark.slow  # Takes 2-3 minutes, skip by default
+    @requires_runtime_smoke
+    @pytest.mark.slow
     def test_docker_build(self, tmp_path):
         """Test Docker image builds successfully."""
-        pytest.skip("Docker build test - run manually with: pytest tests/test_integration.py::TestDockerImage::test_docker_build -v")
         dockerfile = Path(__file__).parent.parent / "docker" / "codex-runtime.Dockerfile"
 
         result = subprocess.run(
@@ -238,9 +232,8 @@ class TestOpenRouterIntegration:
 @pytest.mark.integration
 @pytest.mark.slow
 @pytest.mark.usefixtures("require_docker")
-@requires_api_key
 class TestEndToEnd:
-    """Full end-to-end tests requiring real API access."""
+    """Controlled end-to-end workflow tests with external process seams mocked."""
 
     def test_full_generation_workflow(self, tmp_path):
         """Test complete workflow: init -> generate -> verify output."""
@@ -251,34 +244,52 @@ class TestEndToEnd:
         config = Config(
             model=ModelConfig(model="codex-mini-latest", approval_mode="none"),
             prompts=["Create a Python hello world script"],
-            output=MagicMock(traces_dir=project_dir / "output"),
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            output=OutputConfig(
+                traces_dir=project_dir / "output",
+                sandbox_dir=project_dir / "sandbox",
+                failures_dir=project_dir / "failures",
+            ),
             timeout_seconds=60,
         )
 
         with patch.object(CodexRunner, '_ensure_image'):
             runner = CodexRunner(config)
 
-        # Create workspace
-        workspace = tmp_path / "workspace"
-        workspace.mkdir()
-
-        # Run session (mocked for unit test, would be real for integration)
-        with patch('subprocess.run') as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-
-            # Mock session file creation
-            session_dir = tmp_path / ".codex" / "sessions"
+        def write_completed_trace(command, *args, **kwargs):
+            mounts = [command[index + 1] for index, item in enumerate(command) if item == "-v"]
+            codex_mount = next(mount for mount in mounts if mount.endswith(":/home/codex/.codex"))
+            session_dir = Path(codex_mount.rsplit(":", maxsplit=1)[0]) / "sessions"
             session_dir.mkdir(parents=True)
-            session_file = session_dir / "test-session.jsonl"
-            session_file.write_text(
-                json.dumps({"type": "session", "id": "test"}) + "\n"
+            rows = [
+                {"type": "session_meta", "payload": {"id": "test", "model_provider": "openai"}},
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Create a Python hello world script"}],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Created hello.py"}],
+                    },
+                },
+            ]
+            (session_dir / "test-session.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
             )
 
-            with patch.object(runner, '_extract_session_file', return_value=project_dir / "output" / "test.jsonl"):
-                result = runner.run_session("Create a Python hello world script", "test")
+        with patch.object(runner, "_run_process", side_effect=write_completed_trace) as run_process:
+            result = runner.run_session("Create a Python hello world script", "test")
 
-        assert result is not None
+        run_process.assert_called_once()
+        assert result.is_file()
+        assert '"role": "assistant"' in result.read_text(encoding="utf-8")
 
 
 # Integration test markers

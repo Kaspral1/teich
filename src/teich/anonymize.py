@@ -286,8 +286,15 @@ class TraceAnonymizer:
         r"(?:(?<![A-Za-z0-9_-])|(?<=\\n))([A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})(?![A-Za-z0-9_-])"
     )
     _bearer_pattern = re.compile(r"(?i)(\bBearer\s+)([A-Za-z0-9._~+/=-]{24,})")
+    # Match an assignment name from the start of the complete identifier, then
+    # decide whether it is sensitive in _replace_generic_secret. The explicit
+    # identifier-character lookbehind is load-bearing: unlike a word boundary,
+    # it cannot restart the match after every '-' in a UUID/tool-call run. Each
+    # identifier is therefore scanned once instead of once per segment.
     _generic_secret_pattern = re.compile(
-        r"(?i)(\b(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|token|secret|password)\b\\?[\"']?[^\S\r\n]*[:=][^\S\r\n]*\\?[\"']?)([A-Za-z0-9_~+/=-]{24,})"
+        r"(?i)(?P<prefix>(?<![A-Za-z0-9_-])(?P<name>[A-Za-z0-9][A-Za-z0-9_-]*)\b"
+        r"\\?[\"']?[^\S\r\n]*[:=][^\S\r\n]*\\?[\"']?)"
+        r"(?P<value>[A-Za-z0-9_~+/=-]{24,})"
     )
     _quoted_assignment_pattern = re.compile(
         r"(?P<prefix>(?<![A-Za-z0-9_.-])(?P<key_quote>[\"']?)(?P<name>[A-Za-z][A-Za-z0-9_.-]{1,120})(?P=key_quote)[ \t]*(?:=|:)[ \t]*)(?P<quote>[\"'])(?P<value>(?:\\.|(?!(?P=quote)).)*)(?P=quote)"
@@ -554,8 +561,6 @@ class TraceAnonymizer:
         "dsn",
         "connection",
     )
-    _jwt_gate = re.compile(r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
-
     def __init__(self) -> None:
         self.counts = {"email": 0, "username": 0, "api_key": 0}
         self._email_map: dict[str, str] = {}
@@ -752,7 +757,10 @@ class TraceAnonymizer:
         for gates, pattern in zip(self._api_key_gates, self._api_key_patterns):
             if any(gate in text for gate in gates):
                 text = pattern.sub(self._replace_prefixed_key, text)
-        if self._jwt_gate.search(text):
+        # A JWT needs at least two separators. Avoid a regex preflight here:
+        # an unanchored greedy first segment turns long hyphenated identifiers
+        # with no dots into a quadratic failed search.
+        if text.count(".") >= 2:
             text = self._jwe_pattern.sub(self._replace_jwt, text)
             text = self._jwt_pattern.sub(self._replace_jwt, text)
         lowered = text.lower()
@@ -860,7 +868,9 @@ class TraceAnonymizer:
         return match.group("prefix") + replacement + suffix
 
     def _replace_generic_secret(self, match: re.Match[str]) -> str:
-        token = match.group(2)
+        token = match.group("value")
+        if not self._is_sensitive_name(match.group("name"), token):
+            return match.group(0)
         if token in self._api_replacements:
             return match.group(0)
         replacement = self._api_key_map.get(token)
@@ -869,7 +879,7 @@ class TraceAnonymizer:
             self._api_key_map[token] = replacement
             self._api_replacements.add(replacement)
         self.counts["api_key"] += 1
-        return match.group(1) + replacement
+        return match.group("prefix") + replacement
 
     def _assignment_secret_replacement(self, name: str, value: str) -> str:
         if self._private_key_block_pattern.search(value):

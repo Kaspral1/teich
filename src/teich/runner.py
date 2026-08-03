@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 import json
@@ -70,6 +70,8 @@ HERMES_TRACE_WRITE_LOCK = threading.Lock()
 CHAT_REQUEST_MAX_ATTEMPTS = 3
 AGENT_TURN_RETRY_LIMIT = 3
 NON_DATA_TRACE_DIR_NAMES = {"partials", "failures"}
+DOCKER_CONTROL_TIMEOUT_SECONDS = 30
+DOCKER_CLEANUP_TIMEOUT_SECONDS = 30
 
 
 def _make_tree_world_writable(path: Path) -> None:
@@ -895,7 +897,8 @@ def completed_prompt_keys_from_outputs(traces_dir: Path, excluded_dirs: list[Pat
         except (OSError, json.JSONDecodeError, ValueError):
             continue
         for example in examples:
-            prompt = example.get("prompt") if isinstance(example.get("prompt"), str) else ""
+            raw_prompt = example.get("prompt")
+            prompt = raw_prompt if isinstance(raw_prompt, str) else ""
             if not prompt.strip():
                 prompt = _prompt_from_training_messages(example.get("messages"))
             if not isinstance(prompt, str) or not prompt.strip():
@@ -1013,6 +1016,16 @@ class DockerRuntimeRunner:
     def _finalize_trace_export(self, trace_path: Path, prompt_input: PromptInput | None = None) -> None:
         return
 
+    def run_session(
+        self,
+        prompt: str,
+        session_id: str | None = None,
+        progress_callback: SessionProgressCallback | None = None,
+        progress_base: SessionProgressUpdate | None = None,
+        prompt_input: PromptInput | None = None,
+    ) -> Path:
+        raise NotImplementedError
+
     @staticmethod
     def _runtime_dockerfile_path() -> Path:
         package_path = Path(__file__).parent / "docker" / RUNTIME_DOCKERFILE_NAME
@@ -1026,6 +1039,7 @@ class DockerRuntimeRunner:
                 ["docker", "image", "inspect", self.image_name, "--format", "{{.Created}}"],
                 capture_output=True,
                 check=True,
+                timeout=DOCKER_CONTROL_TIMEOUT_SECONDS,
                 **TEXT_SUBPROCESS_KWARGS,
             )
         except subprocess.CalledProcessError:
@@ -1049,6 +1063,7 @@ class DockerRuntimeRunner:
                 ["docker", "images", "-q", self.image_name],
                 capture_output=True,
                 check=True,
+                timeout=DOCKER_CONTROL_TIMEOUT_SECONDS,
                 **TEXT_SUBPROCESS_KWARGS,
             )
             if not result.stdout.strip():
@@ -1059,8 +1074,14 @@ class DockerRuntimeRunner:
             dockerfile_mtime = datetime.fromtimestamp(dockerfile_path.stat().st_mtime, tz=timezone.utc)
             if image_created_at is None or image_created_at < dockerfile_mtime:
                 self._build_image()
-        except subprocess.CalledProcessError:
-            self._build_image()
+        except FileNotFoundError as exc:
+            raise RuntimeError("Docker is not installed or is not available on PATH.") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Docker did not respond while Teich checked the runtime image.") from exc
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or "")
+            details = stderr.strip() or str(exc)
+            raise RuntimeError(f"Docker could not inspect the Teich runtime image: {details}") from exc
 
     def _build_image(self) -> None:
         """Build the Docker image."""
@@ -1139,12 +1160,18 @@ class DockerRuntimeRunner:
     def _remove_container(container_name: str | None) -> None:
         if not container_name:
             return
-        subprocess.run(
-            ["docker", "rm", "-f", container_name],
-            capture_output=True,
-            check=False,
-            **TEXT_SUBPROCESS_KWARGS,
-        )
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                capture_output=True,
+                check=False,
+                timeout=DOCKER_CLEANUP_TIMEOUT_SECONDS,
+                **TEXT_SUBPROCESS_KWARGS,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            # Cleanup is best-effort and must not hide the original run error
+            # or hang shutdown indefinitely when Docker is unavailable.
+            return
 
     def _terminate_process(
         self,
@@ -1174,7 +1201,13 @@ class DockerRuntimeRunner:
     @staticmethod
     def _start_container(command: list[str]) -> None:
         try:
-            subprocess.run(command, capture_output=True, check=True, **TEXT_SUBPROCESS_KWARGS)
+            subprocess.run(
+                command,
+                capture_output=True,
+                check=True,
+                timeout=DOCKER_CONTROL_TIMEOUT_SECONDS,
+                **TEXT_SUBPROCESS_KWARGS,
+            )
         except FileNotFoundError as exc:
             if shutil.which(command[0]) is None:
                 raise RuntimeError(
@@ -1186,6 +1219,10 @@ class DockerRuntimeRunner:
             stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or "")
             details = stderr.strip() or stdout.strip() or str(exc)
             raise RuntimeError(f"Failed to start Docker runtime container: {details}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Docker did not start the runtime container within {DOCKER_CONTROL_TIMEOUT_SECONDS} seconds."
+            ) from exc
 
     def _start_tracked_container(self, command: list[str], container_name: str | None) -> None:
         self._register_active_container(container_name)
@@ -1674,7 +1711,7 @@ class DockerRuntimeRunner:
         return None
 
     def _openrouter_usage_from_generation_ids(self, generation_ids: set[str]) -> dict[str, Any] | None:
-        usages = [
+        usages: list[dict[str, Any] | None] = [
             usage
             for generation_id in sorted(generation_ids)
             if (usage := self._openrouter_generation_usage(generation_id)) is not None
@@ -4417,7 +4454,7 @@ class HermesRunner(ExternalCliRunner):
                         final_exports = self._export_completed_hermes_state_sessions(home_dir, workspace, turn_prompts)
                         parsed_session_id = self._parse_hermes_stdout_session_id("\n".join([*stdout_parts, stdout]))
                         destination = (
-                            final_exports.get(parsed_session_id)
+                            (final_exports.get(parsed_session_id) if parsed_session_id else None)
                             or next((path for sid, path in final_exports.items() if sid.startswith(session_id)), None)
                             or next(
                                 (path for sid, path in final_exports.items() if self._trace_has_no_parent(path)),
@@ -4452,7 +4489,7 @@ class HermesRunner(ExternalCliRunner):
                 raise RuntimeError(f"Session {session_id[:8]} failed: Hermes did not write any state.db sessions")
             parsed_session_id = self._parse_hermes_stdout_session_id("\n".join(stdout_parts))
             destination = (
-                final_exports.get(parsed_session_id)
+                (final_exports.get(parsed_session_id) if parsed_session_id else None)
                 or next((path for sid, path in final_exports.items() if sid.startswith(session_id)), None)
                 or next(
                     (path for sid, path in final_exports.items() if self._trace_has_no_parent(path)),
@@ -4501,6 +4538,37 @@ class ChatRunner(DockerRuntimeRunner):
     def __init__(self, config: Config):
         self.config = config
         self.image_name = RUNTIME_IMAGE_NAME
+        self._chat_cancel_events: dict[int, threading.Event] = {}
+        self._chat_cancel_lock = threading.Lock()
+
+    def _register_chat_cancel_event(self, cancel_event: threading.Event) -> None:
+        thread_id = threading.get_ident()
+        with self._chat_cancel_lock:
+            self._chat_cancel_events[thread_id] = cancel_event
+
+    def _unregister_chat_cancel_event(self) -> None:
+        thread_id = threading.get_ident()
+        with self._chat_cancel_lock:
+            self._chat_cancel_events.pop(thread_id, None)
+
+    def _chat_batch_cancelled(self) -> bool:
+        thread_id = threading.get_ident()
+        with self._chat_cancel_lock:
+            cancel_event = self._chat_cancel_events.get(thread_id)
+        return cancel_event is not None and cancel_event.is_set()
+
+    def _raise_if_chat_batch_cancelled(self) -> None:
+        if self._chat_batch_cancelled():
+            raise RuntimeError("Chat batch was cancelled before this response could be saved.")
+
+    def _terminate_active_processes(self) -> None:
+        # Chat requests run in Python worker threads rather than child
+        # processes. Signal every live batch so it stops before another API
+        # turn or output write once the in-flight socket call returns.
+        with self._chat_cancel_lock:
+            cancel_events = list(self._chat_cancel_events.values())
+        for cancel_event in cancel_events:
+            cancel_event.set()
 
     def _default_base_url(self) -> str:
         provider = self.config.api.provider.strip().lower()
@@ -4597,29 +4665,37 @@ class ChatRunner(DockerRuntimeRunner):
         if isinstance(payload, dict):
             summary = payload.get("summary")
             if isinstance(summary, list):
-                parts = [
-                    item.get("text", "").strip()
-                    for item in summary
-                    if isinstance(item, dict) and isinstance(item.get("text"), str) and item.get("text").strip()
-                ]
+                parts: list[str] = []
+                for item in summary:
+                    if not isinstance(item, dict):
+                        continue
+                    item_text = item.get("text")
+                    if isinstance(item_text, str) and item_text.strip():
+                        parts.append(item_text.strip())
                 if parts:
                     return "\n\n".join(parts)
             text = payload.get("text")
             if isinstance(text, str) and text.strip():
                 return text.strip()
         if isinstance(payload, list):
-            parts = [
+            reasoning_candidates = [
                 ChatRunner._extract_reasoning_text(item)
                 for item in payload
             ]
-            merged = [part for part in parts if isinstance(part, str) and part.strip()]
+            merged = [
+                part
+                for part in reasoning_candidates
+                if isinstance(part, str) and part.strip()
+            ]
             if merged:
                 return "\n\n".join(merged)
         return None
 
     def _parse_chat_response(self, payload: dict[str, Any]) -> tuple[str, str | None, dict[str, Any] | None, str]:
-        model = payload.get("model") if isinstance(payload.get("model"), str) and payload.get("model") else self.config.get_effective_model()
-        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+        raw_model = payload.get("model")
+        model = raw_model if isinstance(raw_model, str) and raw_model else self.config.get_effective_model()
+        raw_usage = payload.get("usage")
+        usage = raw_usage if isinstance(raw_usage, dict) else None
         if self._wire_api() in {"completions", "chat_completions", "chat-completions", "openai-completions"}:
             choices = payload.get("choices")
             if not isinstance(choices, list) or not choices:
@@ -4662,12 +4738,18 @@ class ChatRunner(DockerRuntimeRunner):
             return None
         input_tokens = TraceMetrics._int_value(usage.get("input") or usage.get("prompt_tokens") or usage.get("input_tokens"))
         output_tokens = TraceMetrics._int_value(usage.get("output") or usage.get("completion_tokens") or usage.get("output_tokens"))
+        output_token_details = usage.get("output_tokens_details")
+        if not isinstance(output_token_details, dict):
+            output_token_details = {}
+        completion_token_details = usage.get("completion_tokens_details")
+        if not isinstance(completion_token_details, dict):
+            completion_token_details = {}
         reasoning_tokens = TraceMetrics._int_value(
             usage.get("reasoning")
             or usage.get("reasoning_tokens")
             or usage.get("reasoning_output_tokens")
-            or (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
-            or (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+            or output_token_details.get("reasoning_tokens")
+            or completion_token_details.get("reasoning_tokens")
         )
         prompt_token_details = usage.get("prompt_tokens_details")
         if not isinstance(prompt_token_details, dict):
@@ -4682,11 +4764,13 @@ class ChatRunner(DockerRuntimeRunner):
             or prompt_token_details.get("cache_write_tokens")
         )
         total_tokens = TraceMetrics._int_value(usage.get("totalTokens") or usage.get("total_tokens"))
-        normalized = {
+        normalized: dict[str, Any] = {
             "input": input_tokens,
             "output": output_tokens,
             "reasoning": reasoning_tokens,
-            "totalTokens": total_tokens or (input_tokens + output_tokens + reasoning_tokens),
+            # OpenAI-compatible APIs report reasoning as a subset of output
+            # tokens. Do not count that subset twice when total_tokens is absent.
+            "totalTokens": total_tokens or (input_tokens + output_tokens),
         }
         if cache_read_tokens:
             normalized["cacheRead"] = cache_read_tokens
@@ -4785,6 +4869,7 @@ class ChatRunner(DockerRuntimeRunner):
         history: list[dict[str, str]] | None = None,
         system_prompt: str | None = None,
     ) -> tuple[str, str | None, dict[str, Any] | None, str]:
+        self._raise_if_chat_batch_cancelled()
         body = self._chat_request_body(prompt, history, system_prompt)
         request = Request(
             self._chat_endpoint(),
@@ -4802,6 +4887,7 @@ class ChatRunner(DockerRuntimeRunner):
             raise RuntimeError(f"Chat request failed: {exc.reason}") from exc
         except json.JSONDecodeError as exc:
             raise RuntimeError("Chat request returned invalid JSON.") from exc
+        self._raise_if_chat_batch_cancelled()
         payload = self._raise_for_chat_api_error(payload)
         content, thinking, usage, model = self._parse_chat_response(payload)
         if not content and not thinking:
@@ -4872,9 +4958,12 @@ class ChatRunner(DockerRuntimeRunner):
         return row
 
     @staticmethod
-    def _merge_usage_totals(usages: list[dict[str, Any] | None]) -> dict[str, Any] | None:
-        normalized_usages = [ChatRunner._normalize_usage(usage) for usage in usages if isinstance(usage, dict)]
-        normalized_usages = [usage for usage in normalized_usages if usage is not None]
+    def _merge_usage_totals(usages: Sequence[dict[str, Any] | None]) -> dict[str, Any] | None:
+        normalized_usages: list[dict[str, Any]] = []
+        for usage in usages:
+            normalized_usage = ChatRunner._normalize_usage(usage)
+            if normalized_usage is not None:
+                normalized_usages.append(normalized_usage)
         if not normalized_usages:
             return None
         totals: dict[str, Any] = {
@@ -4910,7 +4999,7 @@ class ChatRunner(DockerRuntimeRunner):
                     if isinstance(generation_id, str) and generation_id.strip()
                 )
         if not totals["totalTokens"]:
-            totals["totalTokens"] = totals["input"] + totals["output"] + totals["reasoning"]
+            totals["totalTokens"] = totals["input"] + totals["output"]
         if cache_read_tokens:
             totals["cacheRead"] = cache_read_tokens
         if cache_write_tokens:
@@ -5212,7 +5301,8 @@ class ChatRunner(DockerRuntimeRunner):
             responses.append(content)
             usages.append(usage)
 
-        metadata = existing_row.get("metadata") if isinstance(existing_row.get("metadata"), dict) else {}
+        raw_metadata = existing_row.get("metadata")
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
         metadata = {
             **metadata,
             "trace_type": "chat",
@@ -5240,8 +5330,10 @@ class ChatRunner(DockerRuntimeRunner):
         append_lock: threading.Lock | None,
     ) -> dict[str, Any]:
         training_row = self._request_chat_conversation(prompt_input)
+        self._raise_if_chat_batch_cancelled()
         if append_lock is not None:
             with append_lock:
+                self._raise_if_chat_batch_cancelled()
                 rows = self._read_chat_training_rows(destination)
                 if not self._chat_rows_include_completed_prompt(rows, prompt_input):
                     self._append_chat_training_row(destination, training_row)
@@ -5435,15 +5527,19 @@ class ChatRunner(DockerRuntimeRunner):
                             datetime.now(timezone.utc),
                             time.monotonic() + self.config.timeout_seconds,
                         )
-                    self._run_chat_prompt_task(
-                        f"prompt-{prompt_index}",
-                        prompt_index,
-                        total_prompts,
-                        prompt_input,
-                        destination,
-                        progress_callback,
-                        append_lock,
-                    )
+                    self._register_chat_cancel_event(stop_event)
+                    try:
+                        self._run_chat_prompt_task(
+                            f"prompt-{prompt_index}",
+                            prompt_index,
+                            total_prompts,
+                            prompt_input,
+                            destination,
+                            progress_callback,
+                            append_lock,
+                        )
+                    finally:
+                        self._unregister_chat_cancel_event()
                 except Exception as exc:
                     with error_lock:
                         errors.append(exc)
@@ -5466,6 +5562,7 @@ class ChatRunner(DockerRuntimeRunner):
                     for prompt_index, (prompt_input, started_at, deadline) in running.items():
                         if now >= deadline:
                             timed_out = (prompt_index, prompt_input, started_at)
+                            stop_event.set()
                             break
                 if timed_out is not None:
                     prompt_index, prompt_input, started_at = timed_out
@@ -5475,7 +5572,6 @@ class ChatRunner(DockerRuntimeRunner):
                     )
                     with error_lock:
                         errors.append(error)
-                    stop_event.set()
                     if progress_callback:
                         progress_callback(
                             SessionProgressUpdate(

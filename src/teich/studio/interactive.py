@@ -31,6 +31,7 @@ from typing import Any
 
 from ..config import Config, PromptInput
 from ..runner import (
+    DOCKER_CLEANUP_TIMEOUT_SECONDS,
     HERMES_DEFAULT_TOOLSETS,
     PI_SESSIONS_DIR_IN_CONTAINER,
     RUNTIME_CONTAINER_USER,
@@ -99,11 +100,15 @@ def _terminate(process: subprocess.Popen | None) -> None:
 def _remove_container(container_name: str | None) -> None:
     if not container_name:
         return
-    subprocess.run(
-        ["docker", "rm", "-f", container_name],
-        capture_output=True,
-        **TEXT_SUBPROCESS_KWARGS,
-    )
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            capture_output=True,
+            timeout=DOCKER_CLEANUP_TIMEOUT_SECONDS,
+            **TEXT_SUBPROCESS_KWARGS,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return
 
 
 class TerminalBridge:
@@ -580,10 +585,7 @@ class InteractiveSession:
         model = self._chat_model or self.config.get_effective_model()
         row: dict[str, Any] = {
             "messages": self._chat_messages,
-            "prompt": self.turn_prompts[0],
             "follow_up_prompts": self.turn_prompts[1:],
-            "thinking": "\n\n".join(thinking_parts) or None,
-            "response": responses[-1] if responses else "",
             "responses": responses,
             "model": model,
             "provider": self.config.api.provider,
@@ -596,6 +598,10 @@ class InteractiveSession:
                 "interactive": True,
             },
         }
+        if len(self.turn_prompts) == 1:
+            row["prompt"] = self.turn_prompts[0]
+            row["thinking"] = "\n\n".join(thinking_parts) or None
+            row["response"] = responses[-1] if responses else ""
         if self.system:
             row["system"] = self.system
         return row

@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from teich.cli import _configure_studio_event_loop_policy
 from teich.config import Config
 from teich.extract import CURSOR_EXTRACTION_NOTICE
-from teich.runner import ClaudeCodeRunner, SessionProgressUpdate
+from teich.runner import ChatRunner, ClaudeCodeRunner, SessionProgressUpdate
 from teich.studio.events import summarize_chat_row, summarize_event, summarize_trace_events
 from teich.studio.generation import RUNNER_CLASSES, GenerationJob
 from teich.studio.interactive import (
@@ -686,6 +686,63 @@ def test_dataset_row_update_replaces_structured_jsonl_line(client):
     assert rows[1] == updated
 
 
+def test_dataset_row_delete_removes_metadata_with_final_structured_row(client):
+    output_dir = client.project_dir / "output"
+    output_dir.mkdir()
+    trace = output_dir / "row.jsonl"
+    trace.write_text(
+        json.dumps({"prompt": "remove me", "response": "removed"}) + "\n",
+        encoding="utf-8",
+    )
+    metadata = trace.with_suffix(".metadata.json")
+    metadata.write_text(json.dumps({"session_id": "row"}), encoding="utf-8")
+
+    response = client.delete("/api/dataset-preview/rows/0")
+
+    assert response.status_code == 200
+    assert response.json()["mode"] == "line"
+    assert not trace.exists()
+    assert not metadata.exists()
+
+
+def test_dataset_row_edits_preserve_rows_beyond_previous_read_limit(client):
+    output_dir = client.project_dir / "output"
+    output_dir.mkdir()
+    trace = output_dir / "large-rows.jsonl"
+    original_rows = [
+        {
+            "prompt": f"prompt {index}",
+            "response": f"response {index}",
+        }
+        for index in range(5_002)
+    ]
+    trace.write_text(
+        "\n".join(json.dumps(row) for row in original_rows) + "\n",
+        encoding="utf-8",
+    )
+    updated = {
+        "prompt": "updated prompt",
+        "response": "updated response",
+        "metadata": {"source_file": "large-rows.jsonl", "source_line": 1},
+    }
+
+    update_response = client.put("/api/dataset-preview/rows/0", json={"row": updated})
+
+    assert update_response.status_code == 200
+    rows_after_update = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    assert len(rows_after_update) == 5_002
+    assert rows_after_update[0] == updated
+    assert rows_after_update[-1] == original_rows[-1]
+
+    delete_response = client.delete("/api/dataset-preview/rows/0")
+
+    assert delete_response.status_code == 200
+    rows_after_delete = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    assert len(rows_after_delete) == 5_001
+    assert rows_after_delete[0] == original_rows[1]
+    assert rows_after_delete[-1] == original_rows[-1]
+
+
 def test_dataset_row_edit_and_delete_refuse_malformed_backing_jsonl(client):
     output_dir = client.project_dir / "output"
     output_dir.mkdir()
@@ -934,6 +991,32 @@ def test_chat_session_discard_rejected_while_turn_running(tmp_path):
         session.discard()
 
     assert session.status == "running"
+
+
+def test_interactive_multiturn_chat_row_omits_single_turn_compatibility_columns(tmp_path):
+    config = Config(
+        agent={"provider": "chat"},
+        model={"model": "test/model"},
+        api={"provider": "openai", "base_url": "https://api.openai.com/v1"},
+        output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"},
+    )
+    session = InteractiveSession(config)
+    session.turn_prompts = ["Build it", "Now test it"]
+    session._chat_messages = [
+        {"role": "user", "content": "Build it", "thinking": None},
+        {"role": "assistant", "content": "Built", "thinking": "plan"},
+        {"role": "user", "content": "Now test it", "thinking": None},
+        {"role": "assistant", "content": "Tested", "thinking": "verify"},
+    ]
+    session._chat_usages = []
+    session._chat_model = "test/model"
+    session._runner = ChatRunner(config)
+
+    row = session._chat_training_row()
+
+    assert {"prompt", "thinking", "response"}.isdisjoint(row)
+    assert row["follow_up_prompts"] == ["Now test it"]
+    assert row["responses"] == ["Built", "Tested"]
 
 
 def test_windows_terminal_bridge_suppresses_host_console():

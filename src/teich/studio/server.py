@@ -738,8 +738,10 @@ def create_app(project_dir: Path) -> FastAPI:
 
     def _dataset_root(path: str | None = None) -> tuple[Path, str | None]:
         data = state.read_config_data()
-        output = data.get("output") if isinstance(data.get("output"), dict) else {}
-        publish = data.get("publish") if isinstance(data.get("publish"), dict) else {}
+        raw_output = data.get("output")
+        output = raw_output if isinstance(raw_output, dict) else {}
+        raw_publish = data.get("publish")
+        publish = raw_publish if isinstance(raw_publish, dict) else {}
         root_value = (path or "").strip() or str(output.get("traces_dir") or "./output")
         root = state.resolve_path(Path(root_value).expanduser())
         repo_id = publish.get("repo_id") if isinstance(publish.get("repo_id"), str) else None

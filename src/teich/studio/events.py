@@ -122,13 +122,13 @@ def _summarize_codex(event: dict[str, Any]) -> list[dict[str, Any]]:
     if event_type == "event_msg":
         msg_type = payload.get("type")
         if msg_type == "agent_message":
-            text = payload.get("message")
-            if isinstance(text, str) and text.strip():
-                return [display_event("assistant", text)]
+            message_text = payload.get("message")
+            if isinstance(message_text, str) and message_text.strip():
+                return [display_event("assistant", message_text)]
         elif msg_type == "agent_reasoning":
-            text = payload.get("text")
-            if isinstance(text, str) and text.strip():
-                return [display_event("thinking", text)]
+            reasoning_text = payload.get("text")
+            if isinstance(reasoning_text, str) and reasoning_text.strip():
+                return [display_event("thinking", reasoning_text)]
         elif msg_type == "task_started":
             return [display_event("status", "Agent started working…")]
         elif msg_type in {"exec_command_begin", "exec_command_end"}:
@@ -137,9 +137,9 @@ def _summarize_codex(event: dict[str, Any]) -> list[dict[str, Any]]:
                 command_text = " ".join(command) if isinstance(command, list) else str(command)
                 return [display_event("tool_call", command_text, name="shell")]
         elif msg_type == "error":
-            text = payload.get("message")
-            if isinstance(text, str) and text.strip():
-                return [display_event("error", text)]
+            error_text = payload.get("message")
+            if isinstance(error_text, str) and error_text.strip():
+                return [display_event("error", error_text)]
         return []
     return []
 

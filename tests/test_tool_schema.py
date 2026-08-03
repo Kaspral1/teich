@@ -1,11 +1,28 @@
-from unittest.mock import patch
+import json
+import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from teich.config import Config, MCPConfig
 import pytest
 from datasets import Dataset
 
 from teich import prepare_data
-from teich.tool_schema import snapshot_configured_tools, snapshot_mcp_tools, validate_tool_calls
+from teich.tool_schema import _stdio_mcp_request, snapshot_configured_tools, snapshot_mcp_tools, validate_tool_calls
+
+
+def test_stdio_mcp_request_times_out_when_server_never_responds():
+    release = threading.Event()
+    process = SimpleNamespace(
+        stdin=MagicMock(),
+        stdout=SimpleNamespace(readline=lambda: release.wait(timeout=1) and ""),
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="did not respond within"):
+            _stdio_mcp_request(process, {"id": 1}, "hung", timeout_sec=0.02)
+    finally:
+        release.set()
 
 
 class TinyChatTokenizer:
@@ -196,6 +213,28 @@ def test_snapshot_mcp_tools_normalizes_schema_and_applies_filters():
         tools = snapshot_mcp_tools(mcp)
 
     assert [tool["function"]["name"] for tool in tools] == ["files.read"]
+
+
+def test_http_mcp_uses_startup_and_tool_timeouts_for_their_respective_requests():
+    mcp = MCPConfig(
+        name="remote",
+        url="https://mcp.example.test",
+        startup_timeout_sec=3,
+        tool_timeout_sec=7,
+    )
+    initialize_response = MagicMock()
+    initialize_response.__enter__.return_value = initialize_response
+    initialize_response.read.return_value = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}).encode()
+    tools_response = MagicMock()
+    tools_response.__enter__.return_value = tools_response
+    tools_response.read.return_value = json.dumps(
+        {"jsonrpc": "2.0", "id": 2, "result": {"tools": []}}
+    ).encode()
+
+    with patch("teich.tool_schema.urlopen", side_effect=[initialize_response, tools_response]) as mock_urlopen:
+        assert snapshot_mcp_tools(mcp) == []
+
+    assert [call.kwargs["timeout"] for call in mock_urlopen.call_args_list] == [3, 7]
 
 
 def test_validate_tool_calls_checks_declared_names_and_required_arguments():

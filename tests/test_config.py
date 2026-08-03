@@ -31,6 +31,18 @@ def test_default_config():
     ]
 
 
+@pytest.mark.parametrize("field", ["startup_timeout_sec", "tool_timeout_sec"])
+def test_mcp_timeouts_must_be_positive(field: str):
+    with pytest.raises(ValueError):
+        MCPConfig(name="server", command="server", **{field: 0})
+
+
+@pytest.mark.parametrize("timeout_seconds", [0, -1])
+def test_session_timeout_must_be_positive(timeout_seconds: int):
+    with pytest.raises(ValueError):
+        Config(timeout_seconds=timeout_seconds)
+
+
 def test_config_from_yaml(tmp_path: Path, monkeypatch):
     """Test loading config from YAML."""
     # Clear env vars that would override YAML values

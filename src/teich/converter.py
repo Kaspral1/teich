@@ -1510,7 +1510,11 @@ def _merge_schemas(schemas: list[dict[str, Any]]) -> dict[str, Any]:
     if schema_types == {"object"}:
         return _merge_object_schemas(unique)
     if schema_types == {"array"}:
-        item_schemas = [schema.get("items") for schema in unique if isinstance(schema.get("items"), dict)]
+        item_schemas: list[dict[str, Any]] = []
+        for schema in unique:
+            items = schema.get("items")
+            if isinstance(items, dict):
+                item_schemas.append(items)
         merged: dict[str, Any] = {"type": "array"}
         if item_schemas:
             merged["items"] = _merge_schemas(item_schemas)
@@ -2250,18 +2254,18 @@ def _claude_context_from_system_event(event: dict[str, Any]) -> str | None:
     if subtype in {None, "local_command", "turn_duration"}:
         return None
     if subtype == "stop_hook_summary":
-        content = _claude_string_list(event.get("hookAdditionalContext"))
-        if content:
-            return "Claude Code stop hook context:\n" + "\n".join(content)
+        hook_context = _claude_string_list(event.get("hookAdditionalContext"))
+        if hook_context:
+            return "Claude Code stop hook context:\n" + "\n".join(hook_context)
         return None
-    content = event.get("content")
-    if not isinstance(content, str) or not content.strip():
+    event_content = event.get("content")
+    if not isinstance(event_content, str) or not event_content.strip():
         return None
     if subtype == "away_summary":
-        return "Claude Code away summary:\n" + content.strip()
+        return "Claude Code away summary:\n" + event_content.strip()
     if subtype == "informational":
-        return "Claude Code notice:\n" + content.strip()
-    return f"Claude Code system event ({subtype}):\n{content.strip()}"
+        return "Claude Code notice:\n" + event_content.strip()
+    return f"Claude Code system event ({subtype}):\n{event_content.strip()}"
 
 
 def _append_claude_system_context(
@@ -2414,9 +2418,9 @@ def _convert_claude_code_trace_to_training_example(
                             tool_names.add(tool_name)
                             tool_schemas.setdefault(tool_name, _claude_deferred_tool_schema(tool_name))
                         elif isinstance(tool, dict):
-                            name = tool.get("name")
-                            if isinstance(name, str) and name.strip():
-                                tool_name = name.strip()
+                            definition_name = tool.get("name")
+                            if isinstance(definition_name, str) and definition_name.strip():
+                                tool_name = definition_name.strip()
                                 tool_names.add(tool_name)
                                 schema = _claude_code_tool_schema_from_definition(tool)
                                 if schema:
@@ -2495,24 +2499,24 @@ def _convert_claude_code_trace_to_training_example(
                     if not isinstance(block, dict) or block.get("type") != "tool_use":
                         continue
                     tool_call_id = block.get("id")
-                    tool_name = block.get("name")
-                    if not isinstance(tool_call_id, str) or not isinstance(tool_name, str):
+                    block_tool_name = block.get("name")
+                    if not isinstance(tool_call_id, str) or not isinstance(block_tool_name, str):
                         continue
-                    if not tool_call_id or not tool_name:
+                    if not tool_call_id or not block_tool_name:
                         continue
                     arguments = _normalize_json_like_value(block.get("input") or {})
-                    tool_names.add(tool_name)
+                    tool_names.add(block_tool_name)
                     tool_schemas.setdefault(
-                        tool_name,
-                        _claude_deferred_tool_schema(tool_name, include_parameters=False),
+                        block_tool_name,
+                        _claude_deferred_tool_schema(block_tool_name, include_parameters=False),
                     )
-                    tool_argument_samples.setdefault(tool_name, []).append(arguments)
+                    tool_argument_samples.setdefault(block_tool_name, []).append(arguments)
                     tool_calls.append(
                         {
                             "id": tool_call_id,
                             "type": "function",
                             "function": {
-                                "name": tool_name,
+                                "name": block_tool_name,
                                 "arguments": arguments,
                             },
                         }
@@ -3030,14 +3034,14 @@ def _hermes_conversation_to_events(conversation: Any) -> list[dict[str, Any]]:
                         },
                     }
                 )
-            event: dict[str, Any] = {"role": "assistant", "content": content}
+            message_event: dict[str, Any] = {"role": "assistant", "content": content}
             if thinking_blocks:
-                event["reasoning_content"] = "\n\n".join(block for block in thinking_blocks if block)
+                message_event["reasoning_content"] = "\n\n".join(block for block in thinking_blocks if block)
             if tool_calls:
-                event["tool_calls"] = tool_calls
+                message_event["tool_calls"] = tool_calls
             if timestamp:
-                event["timestamp"] = timestamp
-            events.append(event)
+                message_event["timestamp"] = timestamp
+            events.append(message_event)
     return events
 
 
@@ -3504,15 +3508,15 @@ def _convert_codex_trace_to_training_example(
                 else:
                     assistant_message["tool_calls"] = [tool_call]
             else:
-                assistant_message: dict[str, Any] = {
+                new_assistant_message: dict[str, Any] = {
                     "role": "assistant",
                     "content": "",
                     "tool_calls": [tool_call],
                 }
                 if pending_reasoning_parts:
-                    assistant_message["reasoning_content"] = "\n\n".join(pending_reasoning_parts)
+                    new_assistant_message["reasoning_content"] = "\n\n".join(pending_reasoning_parts)
                     pending_reasoning_parts = []
-                messages.append(assistant_message)
+                messages.append(new_assistant_message)
             continue
 
         if payload_type == "function_call_output":
@@ -3923,8 +3927,10 @@ def _structured_training_example_from_row(
         if assistant_message["content"] or "reasoning_content" in assistant_message:
             messages.append(assistant_message)
     raw_tools = row.get("tools") if isinstance(row.get("tools"), list) else []
-    prompt = row.get("prompt") if isinstance(row.get("prompt"), str) else _prompt_from_messages(messages)
-    metadata = dict(row.get("metadata")) if isinstance(row.get("metadata"), dict) else {}
+    raw_prompt = row.get("prompt")
+    prompt = raw_prompt if isinstance(raw_prompt, str) else _prompt_from_messages(messages)
+    raw_metadata = row.get("metadata")
+    metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
     if isinstance(row.get("model"), str) and row.get("model"):
         metadata.setdefault("model", row["model"])
     if isinstance(row.get("provider"), str) and row.get("provider"):
@@ -3940,7 +3946,9 @@ def _structured_training_example_from_row(
         "trace_type",
         "chat" if any(key in row for key in ("system", "thinking", "response", "model")) and not raw_tools else "structured",
     )
-    tools = _merge_tools_with_builtin_trace_tools(raw_tools, metadata.get("trace_type"))
+    raw_trace_type = metadata.get("trace_type")
+    trace_type = raw_trace_type if isinstance(raw_trace_type, str) else None
+    tools = _merge_tools_with_builtin_trace_tools(raw_tools, trace_type)
     if first_message_timestamp:
         metadata.setdefault(FIRST_MESSAGE_TIMESTAMP_METADATA_KEY, first_message_timestamp)
     return TrainingExample(
