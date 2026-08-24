@@ -115,3 +115,13 @@ def test_teich_example_has_single_safe_training_flow():
     assert sum(isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "train" for node in ast.walk(tree)) == 1
 
 
+def test_gemma4_example_uses_live_remote_template_and_safe_masks():
+    source = Path("gemma4_example.py").read_text(encoding="utf-8")
+
+    assert 'os.environ.setdefault("UNSLOTH_RETURN_LOGITS", "1")' in source
+    assert 'MODEL_REVISION = os.environ.get("MODEL_REVISION", "main")' in source
+    assert 'CHAT_TEMPLATE_PATH = os.environ.get("CHAT_TEMPLATE_PATH")' in source
+    assert 'or "gemma-template.jinja"' not in source
+    assert "token=HF_TOKEN or None" in source
+    assert 'oversized_policy="trim_followups"' in source
+    assert "processing_class=tokenizer" in source

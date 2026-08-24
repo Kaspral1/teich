@@ -1101,11 +1101,12 @@ def test_prepare_and_mask_can_exclude_reasoning_from_gemma_style_supervision():
     row = training_data[0]
     assert row["text"] == "<bos><|turn>user\nhello<turn|>\n<|turn>model\n<|channel>thought\nthink\n<channel|>world<turn|>\n"
     supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
-    assert supervised_text == "world"
+    assert supervised_text == "world<turn|>"
     masked_text = tokenizer.decode(
         [token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100]
     )
     assert "<|channel>thought\nthink\n<channel|>" in masked_text
+    assert "<turn|>" not in masked_text.rsplit("<|turn>model\n", 1)[-1]
 
 
 def test_prepare_and_mask_falls_back_when_gemma_drops_marker_boundaries_with_thinking_disabled():
@@ -1139,7 +1140,7 @@ def test_prepare_and_mask_falls_back_when_gemma_drops_marker_boundaries_with_thi
 
     row = training_data[0]
     supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
-    assert supervised_text == "world"
+    assert supervised_text == "world<turn|>"
 
 
 def test_prepare_data_rejects_reserved_chat_template_kwargs():

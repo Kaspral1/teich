@@ -11,6 +11,8 @@ from teich import mask_data, prepare_data
 
 TOKENIZER_SMOKE_MODELS = [
     pytest.param("unsloth/Qwen3.5-0.8B", {"enable_thinking": True}, id="unsloth-qwen3.5"),
+    pytest.param("google/gemma-4-E4B-it", {"enable_thinking": True}, id="gemma-4-e4b-it"),
+    pytest.param("google/gemma-4-26B-A4B-it", {"enable_thinking": True}, id="gemma-4-26b-a4b-it"),
     pytest.param("google/gemma-4-31B-it", {"enable_thinking": True}, id="gemma-4-31b-it"),
 ]
 
@@ -71,7 +73,7 @@ def test_real_tokenizer_prepare_and_mask_tool_dataset(model_id: str, chat_templa
     try:
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     except Exception as exc:
-        pytest.skip(f"Could not load tokenizer for {model_id}: {exc}")
+        pytest.fail(f"Could not load tokenizer for {model_id}: {exc}")
 
     prepared = prepare_data(
         _tool_call_dataset(),
@@ -107,3 +109,19 @@ def test_real_tokenizer_prepare_and_mask_tool_dataset(model_id: str, chat_templa
     assert "Found project files." in supervised_text
     assert "SECRET_TOOL_OUTPUT" not in supervised_text
     assert "SECRET_TOOL_OUTPUT" in masked_text
+
+    if model_id.startswith("google/gemma-4-"):
+        eot_token_id = tokenizer.convert_tokens_to_ids("<turn|>")
+        assert eot_token_id in supervised_ids
+        assert supervised_text.endswith("<turn|>")
+
+        source_row = _tool_call_dataset()[0]
+        generation_messages = source_row["messages"][:-1]
+        generation_prompt = tokenizer.apply_chat_template(
+            generation_messages,
+            tools=source_row["tools"],
+            tokenize=False,
+            add_generation_prompt=True,
+            **chat_template_kwargs,
+        )
+        assert generation_prompt.endswith("<|channel>thought\n")

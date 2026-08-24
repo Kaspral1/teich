@@ -585,7 +585,10 @@ def _gemma_like_supervised_spans(text: str) -> list[tuple[int, int]]:
         block_end = turn_matches[index + 1].start() if index + 1 < len(turn_matches) else len(text)
         turn_end = text.find(_GEMMA_TURN_END, block_start, block_end)
         if turn_end >= 0:
-            block_end = turn_end
+            # The model emits <turn|> to terminate a completed response. Keep
+            # that token in the target so response-only SFT still teaches the
+            # live Gemma 4 stopping contract.
+            block_end = turn_end + len(_GEMMA_TURN_END)
         supervised_start = block_start + len(_GEMMA_ASSISTANT_TURN_PREFIX)
         if supervised_start < block_end:
             supervised_spans.append((supervised_start, block_end))
@@ -1387,7 +1390,29 @@ def _select_supervised_spans(
         selected = _subtract_spans(selected, _source_spans_for_kind(spans, _SPAN_KIND_SYSTEM))
     if not train_on_developer:
         selected = _subtract_spans(selected, _source_spans_for_kind(spans, _SPAN_KIND_DEVELOPER))
-    return _merge_spans(selected)
+    selected = _merge_spans(selected)
+
+    # A Gemma turn terminator is useful only when the same model turn still
+    # contains an enabled training target. For example, excluding reasoning
+    # from a reasoning-only response must not keep the row alive solely by
+    # labeling its trailing <turn|> token.
+    orphaned_turn_ends: list[tuple[int, int]] = []
+    turn_matches = list(_GEMMA_TURN_START_PATTERN.finditer(text))
+    for index, match in enumerate(turn_matches):
+        if match.group(1) != "model":
+            continue
+        block_end = turn_matches[index + 1].start() if index + 1 < len(turn_matches) else len(text)
+        turn_end = text.find(_GEMMA_TURN_END, match.end(), block_end)
+        if turn_end < 0:
+            continue
+        has_selected_content = any(
+            text[max(start, match.end()) : min(end, turn_end)].strip()
+            for start, end in selected
+            if start < turn_end and end > match.end()
+        )
+        if not has_selected_content:
+            orphaned_turn_ends.append((turn_end, turn_end + len(_GEMMA_TURN_END)))
+    return _subtract_spans(selected, orphaned_turn_ends)
 
 
 def _labels_from_offsets(
