@@ -885,17 +885,6 @@ def _gemma_like_supervised_spans(text: str) -> list[tuple[int, int]]:
     return _subtract_spans(supervised_spans, tool_response_spans)
 
 
-def _is_gemma_turn_end_only_span(text: str, span: tuple[int, int]) -> bool:
-    start, end = span
-    value = text[start:end].strip()
-    while value.startswith(_GEMMA_ASSISTANT_TURN_PREFIX):
-        value = value[len(_GEMMA_ASSISTANT_TURN_PREFIX):].lstrip()
-    empty_thought = _GEMMA_THOUGHT_PREFIX + _GEMMA_THOUGHT_END
-    if value.startswith(empty_thought):
-        value = value[len(empty_thought):].lstrip()
-    return value == _GEMMA_TURN_END
-
-
 def _tool_response_spans(text: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     for start_token, end_token in _TOOL_RESPONSE_DELIMITERS:
@@ -1914,27 +1903,6 @@ def _supervised_text_and_spans(
         )
         if inferred_spans:
             return formatted_text, _span_dicts(inferred_spans)
-    gemma_spans = _gemma_like_supervised_spans(formatted_text)
-    if gemma_spans:
-        gemma_spans = _subtract_spans(gemma_spans, _tool_call_spans(formatted_text))
-        gemma_spans = _subtract_spans(gemma_spans, _tool_response_spans(formatted_text))
-        gemma_spans = _subtract_spans(gemma_spans, _reasoning_spans(formatted_text))
-        gemma_spans = [
-            span
-            for span in gemma_spans
-            if not _is_gemma_turn_end_only_span(formatted_text, span)
-        ]
-        supervised_spans.extend(
-            {
-                "start": start,
-                "end": end,
-                "source_start": start,
-                "source_end": end,
-                "kind": _SPAN_KIND_FINAL_ANSWER,
-                "role": "assistant",
-            }
-            for start, end in gemma_spans
-        )
     assistant_prompt_prefixes = _resolve_assistant_prompt_prefixes(
         renderer,
         messages,

@@ -4239,6 +4239,60 @@ def test_new_gemma4_template_strict_markers_tolerate_trimmed_embedded_thinking()
     assert "gh issue view 1123 --json title,body" in supervised_text
 
 
+def test_new_gemma4_unresolved_tool_call_does_not_label_tool_response_prefix_as_answer():
+    jinja2 = pytest.importorskip("jinja2")
+    template_path = Path("new_gemma_4_template.jinja")
+    if not template_path.exists():
+        pytest.skip(f"{template_path} is not available")
+
+    tokenizer = RealJinjaChatTemplateTokenizer(template_path, jinja2)
+    answer = "A" * 92
+    tools = _real_template_tool_call_dataset()[0]["tools"]
+
+    def row(content: str) -> dict[str, object]:
+        return {
+            "messages": [
+                {"role": "user", "content": "Inspect the repository."},
+                {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": {"command": "ls"}},
+                        }
+                    ],
+                },
+            ],
+            "tools": tools,
+        }
+
+    prepared = prepare_data(
+        Dataset.from_list([row(""), row(answer)]),
+        tokenizer,
+        tokenize=True,
+        strict=True,
+        verbose=False,
+    )
+
+    assert prepared[0]["text"].endswith("<|tool_response>")
+    assert not any(
+        span.get("kind") == "final_answer"
+        for span in prepared[0]["teich_supervised_spans"]
+    )
+
+    final_spans = [
+        span
+        for span in prepared[1]["teich_supervised_spans"]
+        if span.get("kind") == "final_answer"
+    ]
+    assert len(final_spans) == 1
+    assert prepared[1]["text"][final_spans[0]["start"] : final_spans[0]["end"]] == answer
+    assert prepared[1]["text"][final_spans[0]["end"] :].startswith("<|tool_call>")
+    assert prepared[1]["text"].endswith("<|tool_response>")
+
+
 def test_marker_boundary_whitespace_reconciliation_handles_insertions_and_deletions():
     spans = [{"start": 5, "end": 12, "kind": "final_answer", "role": "assistant"}]
     deleted = _reconcile_marker_boundary_whitespace("start\n\nanswer", spans, "startanswer")
