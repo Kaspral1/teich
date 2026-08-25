@@ -304,6 +304,28 @@ def test_real_gemma4_supervises_exactly_one_turn_end_for_enabled_targets(model_i
     assert tool_supervised_text.count("<turn|>") == 1
     assert tool_supervised_text.endswith("<turn|>")
 
+    empty_final_messages = list(_tool_call_dataset()[0]["messages"])
+    empty_final_messages[-1] = {"role": "assistant", "content": ""}
+    empty_final_prepared = prepare_data(
+        Dataset.from_list(
+            [
+                {
+                    "messages": empty_final_messages,
+                    "tools": _tool_call_dataset()[0]["tools"],
+                }
+            ]
+        ),
+        tokenizer,
+        tokenize=True,
+        strict=True,
+        max_length=4096,
+        verbose=False,
+    )
+    assert not any(
+        span.get("kind") == "final_answer"
+        for span in empty_final_prepared[0]["teich_supervised_spans"]
+    )
+
 
 @pytest.mark.integration
 @pytest.mark.tokenizer_smoke

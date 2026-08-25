@@ -885,6 +885,17 @@ def _gemma_like_supervised_spans(text: str) -> list[tuple[int, int]]:
     return _subtract_spans(supervised_spans, tool_response_spans)
 
 
+def _is_gemma_turn_end_only_span(text: str, span: tuple[int, int]) -> bool:
+    start, end = span
+    value = text[start:end].strip()
+    while value.startswith(_GEMMA_ASSISTANT_TURN_PREFIX):
+        value = value[len(_GEMMA_ASSISTANT_TURN_PREFIX):].lstrip()
+    empty_thought = _GEMMA_THOUGHT_PREFIX + _GEMMA_THOUGHT_END
+    if value.startswith(empty_thought):
+        value = value[len(empty_thought):].lstrip()
+    return value == _GEMMA_TURN_END
+
+
 def _tool_response_spans(text: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     for start_token, end_token in _TOOL_RESPONSE_DELIMITERS:
@@ -1695,13 +1706,14 @@ def _select_supervised_spans(
     selected = _merge_spans(selected)
 
     # A Gemma turn terminator is useful exactly when the same model turn still
-    # contains an enabled training target. It is initially part of the inferred
-    # final-answer span, so restore it when final answers are disabled but an
-    # enabled reasoning or tool-call target remains. Conversely, do not keep a
-    # reasoning-only row alive solely by labeling <turn|> after reasoning was
-    # excluded.
+    # contains an enabled model-authored training target. Terminator-only spans
+    # are not final answers, so add the terminator from the rendered protocol
+    # instead of relying on degenerate final-answer metadata. Conversely, do
+    # not keep a row alive solely by labeling <turn|> after every assistant
+    # target was excluded.
     orphaned_turn_ends: list[tuple[int, int]] = []
     retained_turn_ends: list[tuple[int, int]] = []
+    model_selected = _subtract_spans(selected, _tool_response_spans(text))
     turn_matches = _gemma_turn_matches(text)
     for index, match in enumerate(turn_matches):
         if match.group(1) != "model":
@@ -1711,16 +1723,12 @@ def _select_supervised_spans(
         if turn_end < 0:
             continue
         turn_end_span = (turn_end, turn_end + len(_GEMMA_TURN_END))
-        turn_end_was_supervised = any(
-            span["start"] <= turn_end and span["end"] >= turn_end_span[1]
-            for span in spans
-        )
         has_selected_content = any(
             text[max(start, match.end()) : min(end, turn_end)].strip()
-            for start, end in selected
+            for start, end in model_selected
             if start < turn_end and end > match.end()
         )
-        if has_selected_content and turn_end_was_supervised:
+        if has_selected_content:
             retained_turn_ends.append(turn_end_span)
         elif not has_selected_content:
             orphaned_turn_ends.append(turn_end_span)
@@ -1911,6 +1919,11 @@ def _supervised_text_and_spans(
         gemma_spans = _subtract_spans(gemma_spans, _tool_call_spans(formatted_text))
         gemma_spans = _subtract_spans(gemma_spans, _tool_response_spans(formatted_text))
         gemma_spans = _subtract_spans(gemma_spans, _reasoning_spans(formatted_text))
+        gemma_spans = [
+            span
+            for span in gemma_spans
+            if not _is_gemma_turn_end_only_span(formatted_text, span)
+        ]
         supervised_spans.extend(
             {
                 "start": start,
