@@ -1533,6 +1533,128 @@ def test_gemma_turn_end_remains_supervised_when_only_tool_call_is_enabled():
     assert supervised_text.endswith("<turn|>")
 
 
+def test_gemma_empty_final_message_does_not_create_a_degenerate_final_answer_span():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "list files"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "inspect first",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": {"command": "ls"}},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "name": "bash", "content": "SECRET"},
+                    {"role": "assistant", "content": ""},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    prepared = prepare_data(dataset, tokenizer, tokenize=True, strict=True, verbose=False)
+    spans = prepared[0]["teich_supervised_spans"]
+    assert not any(span.get("kind") == "final_answer" for span in spans)
+
+    trainer = SimpleNamespace(
+        train_dataset=prepared,
+        eval_dataset=None,
+        args=SimpleNamespace(dataset_text_field="text", max_length=None, packing=False),
+        tokenizer=tokenizer,
+    )
+    trainer = mask_data(
+        trainer,
+        tokenizer=tokenizer,
+        train_on_reasoning=True,
+        train_on_final_answers=True,
+        train_on_tools=True,
+        audit=True,
+        verbose=False,
+    )
+    row = trainer.train_dataset[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    assert "inspect first" in supervised_text
+    assert '<|tool_call>call:bash{command:"ls"}<tool_call|>' in supervised_text
+    assert "SECRET" not in supervised_text
+    assert supervised_text.endswith("<turn|>")
+    assert supervised_text.count("<turn|>") == 1
+
+
+def test_gemma_tool_only_mask_does_not_cross_two_tool_response_boundaries():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    messages = [{"role": "user", "content": "inspect twice"}]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+            },
+        }
+    ]
+    for index, command in enumerate(("ls", "pwd"), start=1):
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": f"narration {index}",
+                    "tool_calls": [
+                        {
+                            "id": f"call_{index}",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": {"command": command}},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{index}",
+                    "name": "bash",
+                    "content": f"SECRET_RESPONSE_{index}",
+                },
+            ]
+        )
+    messages.append({"role": "assistant", "content": "final text"})
+
+    training_data = prepare_and_mask_for_test(
+        Dataset.from_list([{"messages": messages, "tools": tools}]),
+        tokenizer,
+        train_on_reasoning=False,
+        train_on_final_answers=False,
+        train_on_tools=True,
+        strict=True,
+    )
+    row = training_data[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+
+    assert 'call:bash{command:"ls"}' in supervised_text
+    assert 'call:bash{command:"pwd"}' in supervised_text
+    assert "narration 1" not in supervised_text
+    assert "narration 2" not in supervised_text
+    assert "final text" not in supervised_text
+    assert "SECRET_RESPONSE_1" not in supervised_text
+    assert "SECRET_RESPONSE_2" not in supervised_text
+    assert supervised_text.count("<turn|>") == 1
+
+
 def test_prepare_and_mask_falls_back_when_gemma_drops_marker_boundaries_with_thinking_disabled():
     class MarkerDroppingGemmaTokenizer(GemmaLikeOffsetTokenizer):
         def apply_chat_template(self, *args, **kwargs):
@@ -4115,6 +4237,60 @@ def test_new_gemma4_template_strict_markers_tolerate_trimmed_embedded_thinking()
     assert "\n\nThe issue requests" not in rendered
     assert "The issue requests a configurable maximum retry delay." in supervised_text
     assert "gh issue view 1123 --json title,body" in supervised_text
+
+
+def test_new_gemma4_unresolved_tool_call_does_not_label_tool_response_prefix_as_answer():
+    jinja2 = pytest.importorskip("jinja2")
+    template_path = Path("new_gemma_4_template.jinja")
+    if not template_path.exists():
+        pytest.skip(f"{template_path} is not available")
+
+    tokenizer = RealJinjaChatTemplateTokenizer(template_path, jinja2)
+    answer = "A" * 92
+    tools = _real_template_tool_call_dataset()[0]["tools"]
+
+    def row(content: str) -> dict[str, object]:
+        return {
+            "messages": [
+                {"role": "user", "content": "Inspect the repository."},
+                {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": {"command": "ls"}},
+                        }
+                    ],
+                },
+            ],
+            "tools": tools,
+        }
+
+    prepared = prepare_data(
+        Dataset.from_list([row(""), row(answer)]),
+        tokenizer,
+        tokenize=True,
+        strict=True,
+        verbose=False,
+    )
+
+    assert prepared[0]["text"].endswith("<|tool_response>")
+    assert not any(
+        span.get("kind") == "final_answer"
+        for span in prepared[0]["teich_supervised_spans"]
+    )
+
+    final_spans = [
+        span
+        for span in prepared[1]["teich_supervised_spans"]
+        if span.get("kind") == "final_answer"
+    ]
+    assert len(final_spans) == 1
+    assert prepared[1]["text"][final_spans[0]["start"] : final_spans[0]["end"]] == answer
+    assert prepared[1]["text"][final_spans[0]["end"] :].startswith("<|tool_call>")
+    assert prepared[1]["text"].endswith("<|tool_response>")
 
 
 def test_marker_boundary_whitespace_reconciliation_handles_insertions_and_deletions():

@@ -226,7 +226,10 @@ For Gemma 4, Teich supervises exactly one closing `<turn|>` for a completed
 model turn whenever reasoning, final-answer, or tool-call supervision is
 enabled for that turn. It does not add a second terminator inside a continuing
 tool-call chain. The terminator remains a target even when the final answer is
-masked, so reasoning-only and tool-only fine-tunes still learn to stop.
+masked, so reasoning-only and tool-only fine-tunes still learn to stop. Empty
+final assistant messages and unresolved tool-result prefixes do not create
+synthetic `final_answer` spans; the stopping token is attached only after an
+actual enabled target is selected.
 
 ## Masking Policy
 

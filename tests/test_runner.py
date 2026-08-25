@@ -43,9 +43,20 @@ def _free_tcp_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _wait_for_tcp_port(port: int, timeout: float = 5.0) -> None:
+def _wait_for_tcp_port(
+    port: int,
+    timeout: float = 5.0,
+    *,
+    process: subprocess.Popen[str] | None = None,
+) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise RuntimeError(
+                f"process exited with code {process.returncode} before port {port} opened"
+                f"\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            )
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.1):
                 return
@@ -994,8 +1005,6 @@ def test_claude_openrouter_proxy_strips_decoded_compression_headers(tmp_path: Pa
     if shutil.which("node") is None:
         pytest.skip("node is required for the proxy smoke test")
 
-    upstream_port = _free_tcp_port()
-    proxy_port = _free_tcp_port()
     response_payload = b'{"ok":true}\n'
     seen: dict[str, object] = {}
 
@@ -1018,7 +1027,11 @@ def test_claude_openrouter_proxy_strips_decoded_compression_headers(tmp_path: Pa
         def log_message(self, format: str, *args: object) -> None:
             return
 
-    server = ThreadingHTTPServer(("127.0.0.1", upstream_port), Handler)
+    # Bind the upstream before selecting the proxy port so the two ephemeral
+    # allocations cannot resolve to the same released port under CI load.
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    upstream_port = int(server.server_address[1])
+    proxy_port = _free_tcp_port()
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     proxy_script = tmp_path / "claude_openrouter_proxy.js"
@@ -1036,7 +1049,7 @@ def test_claude_openrouter_proxy_strips_decoded_compression_headers(tmp_path: Pa
         text=True,
     )
     try:
-        _wait_for_tcp_port(proxy_port)
+        _wait_for_tcp_port(proxy_port, process=process)
         request = Request(
             f"http://127.0.0.1:{proxy_port}/v1/messages?beta=true",
             data=json.dumps(
@@ -1106,8 +1119,6 @@ def test_claude_openrouter_proxy_handles_requests_concurrently(tmp_path: Path):
     if shutil.which("node") is None:
         pytest.skip("node is required for the proxy smoke test")
 
-    upstream_port = _free_tcp_port()
-    proxy_port = _free_tcp_port()
     request_count = 5
     response_delay = 0.35
     stats = {"inflight": 0, "max_inflight": 0, "requests": 0}
@@ -1137,7 +1148,12 @@ def test_claude_openrouter_proxy_handles_requests_concurrently(tmp_path: Path):
         def log_message(self, format: str, *args: object) -> None:
             return
 
-    server = ThreadingHTTPServer(("127.0.0.1", upstream_port), Handler)
+    # Keep the upstream port reserved while selecting the proxy port. Calling
+    # _free_tcp_port twice can return the same released port and make Node exit
+    # with EADDRINUSE before the readiness probe observes it.
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    upstream_port = int(server.server_address[1])
+    proxy_port = _free_tcp_port()
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     proxy_script = tmp_path / "claude_openrouter_proxy.js"
@@ -1166,7 +1182,7 @@ def test_claude_openrouter_proxy_handles_requests_concurrently(tmp_path: Path):
             return response.read()
 
     try:
-        _wait_for_tcp_port(proxy_port)
+        _wait_for_tcp_port(proxy_port, process=process)
         started = time.perf_counter()
         with concurrent.futures.ThreadPoolExecutor(max_workers=request_count) as executor:
             bodies = list(executor.map(send_request, range(request_count)))

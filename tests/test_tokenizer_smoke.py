@@ -268,6 +268,7 @@ def test_real_gemma4_supervises_exactly_one_turn_end_for_enabled_targets(model_i
         assert ("Careful reasoning." in supervised_text) is train_on_reasoning
         assert ("Final answer." in supervised_text) is train_on_final_answers
 
+
     tool_prepared = prepare_data(
         _tool_call_dataset(),
         tokenizer,
@@ -303,6 +304,69 @@ def test_real_gemma4_supervises_exactly_one_turn_end_for_enabled_targets(model_i
     assert tool_supervised_ids.count(turn_end_token_id) == 1
     assert tool_supervised_text.count("<turn|>") == 1
     assert tool_supervised_text.endswith("<turn|>")
+
+    empty_final_messages = list(_tool_call_dataset()[0]["messages"])
+    empty_final_messages[-1] = {"role": "assistant", "content": ""}
+    empty_final_prepared = prepare_data(
+        Dataset.from_list(
+            [
+                {
+                    "messages": empty_final_messages,
+                    "tools": _tool_call_dataset()[0]["tools"],
+                }
+            ]
+        ),
+        tokenizer,
+        tokenize=True,
+        strict=True,
+        max_length=4096,
+        verbose=False,
+    )
+    assert not any(
+        span.get("kind") == "final_answer"
+        for span in empty_final_prepared[0]["teich_supervised_spans"]
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.tokenizer_smoke
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        pytest.param("google/gemma-4-E4B-it", id="gemma-4-e4b-unresolved-tool"),
+        pytest.param("google/gemma-4-26B-A4B-it", id="gemma-4-26b-a4b-unresolved-tool"),
+        pytest.param("google/gemma-4-31B-it", id="gemma-4-31b-unresolved-tool"),
+    ],
+)
+def test_real_gemma4_unresolved_tool_call_has_no_synthetic_final_answer(model_id: str):
+    if not _tokenizer_smokes_enabled():
+        pytest.skip("Set TEICH_RUN_TOKENIZER_SMOKES=1 to run real Hugging Face tokenizer smokes.")
+    transformers = pytest.importorskip("transformers")
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    answer = "A" * 92
+    source = _tool_call_dataset()[0]
+    messages = [
+        source["messages"][1],
+        {**source["messages"][2], "content": answer, "reasoning_content": ""},
+    ]
+
+    prepared = prepare_data(
+        Dataset.from_list([{"messages": messages, "tools": source["tools"]}]),
+        tokenizer,
+        tokenize=True,
+        strict=True,
+        verbose=False,
+    )
+    text = prepared[0]["text"]
+    final_spans = [
+        span
+        for span in prepared[0]["teich_supervised_spans"]
+        if span.get("kind") == "final_answer"
+    ]
+
+    assert text.endswith("<|tool_response>")
+    assert len(final_spans) == 1
+    assert text[final_spans[0]["start"] : final_spans[0]["end"]] == answer
 
 
 @pytest.mark.integration
