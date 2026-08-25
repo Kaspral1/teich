@@ -218,6 +218,11 @@ class TerminalBridge:
             self._listeners.add(listener)
             return "".join(self._scrollback)
 
+    def scrollback(self) -> str:
+        """Return a consistent snapshot for a slow websocket to replay."""
+        with self._lock:
+            return "".join(self._scrollback)
+
     def detach(self, listener: Callable[[str], None]) -> None:
         with self._lock:
             self._listeners.discard(listener)

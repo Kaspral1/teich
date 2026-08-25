@@ -469,7 +469,7 @@ def _align_gemma4_nonthinking_training_text(
         return text
     parts: list[str] = []
     cursor = 0
-    for match in _GEMMA_TURN_START_PATTERN.finditer(text):
+    for match in _gemma_turn_matches(text):
         if match.group(1) != "model":
             continue
         parts.append(text[cursor:match.end()])
@@ -480,6 +480,22 @@ def _align_gemma4_nonthinking_training_text(
         return text
     parts.append(text[cursor:])
     return "".join(parts)
+
+
+def _gemma_turn_matches(text: str) -> list[re.Match[str]]:
+    """Find rendered Gemma turn boundaries without scanning inside turn content."""
+    matches: list[re.Match[str]] = []
+    cursor = 0
+    while True:
+        match = _GEMMA_TURN_START_PATTERN.search(text, cursor)
+        if match is None:
+            break
+        matches.append(match)
+        turn_end = text.find(_GEMMA_TURN_END, match.end())
+        if turn_end < 0:
+            break
+        cursor = turn_end + len(_GEMMA_TURN_END)
+    return matches
 
 
 def _as_text_content_parts(content: Any) -> Any:
@@ -847,7 +863,7 @@ def _find_delimited_spans(text: str, start_token: str, end_token: str) -> list[t
 
 
 def _gemma_like_supervised_spans(text: str) -> list[tuple[int, int]]:
-    turn_matches = list(_GEMMA_TURN_START_PATTERN.finditer(text))
+    turn_matches = _gemma_turn_matches(text)
     if not turn_matches:
         return []
     tool_response_spans = _tool_response_spans(text)
@@ -1686,7 +1702,7 @@ def _select_supervised_spans(
     # excluded.
     orphaned_turn_ends: list[tuple[int, int]] = []
     retained_turn_ends: list[tuple[int, int]] = []
-    turn_matches = list(_GEMMA_TURN_START_PATTERN.finditer(text))
+    turn_matches = _gemma_turn_matches(text)
     for index, match in enumerate(turn_matches):
         if match.group(1) != "model":
             continue

@@ -2259,7 +2259,49 @@ def test_anonymize_redacts_base64_media_payloads_without_touching_metadata(tmp_p
     assert source["media_type"] == "image/png"
     assert source["data"] != image_data
     assert image_data not in json.dumps(row)
-    assert base64.b64decode(source["data"]).startswith(b"[redacted media ")
+    assert base64.b64decode(source["data"]).startswith(b"\x89PNG\r\n\x1a\n")
+
+
+@pytest.mark.parametrize(
+    ("declared_type", "replacement_type", "signature"),
+    [
+        ("image/jpeg", "image/jpeg", b"\xff\xd8\xff"),
+        ("image/avif", "image/png", b"\x89PNG\r\n\x1a\n"),
+        ("audio/mpeg", "audio/wav", b"RIFF"),
+        ("video/mp4", "video/webm", b"\x1aE\xdf\xa3"),
+    ],
+)
+def test_anonymize_media_placeholder_matches_output_mime_type(
+    declared_type: str,
+    replacement_type: str,
+    signature: bytes,
+):
+    anonymizer = anonymize_module.TraceAnonymizer()
+    original_data = base64.b64encode(b"private media bytes" * 32).decode("ascii")
+
+    redacted = anonymizer.anonymize_value(
+        {
+            "type": "base64",
+            "media_type": declared_type,
+            "data": original_data,
+        }
+    )
+
+    assert redacted["media_type"] == replacement_type
+    assert base64.b64decode(redacted["data"]).startswith(signature)
+    assert redacted["data"] != original_data
+
+
+def test_anonymize_name_matcher_preserves_lowercase_code_and_yaml_values():
+    anonymizer = anonymize_module.TraceAnonymizer()
+    text = "name: npm install\nname: Run tests\nmy name is Jane Doe"
+
+    redacted = anonymizer.anonymize_text(text)
+
+    assert "name: npm install" in redacted
+    assert "name: Run tests" in redacted
+    assert "Jane Doe" not in redacted
+    assert "my name is redacted_pii_" in redacted
 
 
 def test_anonymize_does_not_treat_systemd_units_as_emails(tmp_path: Path):

@@ -5,7 +5,6 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-import base64
 import hashlib
 import multiprocessing
 import os
@@ -259,6 +258,18 @@ def _anonymize_jsonl_file(source: Path, destination: Path, anonymizer: "TraceAno
 class TraceAnonymizer:
     """Stateful per-trace anonymizer with consistent replacement maps."""
 
+    # Small decoder-valid replacements keep multimodal schemas loadable after
+    # opaque media is removed. Unsupported subtypes are normalized to the
+    # corresponding fallback MIME type instead of retaining a false declaration.
+    _media_placeholder_base64 = {
+        "image/png": "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAACXBIWXMAAAABAAAAAQBPJcTWAAAAC0lEQVR4nGNgQAYAAA4AAamRc7EAAAAASUVORK5CYII=",
+        "image/jpeg": "/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYxLjE5LjEwMQD/2wBDAAgEBAQEBAUFBQUFBQYGBgYGBgYGBgYGBgYHBwcICAgHBwcGBgcHCAgICAkJCQgICAgJCQoKCgwMCwsODg4RERT/xABLAAEBAAAAAAAAAAAAAAAAAAAACAEBAAAAAAAAAAAAAAAAAAAAABABAAAAAAAAAAAAAAAAAAAAABEBAAAAAAAAAAAAAAAAAAAAAP/AABEIAAIAAgMBIgACEQADEQD/2gAMAwEAAhEDEQA/AJ/AB//Z",
+        "image/gif": "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==",
+        "image/webp": "UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoCAAIAAgA0JaQAA3AA/vv9UAA=",
+        "audio/wav": "UklGRpYAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgATElTVBoAAABJTkZPSVNGVA0AAABMYXZmNjEuNy4xMDAAAGRhdGFQAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIA=",
+        "video/webm": "GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwEAAAAAAAIFEU2bdLpNu4tTq4QVSalmU6yBoU27i1OrhBZUrmtTrIHWTbuMU6uEElTDZ1OsggEjTbuMU6uEHFO7a1OsggHv7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmsCrXsYMPQkBNgIxMYXZmNjEuNy4xMDBXQYxMYXZmNjEuNy4xMDBEiYhARAAAAAAAABZUrmvIrgEAAAAAAAA/14EBc8WIEWEZBnl2+u6cgQAitZyDdW5kiIEAhoVWX1ZQOYOBASPjg4QCYloA4JCwgRC6gRCagQJVsIRVuYEBElTDZ0B/c3OfY8CAZ8iZRaOHRU5DT0RFUkSHjExhdmY2MS43LjEwMHNz2mPAi2PFiBFhGQZ5dvruZ8ilRaOHRU5DT0RFUkSHmExhdmM2MS4xOS4xMDEgbGlidnB4LXZwOWfIoUWjiERVUkFUSU9ORIeTMDA6MDA6MDAuMDQwMDAwMDAwAB9DtnXC54EAo72BAACAgkmDQgAA8AD2BjgkHBhKAAAgQAAim///lXb23/SskhXr7zdPyoCRyEjNuPymkNJQgETBR424BAAAHFO7a5G7j7OBALeK94EB8YIBqPCBAw==",
+    }
+
     _email_pattern = re.compile(
         r"(?<![A-Za-z0-9._%+-])([A-Za-z0-9][A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,})(?![A-Za-z0-9._%+-])"
     )
@@ -313,7 +324,7 @@ class TraceAnonymizer:
         r"(?P<value>(?:\d{1,3}\.){3}\d{1,3})"
     )
     _name_pattern = re.compile(
-        r"(?i)(?P<prefix>\b(?:my\s+name\s+is|full\s+name\s*[:=]|name\s*[:=])\s*)"
+        r"(?P<prefix>(?i:\b(?:my\s+name\s+is|full\s+name\s*[:=]|name\s*[:=]))\s*)"
         r"(?P<value>[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){1,3})"
     )
     _address_pattern = re.compile(
@@ -713,18 +724,26 @@ class TraceAnonymizer:
 
     def _anonymize_mapping(self, value: dict[Any, Any]) -> dict[Any, Any]:
         should_redact_base64_data = self._looks_like_base64_media_source(value)
+        media_replacement: tuple[str, str] | None = None
+        media_data = value.get("data")
+        if (
+            should_redact_base64_data
+            and isinstance(media_data, str)
+            and self._looks_like_base64_blob(media_data)
+        ):
+            media_type = value.get("media_type") or value.get("mime_type")
+            media_replacement = self._redact_base64_media(
+                media_type if isinstance(media_type, str) else None
+            )
         role = value.get("role")
         is_assistant_message = isinstance(role, str) and role.lower() == "assistant"
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
             redacted_key = self.anonymize_value(key)
-            if (
-                should_redact_base64_data
-                and key == "data"
-                and isinstance(item, str)
-                and self._looks_like_base64_blob(item)
-            ):
-                redacted[redacted_key] = self._redact_base64_media(item)
+            if media_replacement is not None and key == "data":
+                redacted[redacted_key] = media_replacement[1]
+            elif media_replacement is not None and key in {"media_type", "mime_type"}:
+                redacted[redacted_key] = media_replacement[0]
             elif is_assistant_message and key in {"content", "reasoning_content", "thinking"}:
                 # Assistant responses can echo credentials and personal data
                 # supplied by users or tools. Apply the same high-confidence
@@ -736,6 +755,8 @@ class TraceAnonymizer:
                 redacted[redacted_key] = self._redact_mapping_value(key, item)
             else:
                 redacted[redacted_key] = self.anonymize_value(item)
+        if media_replacement is not None and "media_type" not in value and "mime_type" not in value:
+            redacted["media_type"] = media_replacement[0]
         return redacted
 
     def _anonymize_assistant_generated_value(self, value: Any) -> Any:
@@ -808,11 +829,19 @@ class TraceAnonymizer:
             return False
         return re.fullmatch(r"[A-Za-z0-9+/=\s]+", value) is not None
 
-    def _redact_base64_media(self, value: str) -> str:
-        """Replace opaque media with a deterministic, valid base64 marker."""
-        marker = f"[redacted media {self._dummy_sequence(value, 16)}]".encode("utf-8")
+    def _redact_base64_media(self, declared_media_type: str | None) -> tuple[str, str]:
+        """Return a decoder-valid placeholder and its truthful MIME type."""
+        normalized = (declared_media_type or "").lower().split(";", 1)[0].strip()
+        replacement_type = normalized
+        if replacement_type not in self._media_placeholder_base64:
+            if normalized.startswith("audio/"):
+                replacement_type = "audio/wav"
+            elif normalized.startswith("video/"):
+                replacement_type = "video/webm"
+            else:
+                replacement_type = "image/png"
         self.counts["media"] += 1
-        return base64.b64encode(marker).decode("ascii")
+        return replacement_type, self._media_placeholder_base64[replacement_type]
 
     def anonymize_text(self, text: str) -> str:
         lowered = text.lower()

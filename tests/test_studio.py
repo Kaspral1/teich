@@ -1287,6 +1287,43 @@ def test_terminal_task_cleanup_propagates_unexpected_errors():
     asyncio.run(run())
 
 
+def test_terminal_output_buffer_coalesces_without_losing_or_reordering_chunks():
+    async def run() -> None:
+        buffer = server_module._TerminalOutputBuffer(lambda: "scrollback", max_pending_chars=100)
+        chunks = ["before\x1b[", "31mred", "\x1b[0mafter"]
+        for chunk in chunks:
+            buffer.enqueue(chunk)
+
+        text, reset = await buffer.get()
+        assert text == "".join(chunks)
+        assert reset is False
+
+    asyncio.run(run())
+
+
+def test_terminal_output_buffer_replays_scrollback_when_pending_output_exceeds_limit():
+    async def run() -> None:
+        buffer = server_module._TerminalOutputBuffer(
+            lambda: "complete bounded scrollback",
+            max_pending_chars=8,
+        )
+        buffer.enqueue("12345")
+        buffer.enqueue("67890")
+
+        text, reset = await buffer.get()
+        assert text == "complete bounded scrollback"
+        assert reset is True
+
+    asyncio.run(run())
+
+
+def test_terminal_client_resets_before_replaying_coalesced_scrollback():
+    source = (server_module.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert "if (message.reset) term.reset();" in source
+    assert source.index("if (message.reset) term.reset();") < source.index("term.write(message.data);")
+
+
 def test_terminal_wait_keeps_socket_open_until_session_ready(monkeypatch):
     class DummyWebSocket:
         def __init__(self) -> None:

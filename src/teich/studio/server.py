@@ -6,6 +6,7 @@ import json
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -25,7 +26,7 @@ from .dataset_preview import build_dataset_preview, dataset_row_context, delete_
 from .events import summarize_chat_row, summarize_trace_events
 from .extraction import ExtractionManager
 from .generation import GenerationManager
-from .interactive import EventLog, SessionManager
+from .interactive import SCROLLBACK_LIMIT, EventLog, SessionManager
 from .project import ProjectState, validate_chat_api_compatibility
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -115,11 +116,37 @@ class DatasetUploadRequest(BaseModel):
 _docker_cache: dict[str, Any] = {"checked_at": 0.0, "available": False, "detail": None}
 TERMINAL_READY_STATUSES = {"ready", "live", "exited", "error"}
 TERMINAL_STARTUP_NOTICE_SECONDS = 15.0
-TERMINAL_OUTPUT_QUEUE_LIMIT = 256
 EXTRACT_PROVIDERS = {"claude", "codex", "cursor", "hermes", "pi"}
 UPLOAD_IGNORE_PATTERNS = ["partials/**", "failures/**"]
 UPLOAD_METADATA_PATTERNS = ["README.md", "tools.json"]
 UPLOAD_DATA_PATTERNS = ["*.jsonl", "**/*.jsonl", "*.metadata.json", "**/*.metadata.json"]
+
+
+class _TerminalOutputBuffer:
+    """Coalesce terminal chunks and replay scrollback instead of dropping bytes."""
+
+    def __init__(
+        self,
+        scrollback: Callable[[], str],
+        *,
+        max_pending_chars: int = SCROLLBACK_LIMIT,
+    ) -> None:
+        self._scrollback = scrollback
+        self._max_pending_chars = max(1, max_pending_chars)
+        self._queue: asyncio.Queue[tuple[str, bool]] = asyncio.Queue(maxsize=1)
+
+    def enqueue(self, text: str) -> None:
+        reset = False
+        if self._queue.full():
+            pending, reset = self._queue.get_nowait()
+            text = pending + text
+        if len(text) > self._max_pending_chars:
+            text = self._scrollback()
+            reset = True
+        self._queue.put_nowait((text, reset))
+
+    async def get(self) -> tuple[str, bool]:
+        return await self._queue.get()
 
 
 def _normalize_extract_provider(provider: str) -> ExtractProvider:
@@ -642,15 +669,10 @@ def create_app(project_dir: Path) -> FastAPI:
             return
         await websocket.accept()
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=TERMINAL_OUTPUT_QUEUE_LIMIT)
+        output_buffer = _TerminalOutputBuffer(session.terminal.scrollback)
 
         def enqueue_output(text: str) -> None:
-            if queue.full():
-                try:
-                    queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            queue.put_nowait(text)
+            output_buffer.enqueue(text)
 
         def on_output(text: str) -> None:
             loop.call_soon_threadsafe(enqueue_output, text)
@@ -673,8 +695,11 @@ def create_app(project_dir: Path) -> FastAPI:
 
             async def pump_output() -> None:
                 while True:
-                    text = await queue.get()
-                    await websocket.send_json({"type": "stdout", "data": text})
+                    text, reset = await output_buffer.get()
+                    message: dict[str, Any] = {"type": "stdout", "data": text}
+                    if reset:
+                        message["reset"] = True
+                    await websocket.send_json(message)
 
             async def pump_input() -> None:
                 while True:
