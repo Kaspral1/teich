@@ -116,6 +116,14 @@ non-`main` revision is required. Set
 `HF_TOKEN` to an account that has accepted the Gemma repository terms when the
 checkpoint is not already available through the local Hugging Face login.
 
+The example keeps reasoning in its agent source and strips reasoning from its
+direct-chat source. Override those source policies with
+`AGENT_REASONING_POLICY` or `CHAT_REASONING_POLICY` when using datasets with a
+different contract. It prints the resolved Gemma mode counts, stripped-row
+count, and maximum token length before training. Do not add `<turn|>` to source
+messages: Teich derives and supervises the live template's completed-turn
+terminator automatically.
+
 Run the example in a dedicated, internally consistent Unsloth training
 environment and check it with `python -m pip check` before a long run. Teich's
 core environment does not pin the CUDA, PyTorch, Unsloth, and TRL stack because

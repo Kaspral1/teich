@@ -136,6 +136,14 @@ def test_gemma4_example_uses_live_remote_template_and_safe_masks():
     assert 'os.environ.get("GEMMA4_ENABLE_THINKING")' in source
     assert 'GEMMA4_THINKING_MODE not in {"auto", "thinking", "nonthinking"}' in source
     assert "chat_template_kwargs=CHAT_TEMPLATE_KWARGS" in source
+    assert '"reasoning_policy": AGENT_REASONING_POLICY' in source
+    assert '"reasoning_policy": CHAT_REASONING_POLICY' in source
+    assert 'AGENT_REASONING_POLICY = os.environ.get("AGENT_REASONING_POLICY", "keep")' in source
+    assert 'CHAT_REASONING_POLICY = os.environ.get("CHAT_REASONING_POLICY", "strip")' in source
+    assert "train_dataset, prep_report = prepare_data(" in source
+    assert "return_report=True" in source
+    assert "prep_report.gemma4_modes" in source
+    assert "Do not append a" in source
     assert 'or "gemma-template.jinja"' not in source
     assert "token=HF_TOKEN or None" in source
     assert 'oversized_policy="trim_followups"' in source
