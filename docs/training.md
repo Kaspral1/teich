@@ -184,6 +184,12 @@ The live template and Teich's per-row contract produce and mask those protocol
 tokens. Tool results remain masked by default, while assistant tool calls and
 their completed-turn `<|im_end|>` are supervised.
 
+`granite42_example.py` is a complete text-only LoRA example. It defaults to the
+8B checkpoint, uses Granite's per-row auto mode, and applies optional
+`GRANITE42_LOW_EFFORT=1` only to the reasoning-bearing agent source. Override
+`MODEL_NAME` to use the 3B or 30B checkpoint without changing the preparation
+contract.
+
 ## Live Qwen 3.8 Models
 
 Qwen 3.8 has a different native contract and Teich does not apply Gemma's auto
@@ -229,6 +235,40 @@ train_dataset, prep_report = prepare_data(
 Qwen 3.8's non-thinking prompt contains an empty `<think>...</think>` primer.
 Teich keeps that inference-alignment prefix in the rendered text but masks it
 from loss. The final answer and closing `<|im_end|>` remain supervised.
+
+`qwen38_example.py` is a complete text-only LoRA example using the live
+multimodal tokenizer. It keeps thinking and history preservation on for the
+agent source, strips reasoning and disables thinking for the direct-chat
+source, and accepts `QWEN38_REASONING_EFFORT=low|medium|xhigh`.
+
+## Live Qwen 3.6 Models
+
+Qwen 3.6 uses a different contract from Qwen 3.8. It supports explicit
+`enable_thinking` and `preserve_thinking`, but its live template has no
+`reasoning_effort` control. The template normally keeps only reasoning related
+to the latest user message, so multi-turn reasoning SFT should explicitly set
+`preserve_thinking=True`:
+
+```python
+train_dataset = prepare_data(
+    "username/qwen36-agent-traces",
+    tokenizer,
+    chat_template_kwargs={
+        "enable_thinking": True,
+        "preserve_thinking": True,
+    },
+    tokenize=True,
+    strict=True,
+)
+```
+
+For a direct source, use `reasoning_policy="strip"` with
+`enable_thinking=False` and `preserve_thinking=False`. Qwen 3.6 does not use
+the older `/think` or `/nothink` soft switches; do not inject either into data.
+
+`qwen36_example.py` demonstrates both source policies with
+`Qwen/Qwen3.6-35B-A3B`. Override `MODEL_NAME=Qwen/Qwen3.6-27B` to use the dense
+checkpoint with the same preparation contract.
 
 ## Source Reasoning Policy
 

@@ -13,6 +13,16 @@ TOKENIZER_SMOKE_MODELS = [
     pytest.param("unsloth/Qwen3.5-0.8B", {"enable_thinking": True}, id="unsloth-qwen3.5"),
     pytest.param("Qwen/Qwen3.8-27B", {}, id="qwen3.8-27b"),
     pytest.param(
+        "Qwen/Qwen3.6-27B",
+        {"enable_thinking": True, "preserve_thinking": True},
+        id="qwen3.6-27b",
+    ),
+    pytest.param(
+        "Qwen/Qwen3.6-35B-A3B",
+        {"enable_thinking": True, "preserve_thinking": True},
+        id="qwen3.6-35b-a3b",
+    ),
+    pytest.param(
         "google/gemma-4-E4B-it",
         {},
         id="gemma-4-e4b-it",
@@ -559,6 +569,111 @@ def test_real_qwen38_preserves_reasoning_history_and_honors_effort():
     )
     assert "reason one" in generation_prompt
     assert generation_prompt.endswith("<think>\n")
+
+
+@pytest.mark.integration
+@pytest.mark.tokenizer_smoke
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        pytest.param("Qwen/Qwen3.6-27B", id="qwen3.6-27b-protocol"),
+        pytest.param("Qwen/Qwen3.6-35B-A3B", id="qwen3.6-35b-a3b-protocol"),
+    ],
+)
+def test_real_qwen36_preserves_reasoning_history_and_supports_direct_mode(model_id: str):
+    if not _tokenizer_smokes_enabled():
+        pytest.skip("Set TEICH_RUN_TOKENIZER_SMOKES=1 to run real Hugging Face tokenizer smokes.")
+    transformers = pytest.importorskip("transformers")
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "ANSWER_ALPHA", "reasoning_content": "THOUGHT_ALPHA"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "ANSWER_BETA", "reasoning_content": "THOUGHT_BETA"},
+    ]
+    prepared = prepare_data(
+        Dataset.from_list([{"messages": messages, "tools": []}]),
+        tokenizer,
+        tokenize=True,
+        strict=True,
+        chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True},
+        verbose=False,
+    )
+    assert "THOUGHT_ALPHA" in prepared[0]["text"]
+    assert "THOUGHT_BETA" in prepared[0]["text"]
+
+    trainer = SimpleNamespace(
+        train_dataset=prepared,
+        eval_dataset=None,
+        processing_class=tokenizer,
+        args=SimpleNamespace(dataset_text_field="text", packing=False, max_length=4096),
+    )
+    trainer = mask_data(
+        trainer,
+        tokenizer=tokenizer,
+        train_on_reasoning=True,
+        train_on_final_answers=True,
+        train_on_tools=False,
+        audit=True,
+        verbose=False,
+    )
+    supervised_ids = [token for token in trainer.train_dataset[0]["labels"] if token != -100]
+    supervised_text = tokenizer.decode(supervised_ids, skip_special_tokens=False)
+    im_end_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    assert supervised_ids.count(im_end_token_id) == 2
+    assert "THOUGHT_ALPHA" in supervised_text
+    assert "THOUGHT_BETA" in supervised_text
+    assert "ANSWER_ALPHA" in supervised_text
+    assert "ANSWER_BETA" in supervised_text
+
+    direct = prepare_data(
+        Dataset.from_list(
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": "answer directly"},
+                        {
+                            "role": "assistant",
+                            "content": "direct answer",
+                            "reasoning_content": "remove this reasoning",
+                        },
+                    ],
+                    "tools": [],
+                }
+            ]
+        ),
+        tokenizer,
+        reasoning_policy="strip",
+        chat_template_kwargs={"enable_thinking": False, "preserve_thinking": False},
+        tokenize=True,
+        strict=True,
+        verbose=False,
+    )
+    empty_thought = "<think>\n\n</think>\n\n"
+    assert "remove this reasoning" not in direct[0]["text"]
+    assert empty_thought in direct[0]["text"]
+
+    direct_trainer = SimpleNamespace(
+        train_dataset=direct,
+        eval_dataset=None,
+        processing_class=tokenizer,
+        args=SimpleNamespace(dataset_text_field="text", packing=False, max_length=4096),
+    )
+    direct_trainer = mask_data(
+        direct_trainer,
+        tokenizer=tokenizer,
+        train_on_reasoning=False,
+        train_on_final_answers=True,
+        train_on_tools=False,
+        audit=True,
+        verbose=False,
+    )
+    direct_supervised_text = tokenizer.decode(
+        [token for token in direct_trainer.train_dataset[0]["labels"] if token != -100],
+        skip_special_tokens=False,
+    )
+    assert empty_thought not in direct_supervised_text
+    assert direct_supervised_text == "direct answer<|im_end|>\n"
 
 
 @pytest.mark.integration
