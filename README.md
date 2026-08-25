@@ -65,6 +65,8 @@ train_dataset = prepare_data(
 With a live Gemma 4 tokenizer, omit `chat_template_kwargs` to let Teich choose
 thinking or non-thinking independently for each row. See [Training](docs/training.md#live-gemma-4-models)
 for auto-mode rules and the E4B, 26B-A4B, and 31B template contract.
+Qwen 3.8 keeps its own template-native defaults, including historical reasoning
+preservation and `reasoning_effort`; see [Live Qwen 3.8 Models](docs/training.md#live-qwen-38-models).
 
 Then create your trainer and call `mask_data()`:
 

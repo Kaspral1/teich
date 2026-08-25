@@ -26,6 +26,7 @@ def prepare_and_mask_for_test(
     messages_column="messages",
     tools_column="tools",
     chat_template_kwargs=None,
+    reasoning_policy="keep",
     train_on_reasoning=True,
     train_on_final_answers=True,
     train_on_tools=True,
@@ -41,6 +42,7 @@ def prepare_and_mask_for_test(
         messages_column=messages_column,
         tools_column=tools_column,
         chat_template_kwargs=chat_template_kwargs,
+        reasoning_policy=reasoning_policy,
         train_on_reasoning=train_on_reasoning,
         max_length=max_length,
         drop_oversized_examples=drop_oversized_examples,
@@ -580,6 +582,69 @@ def test_gemma4_auto_mode_handles_mixed_thinking_and_direct_rows():
     assert "<|channel>thought" not in direct_target
     assert "answer" in direct_target
     assert direct_target.endswith("<turn|>")
+
+
+def test_reasoning_policy_strip_makes_reasoning_dataset_direct_for_gemma4():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer", "reasoning_content": "private analysis"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared, report = prepare_data(
+        dataset,
+        tokenizer,
+        reasoning_policy="strip",
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+
+    assert "private analysis" not in prepared[0]["text"]
+    assert "<|channel>thought\n<channel|>answer<turn|>" in prepared[0]["text"]
+    assert report.gemma4_modes == {"nonthinking": 1}
+    assert report.reasoning_stripped_rows == 1
+    assert report.reasoning_stripped_messages == 1
+
+    training_data = prepare_and_mask_for_test(
+        dataset,
+        tokenizer,
+        reasoning_policy="strip",
+        strict=True,
+    )
+    supervised_text = tokenizer.decode(
+        [token for token in training_data[0]["labels"] if token != -100]
+    )
+    assert "private analysis" not in supervised_text
+    assert supervised_text == "answer<turn|>"
+
+
+def test_prepare_data_rejects_unknown_reasoning_policy():
+    with pytest.raises(ValueError, match="reasoning_policy must be one of"):
+        prepare_data(
+            Dataset.from_list(
+                [
+                    {
+                        "messages": [
+                            {"role": "user", "content": "question"},
+                            {"role": "assistant", "content": "answer"},
+                        ],
+                        "tools": [],
+                    }
+                ]
+            ),
+            GemmaLikeOffsetTokenizer(),
+            reasoning_policy="guess",
+            verbose=False,
+        )
 
 
 def test_gemma4_auto_mode_preserves_historical_reasoning():

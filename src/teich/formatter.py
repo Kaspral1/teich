@@ -75,6 +75,7 @@ _TEICH_LABEL_PADDING_COLLATOR_NAMES = {
 }
 _OVERSIZED_POLICIES = {"drop", "trim_followups", "error"}
 _OVERSIZED_POLICY_KEEP = "keep"
+_REASONING_POLICIES = {"keep", "strip"}
 _GEMMA4_PREFIX_CACHE: weakref.WeakKeyDictionary[Any, dict[str, str]] = weakref.WeakKeyDictionary()
 
 
@@ -100,6 +101,8 @@ class PrepareReport:
     trimmed_rows: list[dict[str, Any]] = field(default_factory=list)
     gemma4_modes: dict[str, int] = field(default_factory=dict)
     gemma4_legacy_triggers_normalized: int = 0
+    reasoning_stripped_rows: int = 0
+    reasoning_stripped_messages: int = 0
 
     def record_token_length(self, row_info: dict[str, Any], token_length: int) -> None:
         entry = {**row_info, "token_length": token_length}
@@ -162,6 +165,12 @@ class PrepareReport:
         if normalized_legacy_trigger:
             self.gemma4_legacy_triggers_normalized += 1
 
+    def record_stripped_reasoning(self, stripped_messages: int) -> None:
+        if stripped_messages <= 0:
+            return
+        self.reasoning_stripped_rows += 1
+        self.reasoning_stripped_messages += stripped_messages
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "total_rows": self.total_rows,
@@ -176,6 +185,8 @@ class PrepareReport:
             "trimmed_rows": self.trimmed_rows,
             "gemma4_modes": self.gemma4_modes,
             "gemma4_legacy_triggers_normalized": self.gemma4_legacy_triggers_normalized,
+            "reasoning_stripped_rows": self.reasoning_stripped_rows,
+            "reasoning_stripped_messages": self.reasoning_stripped_messages,
         }
 
 
@@ -223,6 +234,35 @@ def _validate_chat_template_kwargs(chat_template_kwargs: dict[str, Any] | None) 
         names = ", ".join(sorted(overlap))
         raise ValueError(f"chat_template_kwargs cannot override reserved apply_chat_template arguments: {names}")
     return kwargs
+
+
+def _validate_reasoning_policy(reasoning_policy: str) -> str:
+    if not isinstance(reasoning_policy, str) or reasoning_policy not in _REASONING_POLICIES:
+        choices = ", ".join(sorted(_REASONING_POLICIES))
+        raise ValueError(f"reasoning_policy must be one of: {choices}.")
+    return reasoning_policy
+
+
+def _apply_reasoning_policy(
+    messages: list[dict[str, Any]],
+    reasoning_policy: str,
+) -> tuple[list[dict[str, Any]], int]:
+    if reasoning_policy == "keep":
+        return messages, 0
+    stripped_messages = 0
+    resolved_messages = messages
+    for index, message in enumerate(messages):
+        if message.get("role") not in {"assistant", "model"} or not _message_reasoning(message):
+            continue
+        if resolved_messages is messages:
+            resolved_messages = list(messages)
+        updated = dict(message)
+        updated.pop("reasoning_content", None)
+        updated.pop("thinking", None)
+        updated.pop("reasoning", None)
+        resolved_messages[index] = updated
+        stripped_messages += 1
+    return resolved_messages, stripped_messages
 
 
 def _renderer_name(renderer: Any) -> str:
@@ -2270,6 +2310,7 @@ def row_fits_context(
     messages_column: str = "messages",
     tools_column: str = "tools",
     text_column: str = "text",
+    reasoning_policy: str = "keep",
     return_details: bool = False,
 ) -> bool | RowContextFit:
     if not isinstance(max_length, int) or max_length <= 0:
@@ -2292,6 +2333,7 @@ def row_fits_context(
     if not isinstance(tools, list):
         raise TypeError(f"Row has a non-list '{tools_column}' column.")
     messages = _normalize_tool_call_arguments_for_template(normalize_training_messages(messages))
+    messages, _ = _apply_reasoning_policy(messages, _validate_reasoning_policy(reasoning_policy))
     renderer = _resolve_chat_template_renderer(tokenizer, text_tokenizer)
     template_kwargs = _validate_chat_template_kwargs(chat_template_kwargs)
     messages, template_kwargs, _, _ = _resolve_gemma4_thinking_contract(
@@ -2318,6 +2360,7 @@ def format_data(
     tools_column: str = "tools",
     text_column: str = "text",
     chat_template_kwargs: dict[str, Any] | None = None,
+    reasoning_policy: str = "keep",
     train_on_reasoning: bool | None = None,
     teich_masking: bool = True,
     max_length: int | None = None,
@@ -2349,6 +2392,7 @@ def format_data(
                         tools_column=tools_column,
                         text_column=text_column,
                         chat_template_kwargs=chat_template_kwargs,
+                        reasoning_policy=reasoning_policy,
                         train_on_reasoning=train_on_reasoning,
                         teich_masking=teich_masking,
                         max_length=max_length,
@@ -2372,6 +2416,7 @@ def format_data(
         raise TypeError("prepare_data expects a Dataset or a sequence of Dataset objects.")
 
     template_kwargs = _validate_chat_template_kwargs(chat_template_kwargs)
+    effective_reasoning_policy = _validate_reasoning_policy(reasoning_policy)
     text_tokenizer = _resolve_text_tokenizer(tokenizer)
     renderer = _resolve_chat_template_renderer(tokenizer, text_tokenizer)
     assistant_prompt_prefix_cache: dict[str, tuple[str, ...]] = {}
@@ -2430,6 +2475,12 @@ def format_data(
                     report.record_dropped_row(row_info, "empty_messages")
                 continue
             messages = _normalize_tool_call_arguments_for_template(messages)
+            messages, stripped_reasoning_messages = _apply_reasoning_policy(
+                messages,
+                effective_reasoning_policy,
+            )
+            if report is not None:
+                report.record_stripped_reasoning(stripped_reasoning_messages)
             tools = tools_batch[index] or []
             if not isinstance(tools, list):
                 raise TypeError(f"Row is missing a list-valued '{tools_column}' column")

@@ -121,6 +121,65 @@ environment and check it with `python -m pip check` before a long run. Teich's
 core environment does not pin the CUDA, PyTorch, Unsloth, and TRL stack because
 those versions depend on the host GPU and CUDA runtime.
 
+## Live Qwen 3.8 Models
+
+Qwen 3.8 has a different native contract and Teich does not apply Gemma's auto
+mode rules to it. The live `Qwen/Qwen3.8-27B` template defaults to thinking,
+defaults `reasoning_effort` to `xhigh`, and preserves historical
+`reasoning_content` unless `preserve_thinking=False` is supplied. To train its
+native reasoning behavior, retain those defaults or set only the desired
+effort:
+
+```python
+train_dataset = prepare_data(
+    "username/qwen38-reasoning-traces",
+    tokenizer,
+    chat_template_kwargs={"reasoning_effort": "medium"},
+    tokenize=True,
+    strict=True,
+)
+```
+
+Supported live efforts are `low`, `medium`, and `xhigh`. Continue to use
+`train_on_reasoning=True` in `mask_data()` when those reasoning tokens should
+receive loss.
+
+For direct instruction tuning from a dataset that still contains reasoning,
+remove the reasoning before rendering and explicitly select Qwen's
+non-thinking template mode:
+
+```python
+train_dataset, prep_report = prepare_data(
+    "username/mixed-source-traces",
+    tokenizer,
+    reasoning_policy="strip",
+    chat_template_kwargs={
+        "enable_thinking": False,
+        "preserve_thinking": False,
+    },
+    return_report=True,
+    tokenize=True,
+    strict=True,
+)
+```
+
+Qwen 3.8's non-thinking prompt contains an empty `<think>...</think>` primer.
+Teich keeps that inference-alignment prefix in the rendered text but masks it
+from loss. The final answer and closing `<|im_end|>` remain supervised.
+
+## Source Reasoning Policy
+
+`reasoning_policy="keep"` is the default and leaves structured assistant
+reasoning for the loaded chat template to handle according to its own model
+contract. `reasoning_policy="strip"` removes normalized `reasoning_content`
+before rendering. This is deliberately independent of
+`mask_data(train_on_reasoning=False)`: masking keeps gold reasoning in the
+causal context, whereas stripping creates a true instruction-only example.
+
+The policy can be set per source in a mixed dataset. `PrepareReport` records
+the affected row and message counts in `reasoning_stripped_rows` and
+`reasoning_stripped_messages`.
+
 ## What `mask_data()` Does
 
 Before `mask_data()`, the trainer dataset usually contains:
@@ -154,6 +213,12 @@ When the tokenizer supports batched offset mappings, `mask_data()` tokenizes
 each dataset-map batch together instead of issuing one tokenizer call per row.
 
 For Qwen-style templates, the initial `<think>` tag is intentionally included in supervision.
+
+For Gemma 4, Teich supervises exactly one closing `<turn|>` for a completed
+model turn whenever reasoning, final-answer, or tool-call supervision is
+enabled for that turn. It does not add a second terminator inside a continuing
+tool-call chain. The terminator remains a target even when the final answer is
+masked, so reasoning-only and tool-only fine-tunes still learn to stop.
 
 ## Masking Policy
 

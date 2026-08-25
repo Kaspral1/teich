@@ -23,6 +23,7 @@ class _SourceMixEntry:
     percentage: float | None
     has_explicit_mix_value: bool
     chat_template_kwargs: dict[str, Any] | None
+    reasoning_policy: str | None
 
 
 @dataclass(slots=True)
@@ -33,6 +34,7 @@ class _ResolvedSourceMix:
     names: list[str]
     rigid_percentages: bool
     chat_template_kwargs: list[dict[str, Any] | None]
+    reasoning_policies: list[str | None]
 
 
 @dataclass(slots=True)
@@ -57,6 +59,7 @@ def prepare_data(
     tools_column: str = "tools",
     text_column: str = "text",
     chat_template_kwargs: dict[str, Any] | None = None,
+    reasoning_policy: str = "keep",
     train_on_reasoning: bool | None = None,
     teich_masking: bool = True,
     max_length: int | None = None,
@@ -94,6 +97,7 @@ def prepare_data(
                 tools_column=tools_column,
                 text_column=text_column,
                 chat_template_kwargs=_merge_chat_template_kwargs(chat_template_kwargs, source_chat_template_kwargs),
+                reasoning_policy=source_reasoning_policy or reasoning_policy,
                 train_on_reasoning=train_on_reasoning,
                 teich_masking=teich_masking,
                 max_length=max_length,
@@ -108,9 +112,10 @@ def prepare_data(
                 strict=strict,
                 verbose=verbose,
             )
-            for source_dataset, source_chat_template_kwargs, source_name in zip(
+            for source_dataset, source_chat_template_kwargs, source_reasoning_policy, source_name in zip(
                 dataset.datasets,
                 dataset.chat_template_kwargs,
+                dataset.reasoning_policies,
                 dataset.names,
                 strict=True,
             )
@@ -134,6 +139,7 @@ def prepare_data(
                 tools_column=tools_column,
                 text_column=text_column,
                 chat_template_kwargs=chat_template_kwargs,
+                reasoning_policy=reasoning_policy,
                 train_on_reasoning=train_on_reasoning,
                 teich_masking=teich_masking,
                 max_length=max_length,
@@ -171,6 +177,7 @@ def prepare_data(
         tools_column=tools_column,
         text_column=text_column,
         chat_template_kwargs=chat_template_kwargs,
+        reasoning_policy=reasoning_policy,
         train_on_reasoning=train_on_reasoning,
         teich_masking=teich_masking,
         max_length=max_length,
@@ -306,6 +313,10 @@ def _source_mix_entry_from_value(value: Any, *, default_name: str) -> _SourceMix
                     value.get("chat_template_kwargs"),
                     f"{name_value}.chat_template_kwargs",
                 ),
+                reasoning_policy=_optional_reasoning_policy(
+                    value.get("reasoning_policy"),
+                    f"{name_value}.reasoning_policy",
+                ),
             )
         raise TypeError("A source mix entry mapping must include a 'source', 'dataset', or 'path' key.")
     return _SourceMixEntry(
@@ -315,6 +326,7 @@ def _source_mix_entry_from_value(value: Any, *, default_name: str) -> _SourceMix
         percentage=None,
         has_explicit_mix_value=False,
         chat_template_kwargs=None,
+        reasoning_policy=None,
     )
 
 
@@ -382,6 +394,14 @@ def _optional_chat_template_kwargs(value: Any, name: str) -> dict[str, Any] | No
     return dict(value)
 
 
+def _optional_reasoning_policy(value: Any, name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in {"keep", "strip"}:
+        raise ValueError(f"{name} must be either 'keep' or 'strip'.")
+    return value
+
+
 def _merge_chat_template_kwargs(
     global_kwargs: dict[str, Any] | None,
     source_kwargs: dict[str, Any] | None,
@@ -439,6 +459,7 @@ def _resolve_source_mix(
         names=[entry.name for entry in entries],
         rigid_percentages=any(entry.has_explicit_mix_value for entry in entries),
         chat_template_kwargs=[entry.chat_template_kwargs for entry in entries],
+        reasoning_policies=[entry.reasoning_policy for entry in entries],
     )
 
 
