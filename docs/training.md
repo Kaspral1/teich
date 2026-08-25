@@ -129,6 +129,61 @@ environment and check it with `python -m pip check` before a long run. Teich's
 core environment does not pin the CUDA, PyTorch, Unsloth, and TRL stack because
 those versions depend on the host GPU and CUDA runtime.
 
+## Live Granite 4.2 Models
+
+Teich smoke-tests the released IBM checkpoints with their live remote chat
+template:
+
+- `ibm-granite/granite-4.2-3b`
+- `ibm-granite/granite-4.2-8b`
+- `ibm-granite/granite-4.2-30b`
+
+Granite 4.2 uses `<think>...</think>` reasoning and supports full thinking,
+non-thinking, and low-effort thinking. Leave `enable_thinking` unset during
+preparation for Teich's recommended per-row auto mode. Rows with structured
+assistant reasoning use thinking mode; direct rows use non-thinking mode and
+retain Granite's required `<think></think>` inference primer as masked context.
+The final answer and closing `<|im_end|>` remain supervised.
+
+The live template defaults `truncate_history_thinking=True` for inference to
+save context. That is unsafe as an SFT default because every assistant turn is
+a training target. Teich therefore supplies `truncate_history_thinking=False`
+while preparing Granite 4.2 rows. Explicitly requesting truncation fails closed
+when it would remove historical source reasoning. With `return_report=True`,
+inspect `prep_report.granite42_modes` for `thinking`, `nonthinking`, and
+`low_effort` row counts.
+
+For low-effort reasoning, use the live template's `low_effort=True` setting:
+
+```python
+train_dataset = prepare_data(
+    "username/granite42-reasoning-traces",
+    tokenizer,
+    chat_template_kwargs={"low_effort": True},
+    tokenize=True,
+    strict=True,
+)
+```
+
+For true direct-instruction tuning from a reasoning-bearing source, strip the
+reasoning before rendering. Setting `train_on_reasoning=False` only masks its
+loss; it does not remove reasoning from causal context.
+
+```python
+train_dataset = prepare_data(
+    "username/granite42-direct-traces",
+    tokenizer,
+    reasoning_policy="strip",
+    tokenize=True,
+    strict=True,
+)
+```
+
+Do not add `<think>`, `<think></think>`, or `<|im_end|>` to source messages.
+The live template and Teich's per-row contract produce and mask those protocol
+tokens. Tool results remain masked by default, while assistant tool calls and
+their completed-turn `<|im_end|>` are supervised.
+
 ## Live Qwen 3.8 Models
 
 Qwen 3.8 has a different native contract and Teich does not apply Gemma's auto
@@ -230,6 +285,10 @@ masked, so reasoning-only and tool-only fine-tunes still learn to stop. Empty
 final assistant messages and unresolved tool-result prefixes do not create
 synthetic `final_answer` spans; the stopping token is attached only after an
 actual enabled target is selected.
+
+For Granite 4.2, the equivalent stopping token is `<|im_end|>`. Each enabled
+assistant reasoning, answer, or tool-call target retains its completed-turn
+terminator, including reasoning-only and tool-only masking policies.
 
 ## Masking Policy
 

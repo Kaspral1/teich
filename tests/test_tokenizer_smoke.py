@@ -27,6 +27,9 @@ TOKENIZER_SMOKE_MODELS = [
         {},
         id="gemma-4-31b-it",
     ),
+    pytest.param("ibm-granite/granite-4.2-3b", {}, id="granite-4.2-3b"),
+    pytest.param("ibm-granite/granite-4.2-8b", {}, id="granite-4.2-8b"),
+    pytest.param("ibm-granite/granite-4.2-30b", {}, id="granite-4.2-30b"),
 ]
 
 
@@ -146,6 +149,142 @@ def test_real_tokenizer_prepare_and_mask_tool_dataset(model_id: str, chat_templa
             **generation_kwargs,
         )
         assert generation_prompt.endswith("<|channel>thought\n")
+
+    if model_id.startswith("ibm-granite/granite-4.2-"):
+        im_end_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        assert supervised_ids.count(im_end_token_id) == 2
+        assert supervised_text.endswith("Found project files.<|im_end|>\n")
+        assert "<think>\nI should inspect the workspace.\n</think>" in supervised_text
+
+        tool_only_trainer = SimpleNamespace(
+            train_dataset=prepared,
+            eval_dataset=None,
+            processing_class=tokenizer,
+            args=SimpleNamespace(dataset_text_field="text", packing=False, max_length=4096),
+        )
+        tool_only_trainer = mask_data(
+            tool_only_trainer,
+            tokenizer=tokenizer,
+            train_on_reasoning=False,
+            train_on_final_answers=False,
+            train_on_tools=True,
+            audit=True,
+            verbose=False,
+        )
+        tool_only_ids = [
+            token for token in tool_only_trainer.train_dataset[0]["labels"] if token != -100
+        ]
+        tool_only_text = tokenizer.decode(tool_only_ids, skip_special_tokens=False)
+        assert tool_only_ids.count(im_end_token_id) == 1
+        assert tool_only_text.count("<|im_end|>") == 1
+        assert tool_only_text.endswith("<|im_end|>\n")
+        assert "bash" in tool_only_text
+        assert "Found project files." not in tool_only_text
+
+
+@pytest.mark.integration
+@pytest.mark.tokenizer_smoke
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        pytest.param("ibm-granite/granite-4.2-3b", id="granite-4.2-3b-protocol"),
+        pytest.param("ibm-granite/granite-4.2-8b", id="granite-4.2-8b-protocol"),
+        pytest.param("ibm-granite/granite-4.2-30b", id="granite-4.2-30b-protocol"),
+    ],
+)
+def test_real_granite42_auto_modes_history_and_turn_termination(model_id: str):
+    if not _tokenizer_smokes_enabled():
+        pytest.skip("Set TEICH_RUN_TOKENIZER_SMOKES=1 to run real Hugging Face tokenizer smokes.")
+    transformers = pytest.importorskip("transformers")
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "ANSWER_ALPHA", "reasoning_content": "THOUGHT_ALPHA"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "ANSWER_BETA", "reasoning_content": "THOUGHT_BETA"},
+    ]
+    prepared = prepare_data(
+        Dataset.from_list([{"messages": messages, "tools": []}]),
+        tokenizer,
+        tokenize=True,
+        strict=True,
+        verbose=False,
+    )
+    assert "THOUGHT_ALPHA" in prepared[0]["text"]
+    assert "THOUGHT_BETA" in prepared[0]["text"]
+
+    for train_on_reasoning, train_on_final_answers in [(True, False), (False, True)]:
+        trainer = SimpleNamespace(
+            train_dataset=prepared,
+            eval_dataset=None,
+            processing_class=tokenizer,
+            args=SimpleNamespace(dataset_text_field="text", packing=False, max_length=4096),
+        )
+        trainer = mask_data(
+            trainer,
+            tokenizer=tokenizer,
+            train_on_reasoning=train_on_reasoning,
+            train_on_final_answers=train_on_final_answers,
+            train_on_tools=False,
+            audit=True,
+            verbose=False,
+        )
+        supervised_ids = [token for token in trainer.train_dataset[0]["labels"] if token != -100]
+        supervised_text = tokenizer.decode(supervised_ids, skip_special_tokens=False)
+        im_end_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        assert supervised_ids.count(im_end_token_id) == 2
+        assert supervised_text.count("<|im_end|>") == 2
+        assert supervised_text.endswith("<|im_end|>\n")
+        assert ("THOUGHT_ALPHA" in supervised_text) is train_on_reasoning
+        assert ("THOUGHT_BETA" in supervised_text) is train_on_reasoning
+        assert ("ANSWER_ALPHA" in supervised_text) is train_on_final_answers
+        assert ("ANSWER_BETA" in supervised_text) is train_on_final_answers
+
+    direct = prepare_data(
+        Dataset.from_list(
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": "answer directly"},
+                        {"role": "assistant", "content": "direct answer"},
+                    ],
+                    "tools": [],
+                }
+            ]
+        ),
+        tokenizer,
+        tokenize=True,
+        strict=True,
+        verbose=False,
+    )
+    generation_prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "answer directly"}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    assert generation_prompt.endswith("<|im_start|>assistant\n<think></think>")
+    assert "<|im_start|>assistant\n<think></think>direct answer<|im_end|>" in direct[0]["text"]
+    direct_trainer = SimpleNamespace(
+        train_dataset=direct,
+        eval_dataset=None,
+        processing_class=tokenizer,
+        args=SimpleNamespace(dataset_text_field="text", packing=False, max_length=4096),
+    )
+    direct_trainer = mask_data(
+        direct_trainer,
+        tokenizer=tokenizer,
+        train_on_reasoning=False,
+        train_on_final_answers=True,
+        train_on_tools=False,
+        audit=True,
+        verbose=False,
+    )
+    direct_supervised_ids = [
+        token for token in direct_trainer.train_dataset[0]["labels"] if token != -100
+    ]
+    direct_supervised_text = tokenizer.decode(direct_supervised_ids, skip_special_tokens=False)
+    assert direct_supervised_text == "direct answer<|im_end|>\n"
 
 
 @pytest.mark.integration

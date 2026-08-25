@@ -100,6 +100,7 @@ class PrepareReport:
     oversized_rows: list[dict[str, Any]] = field(default_factory=list)
     trimmed_rows: list[dict[str, Any]] = field(default_factory=list)
     gemma4_modes: dict[str, int] = field(default_factory=dict)
+    granite42_modes: dict[str, int] = field(default_factory=dict)
     gemma4_legacy_triggers_normalized: int = 0
     reasoning_stripped_rows: int = 0
     reasoning_stripped_messages: int = 0
@@ -165,6 +166,11 @@ class PrepareReport:
         if normalized_legacy_trigger:
             self.gemma4_legacy_triggers_normalized += 1
 
+    def record_granite42_mode(self, mode: str | None) -> None:
+        if mode is None:
+            return
+        self.granite42_modes[mode] = self.granite42_modes.get(mode, 0) + 1
+
     def record_stripped_reasoning(self, stripped_messages: int) -> None:
         if stripped_messages <= 0:
             return
@@ -184,6 +190,7 @@ class PrepareReport:
             "oversized_rows": self.oversized_rows,
             "trimmed_rows": self.trimmed_rows,
             "gemma4_modes": self.gemma4_modes,
+            "granite42_modes": self.granite42_modes,
             "gemma4_legacy_triggers_normalized": self.gemma4_legacy_triggers_normalized,
             "reasoning_stripped_rows": self.reasoning_stripped_rows,
             "reasoning_stripped_messages": self.reasoning_stripped_messages,
@@ -197,6 +204,7 @@ class _RenderedRow:
     tokenized: tuple[list[int], list[int]] | None
     token_length: int | None
     gemma4_mode: str | None = None
+    granite42_mode: str | None = None
     normalized_legacy_trigger: bool = False
 
 
@@ -284,12 +292,33 @@ def _is_gemma4_renderer(renderer: Any) -> bool:
     )
 
 
+def _is_granite42_renderer(renderer: Any) -> bool:
+    if "granite-4.2" in _renderer_name(renderer):
+        return True
+    template = getattr(renderer, "chat_template", None)
+    return (
+        isinstance(template, str)
+        and "truncate_history_thinking" in template
+        and "<think></think>" in template
+        and "<|im_start|>" in template
+        and "<|im_end|>" in template
+    )
+
+
 def _message_reasoning(message: dict[str, Any]) -> str:
     for key in ("reasoning_content", "thinking", "reasoning"):
         value = message.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+def _message_has_inline_thinking(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    if not isinstance(content, str):
+        return False
+    stripped = content.lstrip()
+    return stripped.startswith("<think>") and "</think>" in stripped
 
 
 def _message_text_contains(message: dict[str, Any], needle: str) -> bool:
@@ -417,6 +446,70 @@ def _resolve_gemma4_thinking_contract(
             )
     mode = "thinking" if thinking_enabled else "nonthinking"
     return resolved_messages, resolved_kwargs, mode, normalized_legacy_trigger
+
+
+def _resolve_granite42_thinking_contract(
+    renderer: Any,
+    messages: list[dict[str, Any]],
+    chat_template_kwargs: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any], str | None]:
+    if not _is_granite42_renderer(renderer):
+        return messages, chat_template_kwargs, None
+
+    resolved_kwargs = dict(chat_template_kwargs)
+    for key in ("enable_thinking", "low_effort", "truncate_history_thinking"):
+        if key in resolved_kwargs and not isinstance(resolved_kwargs[key], bool):
+            raise ValueError(f"Granite 4.2 {key} must be a boolean when provided.")
+
+    reasoning_indexes = [
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") in {"assistant", "model"}
+        and (_message_reasoning(message) or _message_has_inline_thinking(message))
+    ]
+    low_effort = (
+        resolved_kwargs.get("low_effort", False) is True
+        or resolved_kwargs.get("reasoning_effort") == "low"
+    )
+    explicit_thinking = "enable_thinking" in resolved_kwargs
+    thinking_enabled = (
+        resolved_kwargs["enable_thinking"]
+        if explicit_thinking
+        else bool(reasoning_indexes or low_effort)
+    )
+    if not thinking_enabled and reasoning_indexes:
+        raise ValueError(
+            "Granite 4.2 thinking is disabled, but this row contains reasoning. Use "
+            "chat_template_kwargs={'enable_thinking': True}, omit enable_thinking for auto mode, "
+            "or use reasoning_policy='strip' for direct-response training."
+        )
+    if low_effort and not thinking_enabled:
+        raise ValueError(
+            "Granite 4.2 low-effort reasoning requires enable_thinking=True. Remove the low-effort "
+            "setting for non-thinking training or enable thinking."
+        )
+
+    last_user_index = max(
+        (index for index, message in enumerate(messages) if message.get("role") == "user"),
+        default=-1,
+    )
+    has_historical_reasoning = any(index < last_user_index for index in reasoning_indexes)
+    if resolved_kwargs.get("truncate_history_thinking") is True and has_historical_reasoning:
+        raise ValueError(
+            "Granite 4.2 truncate_history_thinking=True would remove reasoning from earlier "
+            "assistant targets during multi-turn SFT. Set it to False or omit it so Teich preserves "
+            "the source reasoning."
+        )
+
+    resolved_kwargs["enable_thinking"] = thinking_enabled
+    # Granite's inference-oriented default strips historical thought. SFT renders
+    # every assistant message as a target, so preserve the source unless the user
+    # explicitly requests truncation for a row without historical reasoning.
+    resolved_kwargs.setdefault("truncate_history_thinking", False)
+    mode = "thinking" if thinking_enabled else "nonthinking"
+    if low_effort:
+        mode = "low_effort"
+    return messages, resolved_kwargs, mode
 
 
 def _gemma4_nonthinking_generation_suffix(
@@ -2266,6 +2359,11 @@ def _render_training_row(
     messages, template_kwargs, gemma4_mode, normalized_legacy_trigger = (
         _resolve_gemma4_thinking_contract(renderer, messages, template_kwargs)
     )
+    messages, template_kwargs, granite42_mode = _resolve_granite42_thinking_contract(
+        renderer,
+        messages,
+        template_kwargs,
+    )
     if teich_masking:
         text, supervised_spans = _supervised_text_and_spans(
             renderer,
@@ -2294,6 +2392,7 @@ def _render_training_row(
         tokenized=tokenized,
         token_length=token_length,
         gemma4_mode=gemma4_mode,
+        granite42_mode=granite42_mode,
         normalized_legacy_trigger=normalized_legacy_trigger,
     )
 
@@ -2334,6 +2433,11 @@ def row_fits_context(
     renderer = _resolve_chat_template_renderer(tokenizer, text_tokenizer)
     template_kwargs = _validate_chat_template_kwargs(chat_template_kwargs)
     messages, template_kwargs, _, _ = _resolve_gemma4_thinking_contract(
+        renderer,
+        messages,
+        template_kwargs,
+    )
+    messages, template_kwargs, _ = _resolve_granite42_thinking_contract(
         renderer,
         messages,
         template_kwargs,
@@ -2632,6 +2736,7 @@ def format_data(
                     rendered.gemma4_mode,
                     normalized_legacy_trigger=rendered.normalized_legacy_trigger,
                 )
+                report.record_granite42_mode(rendered.granite42_mode)
         return output_batch
 
     formatted_data = dataset.map(
