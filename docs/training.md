@@ -57,11 +57,54 @@ are:
 - `google/gemma-4-26B-A4B-it`
 - `google/gemma-4-31B-it`
 
-Pass `chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True}`
-to `prepare_data()`. Do not replace `tokenizer.chat_template` unless you are
-intentionally testing a maintained fork. Teich supervises the closing
-`<turn|>` token for completed Gemma responses while keeping system, user, and
-tool-response context masked.
+Gemma 4 does not infer this mode from the presence of reasoning labels alone.
+The live template enables thinking by placing `<|think|>` at the beginning of
+the system turn when `enable_thinking=True`; do not embed that token manually,
+because enabling the template would then duplicate it. For thinking SFT, pass
+`chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True}`.
+`preserve_thinking=True` is required for multi-turn rows with historical
+reasoning; otherwise the upstream template silently omits reasoning from all
+but the last assistant turn.
+
+For non-thinking SFT, pass `{"enable_thinking": False}` and use rows that have
+neither reasoning fields nor a manually embedded `<|think|>` system trigger.
+The live template will render `reasoning_content` even when thinking is off,
+which creates an internally inconsistent example; Teich rejects that state.
+The 26B-A4B and 31B generation prompts also insert an empty thought channel in
+non-thinking mode while E4B does not. Teich detects this from the loaded live
+template and mirrors the prefix in completed training turns so SFT and
+inference contexts agree.
+
+Do not replace `tokenizer.chat_template` unless you are intentionally testing a
+maintained fork. Teich supervises the closing `<turn|>` token for completed
+Gemma responses while keeping system, user, tool-response, and generated prompt
+prefix context masked.
+
+Thinking and non-thinking examples can be mixed safely by separating them into
+sources with source-level template kwargs:
+
+```python
+train_dataset = prepare_data(
+    {
+        "thinking": {
+            "source": "username/gemma-thinking-traces",
+            "percentage": 60,
+            "chat_template_kwargs": {
+                "enable_thinking": True,
+                "preserve_thinking": True,
+            },
+        },
+        "direct": {
+            "source": "username/gemma-direct-traces",
+            "percentage": 40,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    },
+    tokenizer,
+    tokenize=True,
+    strict=True,
+)
+```
 
 `gemma4_example.py` uses the live remote template by default. Set
 `CHAT_TEMPLATE_PATH` only to opt into a local custom template, and set

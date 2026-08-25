@@ -115,9 +115,11 @@ class DatasetUploadRequest(BaseModel):
 _docker_cache: dict[str, Any] = {"checked_at": 0.0, "available": False, "detail": None}
 TERMINAL_READY_STATUSES = {"ready", "live", "exited", "error"}
 TERMINAL_STARTUP_NOTICE_SECONDS = 15.0
+TERMINAL_OUTPUT_QUEUE_LIMIT = 256
 EXTRACT_PROVIDERS = {"claude", "codex", "cursor", "hermes", "pi"}
 UPLOAD_IGNORE_PATTERNS = ["partials/**", "failures/**"]
 UPLOAD_METADATA_PATTERNS = ["README.md", "tools.json"]
+UPLOAD_DATA_PATTERNS = ["*.jsonl", "**/*.jsonl", "*.metadata.json", "**/*.metadata.json"]
 
 
 def _normalize_extract_provider(provider: str) -> ExtractProvider:
@@ -241,7 +243,7 @@ def _sse(log: EventLog, after: int) -> StreamingResponse:
             if events:
                 for event in events:
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                index += len(events)
+                index = int(events[-1]["seq"]) + 1
                 idle_cycles = 0
             else:
                 if log.closed:
@@ -331,6 +333,7 @@ def _upload_dataset_folder(
             folder_path=str(folder_path),
             repo_type="dataset",
             private=private,
+            allow_patterns=UPLOAD_DATA_PATTERNS,
             ignore_patterns=list(dict.fromkeys([*ignore_patterns, *UPLOAD_METADATA_PATTERNS])),
         )
     else:
@@ -339,6 +342,7 @@ def _upload_dataset_folder(
             repo_id=repo_id,
             repo_type="dataset",
             commit_message="Upload teich dataset output",
+            allow_patterns=[*UPLOAD_DATA_PATTERNS, *UPLOAD_METADATA_PATTERNS],
             ignore_patterns=ignore_patterns,
         )
     return str(repo_url)
@@ -519,10 +523,10 @@ def create_app(project_dir: Path) -> FastAPI:
         ]
         model_filter = (payload.model or "").strip() or None
         config_output = str(output_dir) if Path(output_value).expanduser().is_absolute() else output_value
-        try:
+
+        def persist_output_config() -> None:
             state.write_config_data({"output": {"traces_dir": config_output}})
-        except Exception:
-            pass
+
         try:
             job = extraction.start(
                 provider,
@@ -530,9 +534,12 @@ def create_app(project_dir: Path) -> FastAPI:
                 source_paths=source_paths,
                 model_filter=model_filter,
                 skip_anonymize=payload.skip_anonymize,
+                before_start=persist_output_config,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         return job.to_dict()
 
     @app.get("/api/extract")
@@ -635,10 +642,18 @@ def create_app(project_dir: Path) -> FastAPI:
             return
         await websocket.accept()
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[str] = asyncio.Queue()
+        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=TERMINAL_OUTPUT_QUEUE_LIMIT)
+
+        def enqueue_output(text: str) -> None:
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            queue.put_nowait(text)
 
         def on_output(text: str) -> None:
-            loop.call_soon_threadsafe(queue.put_nowait, text)
+            loop.call_soon_threadsafe(enqueue_output, text)
 
         await _wait_for_terminal_session_ready(websocket, session)
         if session.status == "error":

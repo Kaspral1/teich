@@ -17,6 +17,7 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "outputs/gemma-tool-sft")
 HUB_REPO_ID = os.environ.get("HUB_REPO_ID") or ""
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 CHAT_TEMPLATE_PATH = os.environ.get("CHAT_TEMPLATE_PATH")
+ENABLE_THINKING = os.environ.get("GEMMA4_ENABLE_THINKING", "1").strip().lower() not in {"0", "false", "no"}
 
 model, tokenizer = FastModel.from_pretrained(
     model_name=MODEL_NAME,
@@ -66,7 +67,12 @@ train_dataset = prepare_data(
     tokenizer,
     split="train",
     hf_token=HF_TOKEN,
-    chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True},
+    # Non-thinking datasets must not contain reasoning fields or a manual
+    # <|think|> system trigger; Teich rejects those inconsistent rows.
+    chat_template_kwargs={
+        "enable_thinking": ENABLE_THINKING,
+        "preserve_thinking": ENABLE_THINKING,
+    },
     max_length=MAX_SEQ_LEN,
     oversized_policy="trim_followups",
     tokenize=True,

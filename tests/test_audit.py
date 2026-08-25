@@ -97,6 +97,17 @@ def test_audit_sft_dataset_rejects_gemma_context_markers():
     assert "<|tool_response>" in report.errors[1]
 
 
+def test_audit_sft_dataset_checks_all_rows_by_default():
+    safe = {"input_ids": [1, 2, 4], "attention_mask": [1, 1, 1], "labels": [-100, 2, 4]}
+    leaked = {"input_ids": [6, 2], "attention_mask": [1, 1], "labels": [6, 2]}
+    dataset = Dataset.from_list([safe] * 8 + [leaked])
+
+    report = audit_sft_dataset(dataset, TinyTokenizer())
+
+    assert not report.ok
+    assert any("row 8" in error and "<|turn>user" in error for error in report.errors)
+
+
 def test_teich_example_has_single_safe_training_flow():
     source = Path("teich_example.py").read_text(encoding="utf-8")
     tree = ast.parse(source)

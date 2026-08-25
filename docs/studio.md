@@ -119,7 +119,7 @@ https://huggingface.co/datasets/<owner>/<dataset>/embed/viewer
 
 That official embed works for datasets already available on the Hub. For unpublished local output, Studio uses Teich's local converter to approximate the parts of the viewer that matter before upload. The full Hugging Face viewer backend is hosted by Hugging Face and adds Parquet-backed row serving, search, filtering, SQL, and statistics after the dataset is uploaded and processed.
 
-The Studio upload button regenerates the dataset card before publishing. The card stays intentionally short and points readers to the maintained training docs; large dataset-level tool snapshots are written to `tools.json` and uploaded alongside the JSONL files.
+The Studio upload button regenerates the dataset card before publishing. The card stays intentionally short and points readers to the maintained training docs; dataset JSONL, generated metadata JSON, `README.md`, and `tools.json` are allowlisted for upload. Unrelated files in the output directory are not published.
 
 ## Requirements
 

@@ -32,6 +32,7 @@ RUNNER_CLASSES = {
     "hermes_agent": HermesRunner,
     "chat": ChatRunner,
 }
+JOB_HISTORY_LIMIT = 20
 
 
 class GenerationStopped(RuntimeError):
@@ -66,9 +67,11 @@ class GenerationJob:
         self._lock = threading.RLock()
         self._runner: Any = None
         self._stop_requested = False
+        self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        threading.Thread(target=self._run, name=f"studio-generate-{self.id[:8]}", daemon=True).start()
+        self._thread = threading.Thread(target=self._run, name=f"studio-generate-{self.id[:8]}", daemon=True)
+        self._thread.start()
 
     def _emit_status(self, status: str, message: str | None = None) -> None:
         self.status = status
@@ -230,11 +233,20 @@ class GenerationManager:
         with self._lock:
             if self._current is not None and self._current.status in {"starting", "running"}:
                 raise RuntimeError("A generation run is already in progress")
+            self._prune_locked()
             job = GenerationJob(config, resume=resume)
             self._jobs[job.id] = job
             self._current = job
         job.start()
         return job
+
+    def _prune_locked(self) -> None:
+        overflow = len(self._jobs) - JOB_HISTORY_LIMIT + 1
+        if overflow <= 0:
+            return
+        completed = [job_id for job_id, job in self._jobs.items() if job.status not in {"starting", "running"}]
+        for job_id in completed[:overflow]:
+            self._jobs.pop(job_id, None)
 
     def current(self) -> GenerationJob | None:
         with self._lock:

@@ -81,7 +81,7 @@ teich extract codex --model gpt-5-codex --out codex-data
 
 `--model` filters by provider model metadata, not by arbitrary prompt text. This keeps traces that actually ran with matching model identifiers such as `claude-fable-5` and excludes traces that only mention the model name in conversation text.
 
-After extraction, Teich automatically scrubs API keys, emails, and home-directory usernames while preserving embedded media payloads for conversation context. It then prints the replacement counts and asks whether to upload to Hugging Face. If you need a raw, unchanged local export, pass `--no-anon` or `--no-anonymize`:
+After extraction, Teich automatically scrubs API keys, emails, contextual PII, home-directory usernames, and embedded media payloads. It then prints the replacement counts and asks whether to upload to Hugging Face. If you need a raw, unchanged local export, pass `--no-anon` or `--no-anonymize`:
 
 ```bash
 teich extract codex --sessions-dir /path/to/.codex --out raw-codex-data --no-anon

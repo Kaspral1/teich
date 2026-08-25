@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+import base64
 import hashlib
 import multiprocessing
 import os
@@ -286,6 +287,25 @@ class TraceAnonymizer:
         r"(?:(?<![A-Za-z0-9_-])|(?<=\\n))([A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})(?![A-Za-z0-9_-])"
     )
     _bearer_pattern = re.compile(r"(?i)(\bBearer\s+)([A-Za-z0-9._~+/=-]{24,})")
+    _ssn_pattern = re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)")
+    _phone_pattern = re.compile(
+        r"(?i)(?P<prefix>\b(?:phone|telephone|tel|call(?:\s+me)?\s+at)\s*[:=]?\s*)"
+        r"(?P<value>(?:\+?1[\s.-]?)?(?:(?:\(\d{3}\)|\d{3})[\s.-]?)\d{3}[\s.-]?\d{4})"
+    )
+    _ip_pattern = re.compile(
+        r"(?i)(?P<prefix>\b(?:ip|ip\s+address|host\s+address)\s*[:=]?\s*)"
+        r"(?P<value>(?:\d{1,3}\.){3}\d{1,3})"
+    )
+    _name_pattern = re.compile(
+        r"(?i)(?P<prefix>\b(?:my\s+name\s+is|full\s+name\s*[:=]|name\s*[:=])\s*)"
+        r"(?P<value>[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){1,3})"
+    )
+    _address_pattern = re.compile(
+        r"(?i)(?P<prefix>\b(?:address\s*[:=]|i\s+live\s+at)\s*)"
+        r"(?P<value>\d{1,6}\s+[A-Za-z0-9][A-Za-z0-9 .'-]{1,80}"
+        r"(?:street|st|road|rd|avenue|ave|boulevard|blvd|lane|ln|drive|dr|court|ct|way)\b"
+        r"(?:,\s*[A-Za-z .'-]{2,40})?(?:,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)?)"
+    )
     # Match an assignment name from the start of the complete identifier, then
     # decide whether it is sensitive in _replace_generic_secret. The explicit
     # identifier-character lookbehind is load-bearing: unlike a word boundary,
@@ -642,8 +662,24 @@ class TraceAnonymizer:
         "dsn",
         "connection",
     )
+    _structured_pii_keys = {
+        "address",
+        "first_name",
+        "full_name",
+        "home_address",
+        "ip_address",
+        "last_name",
+        "mobile",
+        "phone",
+        "phone_number",
+        "social_security_number",
+        "ssn",
+        "street_address",
+        "telephone",
+    }
+
     def __init__(self) -> None:
-        self.counts = {"email": 0, "username": 0, "api_key": 0}
+        self.counts = {"email": 0, "username": 0, "api_key": 0, "pii": 0, "media": 0}
         self._email_map: dict[str, str] = {}
         self._username_map: dict[str, str] = {}
         self._api_key_map: dict[str, str] = {}
@@ -660,26 +696,26 @@ class TraceAnonymizer:
         return value
 
     def _anonymize_mapping(self, value: dict[Any, Any]) -> dict[Any, Any]:
-        should_preserve_base64_data = self._looks_like_base64_media_source(value)
+        should_redact_base64_data = self._looks_like_base64_media_source(value)
         role = value.get("role")
         is_assistant_message = isinstance(role, str) and role.lower() == "assistant"
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
             redacted_key = self.anonymize_value(key)
             if (
-                should_preserve_base64_data
+                should_redact_base64_data
                 and key == "data"
                 and isinstance(item, str)
                 and self._looks_like_base64_blob(item)
             ):
-                redacted[redacted_key] = item
+                redacted[redacted_key] = self._redact_base64_media(item)
             elif is_assistant_message and key in {"content", "reasoning_content", "thinking"}:
-                # Assistant-authored prose and code frequently demonstrate
-                # credentials, JWTs, connection strings, and email addresses.
-                # Treating those examples as private input corrupts otherwise
-                # valid training targets. Identity-bearing local paths still
-                # get scrubbed; structured tool inputs remain on the full path.
+                # Assistant responses can echo credentials and personal data
+                # supplied by users or tools. Apply the same high-confidence
+                # privacy rules here instead of assuming the content is synthetic.
                 redacted[redacted_key] = self._anonymize_assistant_generated_value(item)
+            elif isinstance(key, str) and isinstance(item, str) and self._is_structured_pii_key(key):
+                redacted[redacted_key] = self._redact_structured_pii(item)
             elif isinstance(key, str) and self._should_redact_mapping_value(key, item):
                 redacted[redacted_key] = self._redact_mapping_value(key, item)
             else:
@@ -688,7 +724,7 @@ class TraceAnonymizer:
 
     def _anonymize_assistant_generated_value(self, value: Any) -> Any:
         if isinstance(value, str):
-            return self._anonymize_identity_text(value)
+            return self.anonymize_text(value)
         if isinstance(value, list):
             return [self._anonymize_assistant_content_block(item) for item in value]
         if isinstance(value, dict):
@@ -727,6 +763,15 @@ class TraceAnonymizer:
         value = str(item)
         return self._assignment_secret_replacement(key, value)
 
+    @classmethod
+    def _is_structured_pii_key(cls, key: str) -> bool:
+        normalized = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+        return normalized in cls._structured_pii_keys
+
+    def _redact_structured_pii(self, value: str) -> str:
+        self.counts["pii"] += 1
+        return self._pii_replacement(value)
+
     @staticmethod
     def _looks_like_base64_media_source(value: dict[Any, Any]) -> bool:
         source_type = value.get("type")
@@ -747,13 +792,38 @@ class TraceAnonymizer:
             return False
         return re.fullmatch(r"[A-Za-z0-9+/=\s]+", value) is not None
 
+    def _redact_base64_media(self, value: str) -> str:
+        """Replace opaque media with a deterministic, valid base64 marker."""
+        marker = f"[redacted media {self._dummy_sequence(value, 16)}]".encode("utf-8")
+        self.counts["media"] += 1
+        return base64.b64encode(marker).decode("ascii")
+
     def anonymize_text(self, text: str) -> str:
         lowered = text.lower()
         if "@" in text:
             text = self._replace_emails(text)
         text = self._anonymize_identity_text(text, lowered=lowered)
         text = self._replace_api_keys(text)
+        text = self._replace_high_confidence_pii(text)
         return text
+
+    def _replace_high_confidence_pii(self, text: str) -> str:
+        def replace_value(match: re.Match[str]) -> str:
+            value = match.group("value")
+            self.counts["pii"] += 1
+            return match.group("prefix") + self._pii_replacement(value)
+
+        def replace_ssn(match: re.Match[str]) -> str:
+            self.counts["pii"] += 1
+            return self._pii_replacement(match.group(0))
+
+        text = self._ssn_pattern.sub(replace_ssn, text)
+        for pattern in (self._phone_pattern, self._ip_pattern, self._name_pattern, self._address_pattern):
+            text = pattern.sub(replace_value, text)
+        return text
+
+    def _pii_replacement(self, value: str) -> str:
+        return "redacted_pii_" + self._dummy_sequence(value, 16)
 
     def _anonymize_identity_text(self, text: str, *, lowered: str | None = None) -> str:
         lowered = text.lower() if lowered is None else lowered

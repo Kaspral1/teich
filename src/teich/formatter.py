@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 import json
 import re
+import weakref
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -18,6 +19,8 @@ _GEMMA_TURN_START_PATTERN = re.compile(r"<\|turn>(model|user|system)\n")
 _GEMMA_ASSISTANT_TURN_PREFIX = "<|turn>model\n"
 _GEMMA_TURN_END = "<turn|>"
 _GEMMA_THOUGHT_PREFIX = "<|channel>thought\n"
+_GEMMA_THOUGHT_END = "<channel|>"
+_GEMMA_THINK_TRIGGER = "<|think|>"
 _GEMMA_TOOL_RESPONSE_START = "<|tool_response>"
 _GEMMA_TOOL_RESPONSE_END = "<tool_response|>"
 _TOOL_RESPONSE_DELIMITERS = (
@@ -72,6 +75,7 @@ _TEICH_LABEL_PADDING_COLLATOR_NAMES = {
 }
 _OVERSIZED_POLICIES = {"drop", "trim_followups", "error"}
 _OVERSIZED_POLICY_KEEP = "keep"
+_GEMMA4_PREFIX_CACHE: weakref.WeakKeyDictionary[Any, dict[str, str]] = weakref.WeakKeyDictionary()
 
 
 @dataclass(slots=True)
@@ -208,6 +212,156 @@ def _validate_chat_template_kwargs(chat_template_kwargs: dict[str, Any] | None) 
     return kwargs
 
 
+def _renderer_name(renderer: Any) -> str:
+    for candidate in (renderer, getattr(renderer, "tokenizer", None)):
+        name = getattr(candidate, "name_or_path", None)
+        if isinstance(name, str) and name:
+            return name.lower()
+    return ""
+
+
+def _is_gemma4_renderer(renderer: Any) -> bool:
+    if "gemma-4" in _renderer_name(renderer):
+        return True
+    template = getattr(renderer, "chat_template", None)
+    return (
+        isinstance(template, str)
+        and "<|turn>model" in template
+        and _GEMMA_THINK_TRIGGER in template
+    )
+
+
+def _message_reasoning(message: dict[str, Any]) -> str:
+    for key in ("reasoning_content", "thinking", "reasoning"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _message_text_contains(message: dict[str, Any], needle: str) -> bool:
+    content = message.get("content")
+    if isinstance(content, str):
+        return needle in content
+    if isinstance(content, list):
+        return any(
+            isinstance(part, dict)
+            and isinstance(part.get("text"), str)
+            and needle in part["text"]
+            for part in content
+        )
+    return False
+
+
+def _validate_gemma4_thinking_contract(
+    renderer: Any,
+    messages: list[dict[str, Any]],
+    chat_template_kwargs: dict[str, Any],
+) -> None:
+    if not _is_gemma4_renderer(renderer):
+        return
+    thinking_enabled = chat_template_kwargs.get("enable_thinking", False) is True
+    reasoning_indexes = [
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") in {"assistant", "model"} and _message_reasoning(message)
+    ]
+    manual_trigger = any(
+        message.get("role") in {"system", "developer"}
+        and _message_text_contains(message, _GEMMA_THINK_TRIGGER)
+        for message in messages
+    )
+    if manual_trigger:
+        raise ValueError(
+            "Gemma 4 system/developer content already contains <|think|>. Do not embed the trigger "
+            "manually: use chat_template_kwargs={'enable_thinking': True, "
+            "'preserve_thinking': True} so the live template inserts it exactly once."
+        )
+    if not thinking_enabled and reasoning_indexes:
+        raise ValueError(
+            "Gemma 4 thinking is disabled, but this row contains reasoning. Use "
+            "chat_template_kwargs={'enable_thinking': True, "
+            "'preserve_thinking': True} for thinking data, or remove reasoning for non-thinking data."
+        )
+    if thinking_enabled and chat_template_kwargs.get("preserve_thinking", False) is not True:
+        last_assistant = max(
+            (
+                index
+                for index, message in enumerate(messages)
+                if message.get("role") in {"assistant", "model"}
+            ),
+            default=-1,
+        )
+        if any(index != last_assistant for index in reasoning_indexes):
+            raise ValueError(
+                "Gemma 4 preserve_thinking=False drops reasoning from earlier assistant turns. "
+                "Set preserve_thinking=True for multi-turn thinking SFT."
+            )
+
+
+def _gemma4_nonthinking_generation_suffix(
+    renderer: Any,
+    chat_template_kwargs: dict[str, Any],
+) -> str:
+    if not _is_gemma4_renderer(renderer) or chat_template_kwargs.get("enable_thinking", False) is True:
+        return ""
+    try:
+        serialized_kwargs = json.dumps(chat_template_kwargs, sort_keys=True, default=repr)
+    except TypeError:
+        serialized_kwargs = repr(chat_template_kwargs)
+    try:
+        renderer_cache = _GEMMA4_PREFIX_CACHE.setdefault(renderer, {})
+    except TypeError:
+        renderer_cache = {}
+    if serialized_kwargs in renderer_cache:
+        return renderer_cache[serialized_kwargs]
+    probe = [{"role": "user", "content": "__TEICH_GEMMA4_PROBE__"}]
+    base_kwargs = {"tokenize": False, "add_generation_prompt": False, **chat_template_kwargs}
+    prompt_kwargs = {"tokenize": False, "add_generation_prompt": True, **chat_template_kwargs}
+    try:
+        base = _apply_chat_template_with_gemma_fallback(renderer, probe, base_kwargs)
+        prompt = _apply_chat_template_with_gemma_fallback(renderer, probe, prompt_kwargs)
+    except Exception:
+        renderer_cache[serialized_kwargs] = ""
+        return ""
+    if not isinstance(base, str) or not isinstance(prompt, str) or not prompt.startswith(base):
+        renderer_cache[serialized_kwargs] = ""
+        return ""
+    generation_prefix = prompt[len(base):]
+    if not generation_prefix.startswith(_GEMMA_ASSISTANT_TURN_PREFIX):
+        renderer_cache[serialized_kwargs] = ""
+        return ""
+    suffix = generation_prefix[len(_GEMMA_ASSISTANT_TURN_PREFIX):]
+    if suffix == _GEMMA_THOUGHT_PREFIX + _GEMMA_THOUGHT_END:
+        renderer_cache[serialized_kwargs] = suffix
+        return suffix
+    renderer_cache[serialized_kwargs] = ""
+    return ""
+
+
+def _align_gemma4_nonthinking_training_text(
+    renderer: Any,
+    text: str,
+    chat_template_kwargs: dict[str, Any],
+) -> str:
+    suffix = _gemma4_nonthinking_generation_suffix(renderer, chat_template_kwargs)
+    if not suffix:
+        return text
+    parts: list[str] = []
+    cursor = 0
+    for match in _GEMMA_TURN_START_PATTERN.finditer(text):
+        if match.group(1) != "model":
+            continue
+        parts.append(text[cursor:match.end()])
+        if not text.startswith(_GEMMA_THOUGHT_PREFIX, match.end()):
+            parts.append(suffix)
+        cursor = match.end()
+    if not parts:
+        return text
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
 def _as_text_content_parts(content: Any) -> Any:
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
@@ -284,7 +438,7 @@ def _render_chat(
     rendered = _apply_chat_template_with_gemma_fallback(renderer, messages, render_kwargs)
     if not isinstance(rendered, str):
         raise TypeError("tokenizer.apply_chat_template(..., tokenize=False) must return a string")
-    return rendered
+    return _align_gemma4_nonthinking_training_text(renderer, rendered, chat_template_kwargs)
 
 
 def _normalize_tool_call_arguments_for_template(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1980,6 +2134,7 @@ def _render_training_row(
     assistant_prompt_prefix_cache: dict[str, tuple[str, ...]],
     strict: bool,
 ) -> _RenderedRow | None:
+    _validate_gemma4_thinking_contract(renderer, messages, template_kwargs)
     if teich_masking:
         text, supervised_spans = _supervised_text_and_spans(
             renderer,
@@ -2550,7 +2705,7 @@ def mask_data(
     train_on_tool_responses: bool = False,
     max_supervised_tokens: int | None = None,
     audit: bool = True,
-    audit_sample_size: int = 8,
+    audit_sample_size: int | None = None,
     verbose: bool = True,
 ) -> Any:
     from .audit import audit_sft_dataset

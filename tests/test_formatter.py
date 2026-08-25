@@ -449,6 +449,126 @@ class GemmaLikeOffsetTokenizer(OffsetCountingTokenizer):
         return rendered
 
 
+def test_gemma4_rejects_reasoning_when_thinking_is_disabled():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer", "reasoning_content": "reason"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="Gemma 4 thinking is disabled"):
+        prepare_data(
+            dataset,
+            tokenizer,
+            chat_template_kwargs={"enable_thinking": False},
+            strict=True,
+            verbose=False,
+        )
+
+
+@pytest.mark.parametrize("enable_thinking", [False, True])
+def test_gemma4_rejects_manual_think_trigger_in_source_data(enable_thinking: bool):
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-E4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "system", "content": "<|think|>"},
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="Do not embed the trigger manually"):
+        prepare_data(
+            dataset,
+            tokenizer,
+            chat_template_kwargs={
+                "enable_thinking": enable_thinking,
+                "preserve_thinking": enable_thinking,
+            },
+            strict=True,
+            verbose=False,
+        )
+
+
+def test_gemma4_rejects_dropped_historical_reasoning():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-31B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "one", "reasoning_content": "reason one"},
+                    {"role": "user", "content": "second"},
+                    {"role": "assistant", "content": "two", "reasoning_content": "reason two"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="preserve_thinking=False"):
+        prepare_data(
+            dataset,
+            tokenizer,
+            chat_template_kwargs={"enable_thinking": True, "preserve_thinking": False},
+            strict=True,
+            verbose=False,
+        )
+
+
+def test_gemma4_nonthinking_training_matches_empty_thought_generation_prefix():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared = prepare_data(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"enable_thinking": False},
+        strict=True,
+        verbose=False,
+    )
+
+    assert "<|turn>model\n<|channel>thought\n<channel|>answer<turn|>" in prepared[0]["text"]
+    training_data = prepare_and_mask_for_test(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"enable_thinking": False},
+        strict=True,
+    )
+    supervised_text = tokenizer.decode(
+        [token for token in training_data[0]["labels"] if token != -100]
+    )
+    assert "<|channel>thought" not in supervised_text
+    assert "answer" in supervised_text
+    assert supervised_text.endswith("<turn|>")
+
+
 def test_reordered_mapping_markers_preserve_typed_tool_spans():
     class SortedToolArgumentTokenizer(OffsetCountingTokenizer):
         def apply_chat_template(self, messages, *, tokenize=False, add_generation_prompt=False, tools=None, **kwargs):

@@ -11,9 +11,21 @@ from teich import mask_data, prepare_data
 
 TOKENIZER_SMOKE_MODELS = [
     pytest.param("unsloth/Qwen3.5-0.8B", {"enable_thinking": True}, id="unsloth-qwen3.5"),
-    pytest.param("google/gemma-4-E4B-it", {"enable_thinking": True}, id="gemma-4-e4b-it"),
-    pytest.param("google/gemma-4-26B-A4B-it", {"enable_thinking": True}, id="gemma-4-26b-a4b-it"),
-    pytest.param("google/gemma-4-31B-it", {"enable_thinking": True}, id="gemma-4-31b-it"),
+    pytest.param(
+        "google/gemma-4-E4B-it",
+        {"enable_thinking": True, "preserve_thinking": True},
+        id="gemma-4-e4b-it",
+    ),
+    pytest.param(
+        "google/gemma-4-26B-A4B-it",
+        {"enable_thinking": True, "preserve_thinking": True},
+        id="gemma-4-26b-a4b-it",
+    ),
+    pytest.param(
+        "google/gemma-4-31B-it",
+        {"enable_thinking": True, "preserve_thinking": True},
+        id="gemma-4-31b-it",
+    ),
 ]
 
 
@@ -111,6 +123,7 @@ def test_real_tokenizer_prepare_and_mask_tool_dataset(model_id: str, chat_templa
     assert "SECRET_TOOL_OUTPUT" in masked_text
 
     if model_id.startswith("google/gemma-4-"):
+        assert "<|think|>" in prepared[0]["text"]
         eot_token_id = tokenizer.convert_tokens_to_ids("<turn|>")
         assert eot_token_id in supervised_ids
         assert supervised_text.endswith("<turn|>")
@@ -125,3 +138,47 @@ def test_real_tokenizer_prepare_and_mask_tool_dataset(model_id: str, chat_templa
             **chat_template_kwargs,
         )
         assert generation_prompt.endswith("<|channel>thought\n")
+
+
+@pytest.mark.integration
+@pytest.mark.tokenizer_smoke
+@pytest.mark.parametrize(
+    "model_id,expects_empty_thought",
+    [
+        pytest.param("google/gemma-4-E4B-it", False, id="gemma-4-e4b-direct"),
+        pytest.param("google/gemma-4-26B-A4B-it", True, id="gemma-4-26b-a4b-direct"),
+        pytest.param("google/gemma-4-31B-it", True, id="gemma-4-31b-direct"),
+    ],
+)
+def test_real_gemma4_nonthinking_training_matches_generation_prompt(
+    model_id: str,
+    expects_empty_thought: bool,
+):
+    if not _tokenizer_smokes_enabled():
+        pytest.skip("Set TEICH_RUN_TOKENIZER_SMOKES=1 to run real Hugging Face tokenizer smokes.")
+    transformers = pytest.importorskip("transformers")
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    messages = [
+        {"role": "user", "content": "Give a direct answer."},
+        {"role": "assistant", "content": "Direct answer."},
+    ]
+
+    prepared = prepare_data(
+        Dataset.from_list([{"messages": messages, "tools": []}]),
+        tokenizer,
+        tokenize=True,
+        strict=True,
+        chat_template_kwargs={"enable_thinking": False},
+        verbose=False,
+    )
+    empty_thought = "<|channel>thought\n<channel|>"
+    generation_prompt = tokenizer.apply_chat_template(
+        messages[:-1],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+
+    assert (empty_thought in generation_prompt) is expects_empty_thought
+    assert (empty_thought in prepared[0]["text"]) is expects_empty_thought
+    assert "<|think|>" not in prepared[0]["text"]

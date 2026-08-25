@@ -192,6 +192,7 @@ app.add_typer(pool_app, name="pool")
 NON_DATA_TRACE_DIR_NAMES = {"partials", "failures"}
 UPLOAD_IGNORE_PATTERNS = ["partials/**", "failures/**"]
 UPLOAD_METADATA_PATTERNS = ["README.md", "tools.json"]
+UPLOAD_DATA_PATTERNS = ["*.jsonl", "**/*.jsonl", "*.metadata.json", "**/*.metadata.json"]
 
 
 def _upload_ignore_patterns(cfg: Config) -> list[str]:
@@ -326,6 +327,7 @@ def _upload_dataset_folder(
             folder_path=str(folder_path),
             repo_type="dataset",
             private=private,
+            allow_patterns=UPLOAD_DATA_PATTERNS,
             ignore_patterns=list(dict.fromkeys([*ignore_patterns, *UPLOAD_METADATA_PATTERNS])),
         )
     else:
@@ -334,6 +336,7 @@ def _upload_dataset_folder(
             repo_id=repo_id,
             repo_type="dataset",
             commit_message="Upload teich dataset output",
+            allow_patterns=[*UPLOAD_DATA_PATTERNS, *UPLOAD_METADATA_PATTERNS],
             ignore_patterns=ignore_patterns,
         )
     return str(repo_url)
