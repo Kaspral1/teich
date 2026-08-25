@@ -72,6 +72,14 @@ def test_windows_owned_process_cleanup_kills_entire_tree():
     process.wait.assert_called_once_with(timeout=5)
 
 
+def test_subprocess_creation_flags_are_platform_safe():
+    assert runner_module.SUBPROCESS_CREATE_NO_WINDOW == getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if os.name == "nt":
+        assert runner_module.TEXT_SUBPROCESS_KWARGS["creationflags"] == runner_module.SUBPROCESS_CREATE_NO_WINDOW
+    else:
+        assert "creationflags" not in runner_module.TEXT_SUBPROCESS_KWARGS
+
+
 def _filesystem_preserves_chmod(tmp_path: Path) -> bool:
     probe = tmp_path / "chmod-probe"
     probe.write_text("", encoding="utf-8")

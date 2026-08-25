@@ -144,11 +144,12 @@ TEXT_SUBPROCESS_KWARGS: dict[str, Any] = {
     "encoding": "utf-8",
     "errors": "replace",
 }
+SUBPROCESS_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 if os.name == "nt":
     # Teich owns these background CLI processes and consumes their output via
     # pipes. They do not need a host console, and suppressing one prevents
     # conhost.exe accumulation in long Windows generation runs.
-    TEXT_SUBPROCESS_KWARGS["creationflags"] = subprocess.CREATE_NO_WINDOW
+    TEXT_SUBPROCESS_KWARGS["creationflags"] = SUBPROCESS_CREATE_NO_WINDOW
 
 
 def _terminate_process_tree(

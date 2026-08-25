@@ -1,15 +1,22 @@
 # -*- coding: utf-8 -*-
 import os
+
+# Gemma 4's fused-loss path has had silent zero-gradient failures with
+# response-only labels. Prefer the correctness path unless the caller has
+# explicitly validated and enabled the fused implementation.
+os.environ.setdefault("UNSLOTH_RETURN_LOGITS", "1")
+
 from unsloth import FastModel
 from trl import SFTConfig, SFTTrainer
 from teich import mask_data, prepare_data
 
 MAX_SEQ_LEN = 16384
 MODEL_NAME = os.environ.get("MODEL_NAME", "google/gemma-4-26B-A4B-it")
+MODEL_REVISION = os.environ.get("MODEL_REVISION", "main")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "outputs/gemma-tool-sft")
 HUB_REPO_ID = os.environ.get("HUB_REPO_ID") or ""
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-CHAT_TEMPLATE_PATH = os.environ.get("CHAT_TEMPLATE_PATH") or "gemma-template.jinja"
+CHAT_TEMPLATE_PATH = os.environ.get("CHAT_TEMPLATE_PATH")
 
 model, tokenizer = FastModel.from_pretrained(
     model_name=MODEL_NAME,
@@ -17,8 +24,12 @@ model, tokenizer = FastModel.from_pretrained(
     load_in_4bit=False,
     load_in_8bit=False,
     full_finetuning=False,
+    revision=MODEL_REVISION,
+    token=HF_TOKEN or None,
 )
 
+# By default, retain the template shipped by the selected live model revision.
+# CHAT_TEMPLATE_PATH is an explicit escape hatch for controlled experiments.
 if CHAT_TEMPLATE_PATH:
     with open(CHAT_TEMPLATE_PATH, "r", encoding="utf-8") as f:
         custom_chat_template = f.read()
@@ -57,14 +68,14 @@ train_dataset = prepare_data(
     hf_token=HF_TOKEN,
     chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True},
     max_length=MAX_SEQ_LEN,
-    drop_oversized_examples=False,
+    oversized_policy="trim_followups",
     tokenize=True,
     strict=True,
 )
 
 trainer = SFTTrainer(
     model=model,
-    tokenizer=tokenizer,
+    processing_class=tokenizer,
     train_dataset=train_dataset,
     eval_dataset=None,
     args=SFTConfig(

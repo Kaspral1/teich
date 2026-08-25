@@ -47,6 +47,33 @@ trainer.train()
 
 Keep `packing=False` for this flow because packed datasets merge row boundaries before masking.
 
+## Live Gemma 4 Models
+
+For the live Google Gemma 4 instruction checkpoints, keep the chat template
+loaded from the selected model repository. The supported smoke-tested targets
+are:
+
+- `google/gemma-4-E4B-it`
+- `google/gemma-4-26B-A4B-it`
+- `google/gemma-4-31B-it`
+
+Pass `chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True}`
+to `prepare_data()`. Do not replace `tokenizer.chat_template` unless you are
+intentionally testing a maintained fork. Teich supervises the closing
+`<turn|>` token for completed Gemma responses while keeping system, user, and
+tool-response context masked.
+
+`gemma4_example.py` uses the live remote template by default. Set
+`CHAT_TEMPLATE_PATH` only to opt into a local custom template, and set
+`MODEL_REVISION` when a reproducible non-`main` revision is required. Set
+`HF_TOKEN` to an account that has accepted the Gemma repository terms when the
+checkpoint is not already available through the local Hugging Face login.
+
+Run the example in a dedicated, internally consistent Unsloth training
+environment and check it with `python -m pip check` before a long run. Teich's
+core environment does not pin the CUDA, PyTorch, Unsloth, and TRL stack because
+those versions depend on the host GPU and CUDA runtime.
+
 ## What `mask_data()` Does
 
 Before `mask_data()`, the trainer dataset usually contains:

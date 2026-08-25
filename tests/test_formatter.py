@@ -27,6 +27,8 @@ def prepare_and_mask_for_test(
     tools_column="tools",
     chat_template_kwargs=None,
     train_on_reasoning=True,
+    train_on_final_answers=True,
+    train_on_tools=True,
     max_length=None,
     include_debug_columns=False,
     drop_oversized_examples=True,
@@ -51,7 +53,15 @@ def prepare_and_mask_for_test(
         args=SimpleNamespace(dataset_text_field="text", max_length=max_length if drop_oversized_examples else None, packing=False),
         tokenizer=tokenizer,
     )
-    trainer = mask_data(trainer, tokenizer=tokenizer, train_on_reasoning=train_on_reasoning, audit=False, verbose=False)
+    trainer = mask_data(
+        trainer,
+        tokenizer=tokenizer,
+        train_on_reasoning=train_on_reasoning,
+        train_on_final_answers=train_on_final_answers,
+        train_on_tools=train_on_tools,
+        audit=False,
+        verbose=False,
+    )
     training_data = trainer.train_dataset
     if include_debug_columns:
         rows = []
@@ -1101,11 +1111,91 @@ def test_prepare_and_mask_can_exclude_reasoning_from_gemma_style_supervision():
     row = training_data[0]
     assert row["text"] == "<bos><|turn>user\nhello<turn|>\n<|turn>model\n<|channel>thought\nthink\n<channel|>world<turn|>\n"
     supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
-    assert supervised_text == "world"
+    assert supervised_text == "world<turn|>"
     masked_text = tokenizer.decode(
         [token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100]
     )
     assert "<|channel>thought\nthink\n<channel|>" in masked_text
+    assert "<turn|>" not in masked_text.rsplit("<|turn>model\n", 1)[-1]
+
+
+def test_gemma_turn_end_remains_supervised_when_only_reasoning_is_enabled():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world", "reasoning_content": "think"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    training_data = prepare_and_mask_for_test(
+        dataset,
+        tokenizer,
+        train_on_reasoning=True,
+        train_on_final_answers=False,
+    )
+
+    row = training_data[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    assert "think" in supervised_text
+    assert "world" not in supervised_text
+    assert supervised_text.endswith("<turn|>")
+
+
+def test_gemma_turn_end_remains_supervised_when_only_tool_call_is_enabled():
+    class ToolTurnClosingGemmaTokenizer(GemmaLikeOffsetTokenizer):
+        def apply_chat_template(self, *args, **kwargs):
+            rendered = super().apply_chat_template(*args, **kwargs)
+            if isinstance(rendered, str):
+                rendered = rendered.replace("<tool_call|>", "<tool_call|><turn|>\n")
+            return rendered
+
+    tokenizer = ToolTurnClosingGemmaTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "list files"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": {"command": "ls"}},
+                            }
+                        ],
+                    },
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "bash", "parameters": {"type": "object"}},
+                    }
+                ],
+            }
+        ]
+    )
+
+    training_data = prepare_and_mask_for_test(
+        dataset,
+        tokenizer,
+        train_on_reasoning=False,
+        train_on_final_answers=False,
+        train_on_tools=True,
+    )
+
+    row = training_data[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    assert "<|tool_call>call:bash" in supervised_text
+    assert "ls" in supervised_text
+    assert supervised_text.endswith("<turn|>")
 
 
 def test_prepare_and_mask_falls_back_when_gemma_drops_marker_boundaries_with_thinking_disabled():
@@ -1139,7 +1229,7 @@ def test_prepare_and_mask_falls_back_when_gemma_drops_marker_boundaries_with_thi
 
     row = training_data[0]
     supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
-    assert supervised_text == "world"
+    assert supervised_text == "world<turn|>"
 
 
 def test_prepare_data_rejects_reserved_chat_template_kwargs():
