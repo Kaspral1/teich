@@ -98,6 +98,8 @@ class PrepareReport:
     dropped_rows: list[dict[str, Any]] = field(default_factory=list)
     oversized_rows: list[dict[str, Any]] = field(default_factory=list)
     trimmed_rows: list[dict[str, Any]] = field(default_factory=list)
+    gemma4_modes: dict[str, int] = field(default_factory=dict)
+    gemma4_legacy_triggers_normalized: int = 0
 
     def record_token_length(self, row_info: dict[str, Any], token_length: int) -> None:
         entry = {**row_info, "token_length": token_length}
@@ -153,6 +155,13 @@ class PrepareReport:
             }
         )
 
+    def record_gemma4_mode(self, mode: str | None, *, normalized_legacy_trigger: bool) -> None:
+        if mode is None:
+            return
+        self.gemma4_modes[mode] = self.gemma4_modes.get(mode, 0) + 1
+        if normalized_legacy_trigger:
+            self.gemma4_legacy_triggers_normalized += 1
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "total_rows": self.total_rows,
@@ -165,6 +174,8 @@ class PrepareReport:
             "dropped_rows": self.dropped_rows,
             "oversized_rows": self.oversized_rows,
             "trimmed_rows": self.trimmed_rows,
+            "gemma4_modes": self.gemma4_modes,
+            "gemma4_legacy_triggers_normalized": self.gemma4_legacy_triggers_normalized,
         }
 
 
@@ -174,6 +185,8 @@ class _RenderedRow:
     supervised_spans: list[dict[str, Any]]
     tokenized: tuple[list[int], list[int]] | None
     token_length: int | None
+    gemma4_mode: str | None = None
+    normalized_legacy_trigger: bool = False
 
 
 @dataclass(slots=True)
@@ -253,41 +266,106 @@ def _message_text_contains(message: dict[str, Any], needle: str) -> bool:
     return False
 
 
-def _validate_gemma4_thinking_contract(
+def _strip_leading_gemma4_trigger(message: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    content = message.get("content")
+    if isinstance(content, str):
+        stripped = content.lstrip()
+        if not stripped.startswith(_GEMMA_THINK_TRIGGER):
+            return message, False
+        updated = dict(message)
+        updated["content"] = stripped[len(_GEMMA_THINK_TRIGGER):].lstrip()
+        return updated, True
+    if not isinstance(content, list):
+        return message, False
+    updated_content = deepcopy(content)
+    for index, part in enumerate(updated_content):
+        if isinstance(part, str):
+            if not part.strip():
+                continue
+            stripped = part.lstrip()
+            if not stripped.startswith(_GEMMA_THINK_TRIGGER):
+                return message, False
+            updated_content[index] = stripped[len(_GEMMA_THINK_TRIGGER):].lstrip()
+            updated = dict(message)
+            updated["content"] = updated_content
+            return updated, True
+        if not isinstance(part, dict):
+            return message, False
+        text = part.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        stripped = text.lstrip()
+        if not stripped.startswith(_GEMMA_THINK_TRIGGER):
+            return message, False
+        updated_part = dict(part)
+        updated_part["text"] = stripped[len(_GEMMA_THINK_TRIGGER):].lstrip()
+        updated_content[index] = updated_part
+        updated = dict(message)
+        updated["content"] = updated_content
+        return updated, True
+    return message, False
+
+
+def _resolve_gemma4_thinking_contract(
     renderer: Any,
     messages: list[dict[str, Any]],
     chat_template_kwargs: dict[str, Any],
-) -> None:
+) -> tuple[list[dict[str, Any]], dict[str, Any], str | None, bool]:
     if not _is_gemma4_renderer(renderer):
-        return
-    thinking_enabled = chat_template_kwargs.get("enable_thinking", False) is True
+        return messages, chat_template_kwargs, None, False
+    resolved_messages = messages
+    normalized_legacy_trigger = False
+    for index, message in enumerate(messages):
+        if message.get("role") not in {"system", "developer"}:
+            continue
+        if not _message_text_contains(message, _GEMMA_THINK_TRIGGER):
+            continue
+        updated_message, stripped = _strip_leading_gemma4_trigger(message)
+        if not stripped or _message_text_contains(updated_message, _GEMMA_THINK_TRIGGER):
+            raise ValueError(
+                "Gemma 4 system/developer content contains <|think|> outside the supported leading "
+                "legacy position. Remove it and let Teich manage the thinking trigger."
+            )
+        if resolved_messages is messages:
+            resolved_messages = list(messages)
+        resolved_messages[index] = updated_message
+        normalized_legacy_trigger = True
+
     reasoning_indexes = [
         index
-        for index, message in enumerate(messages)
+        for index, message in enumerate(resolved_messages)
         if message.get("role") in {"assistant", "model"} and _message_reasoning(message)
     ]
-    manual_trigger = any(
-        message.get("role") in {"system", "developer"}
-        and _message_text_contains(message, _GEMMA_THINK_TRIGGER)
-        for message in messages
+    resolved_kwargs = dict(chat_template_kwargs)
+    explicit_thinking = "enable_thinking" in resolved_kwargs
+    if explicit_thinking and not isinstance(resolved_kwargs["enable_thinking"], bool):
+        raise ValueError("Gemma 4 enable_thinking must be a boolean when provided.")
+    if "preserve_thinking" in resolved_kwargs and not isinstance(resolved_kwargs["preserve_thinking"], bool):
+        raise ValueError("Gemma 4 preserve_thinking must be a boolean when provided.")
+    thinking_enabled = (
+        resolved_kwargs["enable_thinking"]
+        if explicit_thinking
+        else bool(reasoning_indexes or normalized_legacy_trigger)
     )
-    if manual_trigger:
+    if explicit_thinking and not thinking_enabled and normalized_legacy_trigger:
         raise ValueError(
-            "Gemma 4 system/developer content already contains <|think|>. Do not embed the trigger "
-            "manually: use chat_template_kwargs={'enable_thinking': True, "
-            "'preserve_thinking': True} so the live template inserts it exactly once."
+            "Gemma 4 enable_thinking=False conflicts with a leading <|think|> system trigger. "
+            "Remove the legacy trigger for non-thinking data or omit enable_thinking for auto mode."
         )
     if not thinking_enabled and reasoning_indexes:
         raise ValueError(
             "Gemma 4 thinking is disabled, but this row contains reasoning. Use "
             "chat_template_kwargs={'enable_thinking': True, "
-            "'preserve_thinking': True} for thinking data, or remove reasoning for non-thinking data."
+            "'preserve_thinking': True}, omit enable_thinking for auto mode, "
+            "or remove reasoning for non-thinking data."
         )
-    if thinking_enabled and chat_template_kwargs.get("preserve_thinking", False) is not True:
+    resolved_kwargs["enable_thinking"] = thinking_enabled
+    resolved_kwargs.setdefault("preserve_thinking", thinking_enabled)
+    if thinking_enabled and resolved_kwargs["preserve_thinking"] is not True:
         last_assistant = max(
             (
                 index
-                for index, message in enumerate(messages)
+                for index, message in enumerate(resolved_messages)
                 if message.get("role") in {"assistant", "model"}
             ),
             default=-1,
@@ -297,6 +375,8 @@ def _validate_gemma4_thinking_contract(
                 "Gemma 4 preserve_thinking=False drops reasoning from earlier assistant turns. "
                 "Set preserve_thinking=True for multi-turn thinking SFT."
             )
+    mode = "thinking" if thinking_enabled else "nonthinking"
+    return resolved_messages, resolved_kwargs, mode, normalized_legacy_trigger
 
 
 def _gemma4_nonthinking_generation_suffix(
@@ -1251,7 +1331,19 @@ def _resolve_assistant_prompt_prefixes(
     probe_contexts = _assistant_prompt_probe_contexts(messages)
     if not probe_contexts:
         return ()
-    cache_key = f"{_serialize_tools_for_cache(tools)}::{','.join(probe_contexts)}"
+    try:
+        serialized_template_kwargs = json.dumps(
+            chat_template_kwargs,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=repr,
+        )
+    except TypeError:
+        serialized_template_kwargs = repr(chat_template_kwargs)
+    cache_key = (
+        f"{_serialize_tools_for_cache(tools)}::{serialized_template_kwargs}::"
+        f"{','.join(probe_contexts)}"
+    )
     prefixes = cache.get(cache_key)
     if prefixes is None:
         prefixes = _infer_assistant_prompt_prefixes(renderer, tools, chat_template_kwargs, probe_contexts)
@@ -2134,7 +2226,9 @@ def _render_training_row(
     assistant_prompt_prefix_cache: dict[str, tuple[str, ...]],
     strict: bool,
 ) -> _RenderedRow | None:
-    _validate_gemma4_thinking_contract(renderer, messages, template_kwargs)
+    messages, template_kwargs, gemma4_mode, normalized_legacy_trigger = (
+        _resolve_gemma4_thinking_contract(renderer, messages, template_kwargs)
+    )
     if teich_masking:
         text, supervised_spans = _supervised_text_and_spans(
             renderer,
@@ -2162,6 +2256,8 @@ def _render_training_row(
         supervised_spans=supervised_spans,
         tokenized=tokenized,
         token_length=token_length,
+        gemma4_mode=gemma4_mode,
+        normalized_legacy_trigger=normalized_legacy_trigger,
     )
 
 
@@ -2198,6 +2294,11 @@ def row_fits_context(
     messages = _normalize_tool_call_arguments_for_template(normalize_training_messages(messages))
     renderer = _resolve_chat_template_renderer(tokenizer, text_tokenizer)
     template_kwargs = _validate_chat_template_kwargs(chat_template_kwargs)
+    messages, template_kwargs, _, _ = _resolve_gemma4_thinking_contract(
+        renderer,
+        messages,
+        template_kwargs,
+    )
     text = _render_chat(renderer, messages, tools, template_kwargs)
     token_length = _tokenized_length(text_tokenizer, text)
     result = RowContextFit(
@@ -2479,6 +2580,10 @@ def format_data(
             )
             if report is not None:
                 report.record_kept_row(row_info, rendered.token_length)
+                report.record_gemma4_mode(
+                    rendered.gemma4_mode,
+                    normalized_legacy_trigger=rendered.normalized_legacy_trigger,
+                )
         return output_batch
 
     formatted_data = dataset.map(

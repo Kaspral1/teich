@@ -132,6 +132,10 @@ def test_gemma4_example_uses_live_remote_template_and_safe_masks():
     assert 'os.environ.setdefault("UNSLOTH_RETURN_LOGITS", "1")' in source
     assert 'MODEL_REVISION = os.environ.get("MODEL_REVISION", "main")' in source
     assert 'CHAT_TEMPLATE_PATH = os.environ.get("CHAT_TEMPLATE_PATH")' in source
+    assert 'os.environ.get("GEMMA4_THINKING_MODE")' in source
+    assert 'os.environ.get("GEMMA4_ENABLE_THINKING")' in source
+    assert 'GEMMA4_THINKING_MODE not in {"auto", "thinking", "nonthinking"}' in source
+    assert "chat_template_kwargs=CHAT_TEMPLATE_KWARGS" in source
     assert 'or "gemma-template.jinja"' not in source
     assert "token=HF_TOKEN or None" in source
     assert 'oversized_policy="trim_followups"' in source

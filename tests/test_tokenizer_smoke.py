@@ -13,17 +13,17 @@ TOKENIZER_SMOKE_MODELS = [
     pytest.param("unsloth/Qwen3.5-0.8B", {"enable_thinking": True}, id="unsloth-qwen3.5"),
     pytest.param(
         "google/gemma-4-E4B-it",
-        {"enable_thinking": True, "preserve_thinking": True},
+        {},
         id="gemma-4-e4b-it",
     ),
     pytest.param(
         "google/gemma-4-26B-A4B-it",
-        {"enable_thinking": True, "preserve_thinking": True},
+        {},
         id="gemma-4-26b-a4b-it",
     ),
     pytest.param(
         "google/gemma-4-31B-it",
-        {"enable_thinking": True, "preserve_thinking": True},
+        {},
         id="gemma-4-31b-it",
     ),
 ]
@@ -116,6 +116,7 @@ def test_real_tokenizer_prepare_and_mask_tool_dataset(model_id: str, chat_templa
     assert prepared.column_names == ["text", "teich_supervised_spans", "input_ids", "attention_mask"]
     assert trainer.train_dataset.column_names == ["input_ids", "labels"]
     assert supervised_ids
+    assert "I should inspect the workspace." in supervised_text
     assert "bash" in supervised_text
     assert "ls" in supervised_text
     assert "Found project files." in supervised_text
@@ -130,12 +131,13 @@ def test_real_tokenizer_prepare_and_mask_tool_dataset(model_id: str, chat_templa
 
         source_row = _tool_call_dataset()[0]
         generation_messages = source_row["messages"][:-1]
+        generation_kwargs = {"enable_thinking": True, "preserve_thinking": True}
         generation_prompt = tokenizer.apply_chat_template(
             generation_messages,
             tools=source_row["tools"],
             tokenize=False,
             add_generation_prompt=True,
-            **chat_template_kwargs,
+            **generation_kwargs,
         )
         assert generation_prompt.endswith("<|channel>thought\n")
 
@@ -168,7 +170,6 @@ def test_real_gemma4_nonthinking_training_matches_generation_prompt(
         tokenizer,
         tokenize=True,
         strict=True,
-        chat_template_kwargs={"enable_thinking": False},
         verbose=False,
     )
     empty_thought = "<|channel>thought\n<channel|>"
@@ -182,3 +183,19 @@ def test_real_gemma4_nonthinking_training_matches_generation_prompt(
     assert (empty_thought in generation_prompt) is expects_empty_thought
     assert (empty_thought in prepared[0]["text"]) is expects_empty_thought
     assert "<|think|>" not in prepared[0]["text"]
+
+    trainer = SimpleNamespace(
+        train_dataset=prepared,
+        eval_dataset=None,
+        processing_class=tokenizer,
+        args=SimpleNamespace(dataset_text_field="text", packing=False, max_length=4096),
+    )
+    trainer = mask_data(trainer, tokenizer=tokenizer, audit=True, verbose=False)
+    row = trainer.train_dataset[0]
+    supervised_text = tokenizer.decode(
+        [token for token in row["labels"] if token != -100],
+        skip_special_tokens=False,
+    )
+    assert empty_thought not in supervised_text
+    assert "Direct answer." in supervised_text
+    assert supervised_text.endswith("<turn|>")

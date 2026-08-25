@@ -48,7 +48,15 @@ print(prep_report.max_token_length)
 print(prep_report.oversized_rows[:3])
 ```
 
-`PrepareReport` includes dropped rows, oversized rows, trimmed rows, token lengths, max token length, kept-row ids, and returned row count.
+`PrepareReport` includes dropped rows, oversized rows, trimmed rows, token lengths,
+max token length, kept-row ids, and returned row count. With a live Gemma 4
+template it also reports per-row mode counts in `gemma4_modes` and migrated
+leading `<|think|>` markers in `gemma4_legacy_triggers_normalized`.
+
+Gemma 4 defaults to per-row auto mode when `enable_thinking` is omitted:
+reasoning-bearing rows enable thinking and history preservation, while direct
+rows use the loaded model's non-thinking protocol. See [Live Gemma 4 Models](training.md#live-gemma-4-models)
+for explicit overrides and validation rules.
 
 Original columns are removed after formatting unless `preserve_columns=True` or an explicit list is passed. The default provenance set is `source`, `metadata`, `raw_index`, and `source_key`.
 

@@ -36,6 +36,7 @@ TEXT_EXTENSIONS = {
 # ponytail: process startup isn't free — only fan out when there are enough
 # files for the parallelism to pay for itself.
 _MIN_FILES_FOR_PARALLEL = 8
+_MIN_TOTAL_BYTES_FOR_PARALLEL = 1024 * 1024
 _WINDOWS_MAX_PROCESS_WORKERS = 61
 
 
@@ -44,6 +45,21 @@ def _process_worker_count(file_count: int) -> int:
     if sys.platform == "win32":
         workers = min(workers, _WINDOWS_MAX_PROCESS_WORKERS)
     return workers
+
+
+def _use_process_workers(source_files: list[Path], workers: int) -> bool:
+    if workers <= 1 or len(source_files) < _MIN_FILES_FOR_PARALLEL:
+        return False
+    total_bytes = 0
+    for source_file in source_files:
+        try:
+            total_bytes += source_file.stat().st_size
+        except OSError:
+            # Let anonymize_file surface the underlying filesystem error.
+            return True
+        if total_bytes >= _MIN_TOTAL_BYTES_FOR_PARALLEL:
+            return True
+    return False
 
 
 @dataclass
@@ -119,7 +135,7 @@ def anonymize_files(
         raise ValueError("source_files and destinations must have the same length")
     reports: list[AnonymizeFileReport] = []
     workers = _process_worker_count(len(source_files))
-    if workers > 1 and len(source_files) >= _MIN_FILES_FOR_PARALLEL:
+    if _use_process_workers(source_files, workers):
         # Each file is anonymized independently (fresh TraceAnonymizer per
         # file), so files can be processed in parallel safely.
         # Extraction can run from a Studio background thread. Explicit spawn

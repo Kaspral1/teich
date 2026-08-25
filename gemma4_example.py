@@ -17,7 +17,21 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "outputs/gemma-tool-sft")
 HUB_REPO_ID = os.environ.get("HUB_REPO_ID") or ""
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 CHAT_TEMPLATE_PATH = os.environ.get("CHAT_TEMPLATE_PATH")
-ENABLE_THINKING = os.environ.get("GEMMA4_ENABLE_THINKING", "1").strip().lower() not in {"0", "false", "no"}
+_thinking_mode = os.environ.get("GEMMA4_THINKING_MODE")
+_legacy_thinking = os.environ.get("GEMMA4_ENABLE_THINKING")
+if _thinking_mode is None and _legacy_thinking is not None:
+    _thinking_mode = (
+        "nonthinking"
+        if _legacy_thinking.strip().lower() in {"0", "false", "no"}
+        else "thinking"
+    )
+GEMMA4_THINKING_MODE = (_thinking_mode or "auto").strip().lower().replace("-", "")
+if GEMMA4_THINKING_MODE not in {"auto", "thinking", "nonthinking"}:
+    raise ValueError("GEMMA4_THINKING_MODE must be auto, thinking, or nonthinking")
+CHAT_TEMPLATE_KWARGS = {
+    "thinking": {"enable_thinking": True},
+    "nonthinking": {"enable_thinking": False},
+}.get(GEMMA4_THINKING_MODE)
 
 model, tokenizer = FastModel.from_pretrained(
     model_name=MODEL_NAME,
@@ -67,12 +81,10 @@ train_dataset = prepare_data(
     tokenizer,
     split="train",
     hf_token=HF_TOKEN,
-    # Non-thinking datasets must not contain reasoning fields or a manual
-    # <|think|> system trigger; Teich rejects those inconsistent rows.
-    chat_template_kwargs={
-        "enable_thinking": ENABLE_THINKING,
-        "preserve_thinking": ENABLE_THINKING,
-    },
+    # Auto mode classifies every Gemma 4 row independently. Reasoning-bearing
+    # rows enable thinking and preserve history; direct rows use the exact
+    # non-thinking inference prefix of the loaded live template.
+    chat_template_kwargs=CHAT_TEMPLATE_KWARGS,
     max_length=MAX_SEQ_LEN,
     oversized_policy="trim_followups",
     tokenize=True,

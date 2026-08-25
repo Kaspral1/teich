@@ -1833,7 +1833,17 @@ def test_anonymize_parallel_worker_count_caps_windows(monkeypatch):
     assert anonymize_module._process_worker_count(100) == 61
 
 
-def test_anonymize_path_progress_reports_parallel_completions_and_sorts_final_report(tmp_path: Path):
+def test_anonymize_large_batch_uses_process_workers(tmp_path: Path):
+    sources = []
+    for index in range(8):
+        source = tmp_path / f"large-{index}.jsonl"
+        source.write_bytes(b"x" * (128 * 1024))
+        sources.append(source)
+
+    assert anonymize_module._use_process_workers(sources, workers=8) is True
+
+
+def test_anonymize_path_small_batch_avoids_process_startup_and_reports_progress(tmp_path: Path):
     input_dir = tmp_path / "input"
     input_dir.mkdir()
     for index in reversed(range(9)):
@@ -1843,11 +1853,16 @@ def test_anonymize_path_progress_reports_parallel_completions_and_sorts_final_re
         )
     updates = []
 
-    report = anonymize_module.anonymize_path(
-        input_dir,
-        tmp_path / "output",
-        progress=lambda file_report, done, total: updates.append((file_report, done, total)),
-    )
+    with patch.object(
+        anonymize_module,
+        "ProcessPoolExecutor",
+        side_effect=AssertionError("tiny files should stay in-process"),
+    ):
+        report = anonymize_module.anonymize_path(
+            input_dir,
+            tmp_path / "output",
+            progress=lambda file_report, done, total: updates.append((file_report, done, total)),
+        )
 
     assert {update[0].path.name for update in updates} == {f"trace-{index}.jsonl" for index in range(9)}
     assert [update[1] for update in updates] == list(range(1, 10))

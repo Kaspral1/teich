@@ -57,58 +57,62 @@ are:
 - `google/gemma-4-26B-A4B-it`
 - `google/gemma-4-31B-it`
 
-Gemma 4 does not infer this mode from the presence of reasoning labels alone.
-The live template enables thinking by placing `<|think|>` at the beginning of
-the system turn when `enable_thinking=True`; do not embed that token manually,
-because enabling the template would then duplicate it. For thinking SFT, pass
-`chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True}`.
-`preserve_thinking=True` is required for multi-turn rows with historical
-reasoning; otherwise the upstream template silently omits reasoning from all
-but the last assistant turn.
+Gemma 4's thinking mode is a prompt protocol, so Teich resolves it for every
+row before rendering. Leave `enable_thinking` unset for the recommended auto
+mode:
 
-For non-thinking SFT, pass `{"enable_thinking": False}` and use rows that have
-neither reasoning fields nor a manually embedded `<|think|>` system trigger.
-The live template will render `reasoning_content` even when thinking is off,
-which creates an internally inconsistent example; Teich rejects that state.
-The 26B-A4B and 31B generation prompts also insert an empty thought channel in
-non-thinking mode while E4B does not. Teich detects this from the loaded live
-template and mirrors the prefix in completed training turns so SFT and
-inference contexts agree.
+- a row containing assistant `reasoning_content`, `thinking`, or `reasoning`
+  becomes a thinking row;
+- a row without assistant reasoning becomes a non-thinking row;
+- thinking rows automatically receive `enable_thinking=True` and
+  `preserve_thinking=True`, preserving historical reasoning in multi-turn data;
+- a leading legacy `<|think|>` in system/developer content is removed and used
+  as a thinking-mode hint. `PrepareReport` records the migration, while triggers
+  in any other position are rejected.
+
+The live template, not the source data, inserts `<|think|>` into the system
+turn. The 26B-A4B and 31B generation prompts also insert an empty thought
+channel in non-thinking mode while E4B does not. Teich discovers that behavior
+from the loaded template and mirrors the prefix in completed SFT turns while
+keeping the synthetic prefix masked.
+
+Explicit `{"enable_thinking": True}` and `{"enable_thinking": False}` remain
+available when an entire source must be forced to one mode. Teich automatically
+enables history preservation for the explicit thinking case. Contradictions
+fail closed: forcing non-thinking on a reasoning-bearing row, or explicitly
+disabling `preserve_thinking` when historical reasoning would disappear,
+raises an error instead of producing inconsistent training text.
 
 Do not replace `tokenizer.chat_template` unless you are intentionally testing a
 maintained fork. Teich supervises the closing `<turn|>` token for completed
 Gemma responses while keeping system, user, tool-response, and generated prompt
 prefix context masked.
 
-Thinking and non-thinking examples can be mixed safely by separating them into
-sources with source-level template kwargs:
+Thinking and non-thinking examples can therefore be mixed in the same source
+without any template configuration:
 
 ```python
-train_dataset = prepare_data(
-    {
-        "thinking": {
-            "source": "username/gemma-thinking-traces",
-            "percentage": 60,
-            "chat_template_kwargs": {
-                "enable_thinking": True,
-                "preserve_thinking": True,
-            },
-        },
-        "direct": {
-            "source": "username/gemma-direct-traces",
-            "percentage": 40,
-            "chat_template_kwargs": {"enable_thinking": False},
-        },
-    },
+train_dataset, prep_report = prepare_data(
+    "username/mixed-gemma-traces",
     tokenizer,
     tokenize=True,
     strict=True,
+    return_report=True,
 )
 ```
 
+With `return_report=True`, inspect `prep_report.gemma4_modes` for the resolved
+thinking/non-thinking counts and
+`prep_report.gemma4_legacy_triggers_normalized` for migrated legacy rows.
+Source-level `chat_template_kwargs` are still useful as explicit policy
+overrides, but are no longer required merely to mix the two modes.
+
 `gemma4_example.py` uses the live remote template by default. Set
-`CHAT_TEMPLATE_PATH` only to opt into a local custom template, and set
-`MODEL_REVISION` when a reproducible non-`main` revision is required. Set
+`CHAT_TEMPLATE_PATH` only to opt into a local custom template. Its
+`GEMMA4_THINKING_MODE` defaults to `auto`; use `thinking` or `nonthinking` only
+to force a homogeneous source. The older `GEMMA4_ENABLE_THINKING` variable is
+still accepted for compatibility. Set `MODEL_REVISION` when a reproducible
+non-`main` revision is required. Set
 `HF_TOKEN` to an account that has accepted the Gemma repository terms when the
 checkpoint is not already available through the local Hugging Face login.
 
