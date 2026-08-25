@@ -1392,11 +1392,14 @@ def _select_supervised_spans(
         selected = _subtract_spans(selected, _source_spans_for_kind(spans, _SPAN_KIND_DEVELOPER))
     selected = _merge_spans(selected)
 
-    # A Gemma turn terminator is useful only when the same model turn still
-    # contains an enabled training target. For example, excluding reasoning
-    # from a reasoning-only response must not keep the row alive solely by
-    # labeling its trailing <turn|> token.
+    # A Gemma turn terminator is useful exactly when the same model turn still
+    # contains an enabled training target. It is initially part of the inferred
+    # final-answer span, so restore it when final answers are disabled but an
+    # enabled reasoning or tool-call target remains. Conversely, do not keep a
+    # reasoning-only row alive solely by labeling <turn|> after reasoning was
+    # excluded.
     orphaned_turn_ends: list[tuple[int, int]] = []
+    retained_turn_ends: list[tuple[int, int]] = []
     turn_matches = list(_GEMMA_TURN_START_PATTERN.finditer(text))
     for index, match in enumerate(turn_matches):
         if match.group(1) != "model":
@@ -1405,13 +1408,21 @@ def _select_supervised_spans(
         turn_end = text.find(_GEMMA_TURN_END, match.end(), block_end)
         if turn_end < 0:
             continue
+        turn_end_span = (turn_end, turn_end + len(_GEMMA_TURN_END))
+        turn_end_was_supervised = any(
+            span["start"] <= turn_end and span["end"] >= turn_end_span[1]
+            for span in spans
+        )
         has_selected_content = any(
             text[max(start, match.end()) : min(end, turn_end)].strip()
             for start, end in selected
             if start < turn_end and end > match.end()
         )
-        if not has_selected_content:
-            orphaned_turn_ends.append((turn_end, turn_end + len(_GEMMA_TURN_END)))
+        if has_selected_content and turn_end_was_supervised:
+            retained_turn_ends.append(turn_end_span)
+        elif not has_selected_content:
+            orphaned_turn_ends.append(turn_end_span)
+    selected = _merge_spans(selected + retained_turn_ends)
     return _subtract_spans(selected, orphaned_turn_ends)
 
 
