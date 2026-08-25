@@ -18,10 +18,13 @@ from teich.config import Config
 from teich.extract import CURSOR_EXTRACTION_NOTICE
 from teich.runner import ChatRunner, ClaudeCodeRunner, SessionProgressUpdate
 from teich.studio.events import summarize_chat_row, summarize_event, summarize_trace_events
+from teich.studio.extraction import ExtractionJob, ExtractionManager
 from teich.studio.generation import RUNNER_CLASSES, GenerationJob
 from teich.studio.interactive import (
     SUBPROCESS_CREATE_NO_WINDOW,
+    EventLog,
     InteractiveSession,
+    SessionManager,
     TerminalBridge,
 )
 from teich.studio.project import ProjectState
@@ -70,6 +73,31 @@ def test_write_config_rejects_invalid(tmp_path):
     state.ensure_initialized()
     with pytest.raises(Exception):
         state.write_config_data({"max_concurrency": 0})
+
+
+def test_event_log_retains_a_bounded_absolute_sequence():
+    log = EventLog(max_events=3)
+    for index in range(5):
+        log.append({"kind": "test", "value": index})
+
+    assert [event["seq"] for event in log.snapshot()] == [2, 3, 4]
+    assert [event["value"] for event in log.wait_for(0, timeout=0)] == [2, 3, 4]
+    assert [event["value"] for event in log.wait_for(4, timeout=0)] == [4]
+
+
+def test_session_manager_prunes_old_completed_history():
+    manager = SessionManager()
+    manager._sessions = {
+        str(index): SimpleNamespace(status="saved")
+        for index in range(55)
+    }
+
+    with manager._lock:
+        manager._prune_locked()
+
+    assert len(manager._sessions) == 49
+    assert "0" not in manager._sessions
+    assert "54" in manager._sessions
 
 
 def test_prompts_round_trip(tmp_path):
@@ -542,6 +570,7 @@ def test_dataset_upload_endpoint_generates_readme_and_uploads_with_env_token(cli
         folder_path=str(output_dir),
         repo_type="dataset",
         private=False,
+        allow_patterns=["*.jsonl", "**/*.jsonl", "*.metadata.json", "**/*.metadata.json"],
         ignore_patterns=["partials/**", "failures/**", "README.md", "tools.json"],
     )
     mock_api.upload_folder.assert_called_once_with(
@@ -859,6 +888,46 @@ def test_extract_endpoint_can_skip_anonymization(client):
     job = _wait_for_extract_job(client)
     assert job["status"] == "completed"
     assert "raw@company.ai" in (client.project_dir / "raw-staged" / "raw.jsonl").read_text(encoding="utf-8")
+
+
+def test_rejected_extract_does_not_mutate_output_config(client):
+    before = client.get("/api/config").json()["config"]["output"]["traces_dir"]
+    client.app.state.extraction._current = SimpleNamespace(status="running", join=lambda: None)
+
+    response = client.post(
+        "/api/extract",
+        json={"provider": "codex", "output": "rejected-output", "sessions_dirs": []},
+    )
+
+    assert response.status_code == 409
+    after = client.get("/api/config").json()["config"]["output"]["traces_dir"]
+    assert after == before
+
+
+def test_extraction_shutdown_waits_for_active_worker(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+    shutdown_finished = threading.Event()
+
+    def blocked_run(job):
+        job.status = "running"
+        started.set()
+        release.wait(timeout=5)
+        job.status = "completed"
+
+    manager = ExtractionManager()
+    with patch.object(ExtractionJob, "_run", blocked_run):
+        manager.start("codex", output_dir=tmp_path)
+        assert started.wait(timeout=1)
+        thread = threading.Thread(
+            target=lambda: (manager.shutdown(), shutdown_finished.set()),
+            daemon=True,
+        )
+        thread.start()
+        assert not shutdown_finished.wait(timeout=0.05)
+        release.set()
+        assert shutdown_finished.wait(timeout=1)
+        thread.join(timeout=1)
 
 
 def test_extract_endpoint_warns_cursor_may_take_a_while(client):
@@ -1216,6 +1285,43 @@ def test_terminal_task_cleanup_propagates_unexpected_errors():
         assert pending_task.cancelled()
 
     asyncio.run(run())
+
+
+def test_terminal_output_buffer_coalesces_without_losing_or_reordering_chunks():
+    async def run() -> None:
+        buffer = server_module._TerminalOutputBuffer(lambda: "scrollback", max_pending_chars=100)
+        chunks = ["before\x1b[", "31mred", "\x1b[0mafter"]
+        for chunk in chunks:
+            buffer.enqueue(chunk)
+
+        text, reset = await buffer.get()
+        assert text == "".join(chunks)
+        assert reset is False
+
+    asyncio.run(run())
+
+
+def test_terminal_output_buffer_replays_scrollback_when_pending_output_exceeds_limit():
+    async def run() -> None:
+        buffer = server_module._TerminalOutputBuffer(
+            lambda: "complete bounded scrollback",
+            max_pending_chars=8,
+        )
+        buffer.enqueue("12345")
+        buffer.enqueue("67890")
+
+        text, reset = await buffer.get()
+        assert text == "complete bounded scrollback"
+        assert reset is True
+
+    asyncio.run(run())
+
+
+def test_terminal_client_resets_before_replaying_coalesced_scrollback():
+    source = (server_module.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert "if (message.reset) term.reset();" in source
+    assert source.index("if (message.reset) term.reset();") < source.index("term.write(message.data);")
 
 
 def test_terminal_wait_keeps_socket_open_until_session_ready(monkeypatch):

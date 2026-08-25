@@ -626,14 +626,7 @@ def _prompt_completion_key(prompt_input: PromptInput | str) -> str:
 
 
 def _prompt_resume_key(prompt_input: PromptInput | str) -> str:
-    if isinstance(prompt_input, str):
-        prompt_parts = [_prompt_text_completion_key(prompt_input)]
-    else:
-        prompt_parts = [
-            _prompt_text_completion_key(prompt)
-            for prompt in prompt_input.turn_prompts()
-        ]
-    return "\n\n--- follow-up ---\n\n".join(prompt_parts)
+    return _prompt_completion_key(prompt_input)
 
 
 def _agent_turn_prompts(prompt: str, prompt_input: PromptInput | None) -> list[str]:
@@ -883,6 +876,36 @@ def _system_from_training_example(example: dict[str, Any]) -> str | None:
     return None
 
 
+def _system_from_teich_trace_events(events: list[dict[str, Any]]) -> str | None:
+    for event in reversed(events):
+        if event.get("type") != "custom" or event.get("customType") != PI_SYSTEM_PROMPT_CUSTOM_TYPE:
+            continue
+        data = event.get("data")
+        system = data.get("systemPrompt") if isinstance(data, dict) else None
+        if isinstance(system, str) and system.strip():
+            return system.strip()
+    return None
+
+
+def _trace_includes_system_prompt(events: list[dict[str, Any]], system_prompt: str) -> bool:
+    expected = system_prompt.strip()
+    if _system_from_teich_trace_events(events) == expected:
+        return True
+    for event in events:
+        candidates = [event]
+        candidates.extend(
+            value
+            for key in ("message", "payload")
+            if isinstance((value := event.get(key)), dict)
+        )
+        for candidate in candidates:
+            if candidate.get("role") not in {"system", "developer"}:
+                continue
+            if _message_text(candidate.get("content")) == expected:
+                return True
+    return False
+
+
 def completed_prompt_keys_from_outputs(traces_dir: Path, excluded_dirs: list[Path] | None = None) -> set[str]:
     if not traces_dir.exists():
         return set()
@@ -897,7 +920,12 @@ def completed_prompt_keys_from_outputs(traces_dir: Path, excluded_dirs: list[Pat
             if structured_rows is not None:
                 examples = structured_rows
             else:
-                examples = [convert_trace_to_training_example(path).to_dict()]
+                events = _read_jsonl_dict_events(path) or []
+                example = convert_trace_to_training_example(path).to_dict()
+                recorded_system = _system_from_teich_trace_events(events)
+                if recorded_system and not _system_from_training_example(example):
+                    example["system"] = recorded_system
+                examples = [example]
         except (OSError, json.JSONDecodeError, ValueError):
             continue
         for example in examples:
@@ -1030,8 +1058,32 @@ class DockerRuntimeRunner:
             return
         self._append_jsonl_events(trace_path, [capture.to_trace_event()])
 
+    def _append_prompt_system_metadata(self, trace_path: Path, prompt_input: PromptInput | None) -> None:
+        if prompt_input is None or not isinstance(prompt_input.system, str) or not trace_path.exists():
+            return
+        system_prompt = prompt_input.system.strip()
+        if not system_prompt:
+            return
+        events = _read_jsonl_dict_events(trace_path) or []
+        if _trace_includes_system_prompt(events, system_prompt):
+            return
+        self._append_jsonl_events(
+            trace_path,
+            [
+                {
+                    "type": "custom",
+                    "id": f"teich-system-{uuid.uuid4().hex[:8]}",
+                    "parentId": None,
+                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "customType": PI_SYSTEM_PROMPT_CUSTOM_TYPE,
+                    "data": {"systemPrompt": system_prompt, "source": "teich"},
+                }
+            ],
+        )
+
     def _finalize_trace_export(self, trace_path: Path, prompt_input: PromptInput | None = None) -> None:
         self._append_harness_context_metadata(trace_path)
+        self._append_prompt_system_metadata(trace_path, prompt_input)
 
     def capture_harness_context(self) -> HarnessContextCapture:
         raise RuntimeError(
@@ -6169,78 +6221,6 @@ class PiRunner(DockerRuntimeRunner):
         shutil.copyfile(source_path, destination)
 
     @staticmethod
-    def _prompt_input_system_prompt(prompt_input: PromptInput | None) -> str | None:
-        if prompt_input is None or not isinstance(prompt_input.system, str):
-            return None
-        system_prompt = prompt_input.system.strip()
-        return system_prompt or None
-
-    @classmethod
-    def _pi_trace_includes_system_prompt(cls, trace_path: Path, system_prompt: str) -> bool:
-        expected = system_prompt.strip()
-        if not expected:
-            return True
-        try:
-            with trace_path.open("r", encoding="utf-8") as source:
-                for raw_line in source:
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    event = json.loads(line)
-                    if not isinstance(event, dict):
-                        continue
-                    if event.get("type") == "custom" and event.get("customType") == PI_SYSTEM_PROMPT_CUSTOM_TYPE:
-                        data = event.get("data")
-                        recorded = data.get("systemPrompt") if isinstance(data, dict) else None
-                        if isinstance(recorded, str) and recorded.strip() == expected:
-                            return True
-                        continue
-                    if event.get("type") != "message":
-                        continue
-                    payload = event.get("message")
-                    if not isinstance(payload, dict) or payload.get("role") not in {"system", "developer"}:
-                        continue
-                    if cls._pi_first_text(payload.get("content")).strip() == expected:
-                        return True
-        except (OSError, json.JSONDecodeError):
-            return False
-        return False
-
-    @staticmethod
-    def _pi_first_text(content: Any) -> str:
-        if isinstance(content, str):
-            return content
-        if not isinstance(content, list):
-            return ""
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") != "text":
-                continue
-            text = block.get("text")
-            if isinstance(text, str):
-                return text
-        return ""
-
-    def _append_pi_system_prompt_metadata(self, trace_path: Path, prompt_input: PromptInput | None) -> None:
-        system_prompt = self._prompt_input_system_prompt(prompt_input)
-        if not system_prompt or self._pi_trace_includes_system_prompt(trace_path, system_prompt):
-            return
-        event = {
-            "type": "custom",
-            "id": f"teich-system-{uuid.uuid4().hex[:8]}",
-            "parentId": None,
-            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "customType": PI_SYSTEM_PROMPT_CUSTOM_TYPE,
-            "data": {
-                "systemPrompt": system_prompt,
-                "source": "teich",
-            },
-        }
-        with trace_path.open("a", encoding="utf-8") as destination:
-            destination.write(json.dumps(event, separators=(",", ":")) + "\n")
-
-    @staticmethod
     def _pi_trace_includes_available_tools(trace_path: Path) -> bool:
         try:
             with trace_path.open("r", encoding="utf-8") as source:
@@ -6280,7 +6260,7 @@ class PiRunner(DockerRuntimeRunner):
             destination.write(json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n")
 
     def _finalize_trace_export(self, trace_path: Path, prompt_input: PromptInput | None = None) -> None:
-        self._append_pi_system_prompt_metadata(trace_path, prompt_input)
+        super()._finalize_trace_export(trace_path, prompt_input)
         self._append_pi_available_tools_metadata(trace_path)
 
     def _latest_session_source_file(self, session_id: str, session_dir: Path, started_at: datetime) -> Path:

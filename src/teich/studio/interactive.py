@@ -55,20 +55,30 @@ TEXT_SUBPROCESS_KWARGS: dict[str, Any] = {
 }
 
 SCROLLBACK_LIMIT = 2 * 1024 * 1024  # bytes of terminal history kept for reconnects
+EVENT_LOG_LIMIT = 10_000
+SESSION_HISTORY_LIMIT = 50
 
 
 class EventLog:
     """Append-only event list with a condition for SSE long-polling."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_events: int = EVENT_LOG_LIMIT) -> None:
         self._events: list[dict[str, Any]] = []
         self._condition = threading.Condition()
+        self._first_seq = 0
+        self._next_seq = 0
+        self._max_events = max(1, max_events)
         self.closed = False
 
     def append(self, event: dict[str, Any]) -> None:
         with self._condition:
-            event = {**event, "seq": len(self._events), "ts": time.time()}
+            event = {**event, "seq": self._next_seq, "ts": time.time()}
+            self._next_seq += 1
             self._events.append(event)
+            overflow = len(self._events) - self._max_events
+            if overflow > 0:
+                del self._events[:overflow]
+                self._first_seq += overflow
             self._condition.notify_all()
 
     def close(self) -> None:
@@ -79,9 +89,11 @@ class EventLog:
     def wait_for(self, start_index: int, timeout: float = 15.0) -> list[dict[str, Any]]:
         """Return events at/after start_index, blocking up to timeout if none yet."""
         with self._condition:
-            if len(self._events) <= start_index and not self.closed:
+            start_index = max(start_index, self._first_seq)
+            if self._next_seq <= start_index and not self.closed:
                 self._condition.wait(timeout=timeout)
-            return self._events[start_index:]
+            start_index = max(start_index, self._first_seq)
+            return self._events[start_index - self._first_seq:]
 
     def snapshot(self) -> list[dict[str, Any]]:
         with self._condition:
@@ -204,6 +216,11 @@ class TerminalBridge:
         """Register a listener and return the scrollback to replay."""
         with self._lock:
             self._listeners.add(listener)
+            return "".join(self._scrollback)
+
+    def scrollback(self) -> str:
+        """Return a consistent snapshot for a slow websocket to replay."""
+        with self._lock:
             return "".join(self._scrollback)
 
     def detach(self, listener: Callable[[str], None]) -> None:
@@ -653,6 +670,7 @@ class SessionManager:
     def create(self, config: Config, *, github_repo: str | None = None, system: str | None = None) -> InteractiveSession:
         session = InteractiveSession(config, github_repo=github_repo, system=system)
         with self._lock:
+            self._prune_locked()
             self._sessions[session.id] = session
         session.start_async()
         return session
@@ -671,6 +689,18 @@ class SessionManager:
 
     def remove(self, session_id: str) -> None:
         with self._lock:
+            self._sessions.pop(session_id, None)
+
+    def _prune_locked(self) -> None:
+        overflow = len(self._sessions) - SESSION_HISTORY_LIMIT + 1
+        if overflow <= 0:
+            return
+        completed = [
+            session_id
+            for session_id, session in self._sessions.items()
+            if session.status in {"finished", "saved", "discarded", "error"}
+        ]
+        for session_id in completed[:overflow]:
             self._sessions.pop(session_id, None)
 
     def shutdown(self) -> None:

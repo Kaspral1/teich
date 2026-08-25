@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import sqlite3
@@ -1694,6 +1695,7 @@ def test_extract_can_upload_staged_anonymized_output_to_huggingface(tmp_path: Pa
         folder_path=str(output_dir),
         repo_type="dataset",
         private=False,
+        allow_patterns=["*.jsonl", "**/*.jsonl", "*.metadata.json", "**/*.metadata.json"],
         ignore_patterns=["partials/**", "failures/**", "README.md", "tools.json"],
     )
     mock_api.upload_folder.assert_called_once_with(
@@ -1831,7 +1833,17 @@ def test_anonymize_parallel_worker_count_caps_windows(monkeypatch):
     assert anonymize_module._process_worker_count(100) == 61
 
 
-def test_anonymize_path_progress_reports_parallel_completions_and_sorts_final_report(tmp_path: Path):
+def test_anonymize_large_batch_uses_process_workers(tmp_path: Path):
+    sources = []
+    for index in range(8):
+        source = tmp_path / f"large-{index}.jsonl"
+        source.write_bytes(b"x" * (128 * 1024))
+        sources.append(source)
+
+    assert anonymize_module._use_process_workers(sources, workers=8) is True
+
+
+def test_anonymize_path_small_batch_avoids_process_startup_and_reports_progress(tmp_path: Path):
     input_dir = tmp_path / "input"
     input_dir.mkdir()
     for index in reversed(range(9)):
@@ -1841,11 +1853,16 @@ def test_anonymize_path_progress_reports_parallel_completions_and_sorts_final_re
         )
     updates = []
 
-    report = anonymize_module.anonymize_path(
-        input_dir,
-        tmp_path / "output",
-        progress=lambda file_report, done, total: updates.append((file_report, done, total)),
-    )
+    with patch.object(
+        anonymize_module,
+        "ProcessPoolExecutor",
+        side_effect=AssertionError("tiny files should stay in-process"),
+    ):
+        report = anonymize_module.anonymize_path(
+            input_dir,
+            tmp_path / "output",
+            progress=lambda file_report, done, total: updates.append((file_report, done, total)),
+        )
 
     assert {update[0].path.name for update in updates} == {f"trace-{index}.jsonl" for index in range(9)}
     assert [update[1] for update in updates] == list(range(1, 10))
@@ -2015,8 +2032,7 @@ def test_anonymize_generalizes_to_synthetic_secret_and_reference_matrix(tmp_path
     assert "PROJECT_SECRET=redacted_" in text
     assert "process.env.PROJECT_SECRET" in text
     assert "sk-Mmu5OJR5NQoTJOGj6z6cHPraZ35yuZfK" not in text
-    assert image_data in text
-    assert "redacted_base64" not in text
+    assert image_data not in text
     assert "@src/main.ts" in text
     assert "@docs/*.md" in text
     assert "@scope/package" in text
@@ -2210,7 +2226,7 @@ def test_anonymize_scrubs_env_style_keys_without_scrubbing_tokenizer_terms(tmp_p
     assert "credential_occurrences=3" in result.output
 
 
-def test_anonymize_preserves_base64_media_payloads_without_touching_metadata(tmp_path: Path):
+def test_anonymize_redacts_base64_media_payloads_without_touching_metadata(tmp_path: Path):
     input_dir = tmp_path / "output"
     input_dir.mkdir()
     image_data = "aGVsbG8=" * 40
@@ -2241,9 +2257,51 @@ def test_anonymize_preserves_base64_media_payloads_without_touching_metadata(tmp
     source = row["content"][0]["source"]
     assert source["type"] == "base64"
     assert source["media_type"] == "image/png"
-    assert source["data"] == image_data
-    assert image_data in json.dumps(row)
-    assert "image_data" not in result.output
+    assert source["data"] != image_data
+    assert image_data not in json.dumps(row)
+    assert base64.b64decode(source["data"]).startswith(b"\x89PNG\r\n\x1a\n")
+
+
+@pytest.mark.parametrize(
+    ("declared_type", "replacement_type", "signature"),
+    [
+        ("image/jpeg", "image/jpeg", b"\xff\xd8\xff"),
+        ("image/avif", "image/png", b"\x89PNG\r\n\x1a\n"),
+        ("audio/mpeg", "audio/wav", b"RIFF"),
+        ("video/mp4", "video/webm", b"\x1aE\xdf\xa3"),
+    ],
+)
+def test_anonymize_media_placeholder_matches_output_mime_type(
+    declared_type: str,
+    replacement_type: str,
+    signature: bytes,
+):
+    anonymizer = anonymize_module.TraceAnonymizer()
+    original_data = base64.b64encode(b"private media bytes" * 32).decode("ascii")
+
+    redacted = anonymizer.anonymize_value(
+        {
+            "type": "base64",
+            "media_type": declared_type,
+            "data": original_data,
+        }
+    )
+
+    assert redacted["media_type"] == replacement_type
+    assert base64.b64decode(redacted["data"]).startswith(signature)
+    assert redacted["data"] != original_data
+
+
+def test_anonymize_name_matcher_preserves_lowercase_code_and_yaml_values():
+    anonymizer = anonymize_module.TraceAnonymizer()
+    text = "name: npm install\nname: Run tests\nmy name is Jane Doe"
+
+    redacted = anonymizer.anonymize_text(text)
+
+    assert "name: npm install" in redacted
+    assert "name: Run tests" in redacted
+    assert "Jane Doe" not in redacted
+    assert "my name is redacted_pii_" in redacted
 
 
 def test_anonymize_does_not_treat_systemd_units_as_emails(tmp_path: Path):
@@ -2349,7 +2407,7 @@ def test_anonymize_keeps_high_confidence_credentials_and_signed_query_values():
     assert anonymizer.counts["api_key"] == 3
 
 
-def test_anonymize_preserves_assistant_authored_examples_but_scans_tool_inputs():
+def test_anonymize_scans_assistant_authored_examples_and_tool_inputs():
     sample_key = "sk-proj-abcdefghijklmnopqrstuvwxyzABCDEFGHIJK"
     sample_jwt = (
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
@@ -2385,14 +2443,55 @@ def test_anonymize_preserves_assistant_authored_examples_but_scans_tool_inputs()
     redacted = anonymizer.anonymize_value(value)
     assistant = redacted["messages"][0]
 
-    assert sample_key in assistant["content"]
-    assert sample_jwt in assistant["content"]
-    assert "correct-horse-battery-staple" in assistant["content"]
-    assert "developer@company.com" in assistant["content"]
-    assert "qa@acme.com" in assistant["reasoning_content"]
+    assert sample_key not in assistant["content"]
+    assert sample_jwt not in assistant["content"]
+    assert "correct-horse-battery-staple" not in assistant["content"]
+    assert "developer@company.com" not in assistant["content"]
+    assert "qa@acme.com" not in assistant["reasoning_content"]
     assert tool_secret not in json.dumps(assistant["tool_calls"])
     assert "redacted_secret_" in json.dumps(assistant["tool_calls"])
-    assert anonymizer.counts == {"email": 0, "username": 0, "api_key": 1}
+    assert anonymizer.counts == {"email": 2, "username": 0, "api_key": 4, "pii": 0, "media": 0}
+
+
+def test_anonymize_scrubs_high_confidence_personal_identifiers():
+    value = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": (
+                    "My name is Jane Example. Phone: (212) 555-0198. "
+                    "Address: 123 Example Street, New York, NY 10001. "
+                    "SSN 123-45-6789. IP address: 192.0.2.45."
+                ),
+            }
+        ]
+    }
+
+    anonymizer = anonymize_module.TraceAnonymizer()
+    redacted = anonymizer.anonymize_value(value)
+    text = redacted["messages"][0]["content"]
+
+    for private_value in (
+        "Jane Example",
+        "(212) 555-0198",
+        "123 Example Street",
+        "123-45-6789",
+        "192.0.2.45",
+    ):
+        assert private_value not in text
+    assert text.count("redacted_pii_") == 5
+    assert anonymizer.counts["pii"] == 5
+
+    structured = anonymizer.anonymize_value(
+        {
+            "full_name": "Sam Private",
+            "phone_number": "212-555-0114",
+            "street_address": "99 Private Road",
+            "ip_address": "198.51.100.7",
+        }
+    )
+    assert all(str(value).startswith("redacted_pii_") for value in structured.values())
+    assert anonymizer.counts["pii"] == 9
 
 
 def test_anonymize_generic_secret_scan_is_bounded_on_long_hyphenated_ids():

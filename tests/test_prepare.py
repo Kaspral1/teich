@@ -67,6 +67,22 @@ class ThinkingModeTokenizer(TinyChatTokenizer):
         return rendered
 
 
+class ReasoningAwareTokenizer(TinyChatTokenizer):
+    def apply_chat_template(self, messages, *, tokenize=False, add_generation_prompt=False, tools=None, **kwargs):
+        parts = []
+        for message in messages:
+            role = message["role"]
+            reasoning = message.get("reasoning_content")
+            reasoning_text = f"<think>{reasoning}</think>" if reasoning else ""
+            parts.append(f"<{role}>{reasoning_text}{message.get('content', '')}</{role}>")
+        rendered = "".join(parts)
+        if add_generation_prompt:
+            rendered += "<assistant>"
+        if tokenize:
+            return self(rendered)
+        return rendered
+
+
 def _dataset() -> Dataset:
     return Dataset.from_list(
         [
@@ -388,6 +404,72 @@ def test_prepare_data_source_mix_rejects_invalid_dataset_level_chat_template_kwa
                 }
             },
             tokenizer,
+            verbose=False,
+        )
+
+
+def test_prepare_data_source_mix_supports_dataset_level_reasoning_policy():
+    reasoning_dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "reasoning prompt"},
+                    {
+                        "role": "assistant",
+                        "content": "reasoning answer",
+                        "reasoning_content": "keep this analysis",
+                    },
+                ],
+                "tools": [],
+            }
+        ]
+    )
+    instruct_dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "instruct prompt"},
+                    {
+                        "role": "assistant",
+                        "content": "instruct answer",
+                        "reasoning_content": "strip this analysis",
+                    },
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared, report = prepare_data(
+        {
+            "reasoning": {"source": reasoning_dataset, "reasoning_policy": "keep"},
+            "instruct": {"source": instruct_dataset, "reasoning_policy": "strip"},
+        },
+        ReasoningAwareTokenizer(),
+        return_report=True,
+        verbose=False,
+    )
+
+    texts = [prepared[index]["text"] for index in range(prepared.num_rows)]
+    reasoning_text = next(text for text in texts if "reasoning answer" in text)
+    instruct_text = next(text for text in texts if "instruct answer" in text)
+    assert "keep this analysis" in reasoning_text
+    assert "strip this analysis" not in instruct_text
+    assert report.reasoning_stripped_rows == 1
+    assert report.reasoning_stripped_messages == 1
+
+
+@pytest.mark.parametrize("reasoning_policy", [True, "drop", ["strip"]])
+def test_prepare_data_source_mix_rejects_invalid_reasoning_policy(reasoning_policy):
+    with pytest.raises(ValueError, match="reasoning_policy must be either"):
+        prepare_data(
+            {
+                "bad": {
+                    "source": _dataset(),
+                    "reasoning_policy": reasoning_policy,
+                }
+            },
+            TinyChatTokenizer(),
             verbose=False,
         )
 

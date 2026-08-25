@@ -96,7 +96,7 @@ def _audit_training_row(row: dict[str, Any], tokenizer: Any, row_index: int) -> 
     return errors, warnings, sample
 
 
-def audit_sft_dataset(dataset: Dataset, tokenizer: Any, *, sample_size: int = 8) -> SFTAuditReport:
+def audit_sft_dataset(dataset: Dataset, tokenizer: Any, *, sample_size: int | None = None) -> SFTAuditReport:
     if not isinstance(dataset, Dataset):
         return SFTAuditReport(ok=False, errors=["dataset must be a datasets.Dataset instance"])
     errors: list[str] = []
@@ -111,7 +111,7 @@ def audit_sft_dataset(dataset: Dataset, tokenizer: Any, *, sample_size: int = 8)
     if dataset.num_rows == 0:
         return SFTAuditReport(ok=False, errors=["dataset contains no rows"])
 
-    limit = min(max(sample_size, 0), dataset.num_rows)
+    limit = dataset.num_rows if sample_size is None else min(max(sample_size, 0), dataset.num_rows)
     if limit == 0:
         warnings.append("sample_size is 0; no rows audited")
 

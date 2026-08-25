@@ -513,9 +513,10 @@ api:
         mock_api.upload_large_folder.assert_called_once_with(
             repo_id="armand0e/test-dataset",
             folder_path=str(output_dir),
-            repo_type="dataset",
-            private=True,
-            ignore_patterns=["partials/**", "failures/**", "README.md", "tools.json"],
+                repo_type="dataset",
+                private=True,
+                allow_patterns=["*.jsonl", "**/*.jsonl", "*.metadata.json", "**/*.metadata.json"],
+                ignore_patterns=["partials/**", "failures/**", "README.md", "tools.json"],
         )
         mock_api.upload_folder.assert_called_once_with(
             folder_path=str(output_dir),
@@ -669,9 +670,10 @@ api:
         mock_api.upload_large_folder.assert_called_once_with(
             repo_id="armand0e/test-dataset",
             folder_path=str(output_dir),
-            repo_type="dataset",
-            private=False,
-            ignore_patterns=["partials/**", "failures/**", "README.md", "tools.json"],
+                repo_type="dataset",
+                private=False,
+                allow_patterns=["*.jsonl", "**/*.jsonl", "*.metadata.json", "**/*.metadata.json"],
+                ignore_patterns=["partials/**", "failures/**", "README.md", "tools.json"],
         )
         mock_api.upload_folder.assert_called_once_with(
             folder_path=str(output_dir),

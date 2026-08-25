@@ -1007,6 +1007,7 @@ function connectTerminalSocket(session, term) {
   socket.onmessage = (event) => {
     const message = JSON.parse(event.data);
     if (message.type === "stdout") {
+      if (message.reset) term.reset();
       term.write(message.data);
     } else if (message.type === "exit") {
       term.writeln(`\r\n\x1b[38;5;208m${message.detail || "Session ended."}\x1b[0m`);

@@ -97,6 +97,17 @@ def test_audit_sft_dataset_rejects_gemma_context_markers():
     assert "<|tool_response>" in report.errors[1]
 
 
+def test_audit_sft_dataset_checks_all_rows_by_default():
+    safe = {"input_ids": [1, 2, 4], "attention_mask": [1, 1, 1], "labels": [-100, 2, 4]}
+    leaked = {"input_ids": [6, 2], "attention_mask": [1, 1], "labels": [6, 2]}
+    dataset = Dataset.from_list([safe] * 8 + [leaked])
+
+    report = audit_sft_dataset(dataset, TinyTokenizer())
+
+    assert not report.ok
+    assert any("row 8" in error and "<|turn>user" in error for error in report.errors)
+
+
 def test_teich_example_has_single_safe_training_flow():
     source = Path("teich_example.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -121,6 +132,18 @@ def test_gemma4_example_uses_live_remote_template_and_safe_masks():
     assert 'os.environ.setdefault("UNSLOTH_RETURN_LOGITS", "1")' in source
     assert 'MODEL_REVISION = os.environ.get("MODEL_REVISION", "main")' in source
     assert 'CHAT_TEMPLATE_PATH = os.environ.get("CHAT_TEMPLATE_PATH")' in source
+    assert 'os.environ.get("GEMMA4_THINKING_MODE")' in source
+    assert 'os.environ.get("GEMMA4_ENABLE_THINKING")' in source
+    assert 'GEMMA4_THINKING_MODE not in {"auto", "thinking", "nonthinking"}' in source
+    assert "chat_template_kwargs=CHAT_TEMPLATE_KWARGS" in source
+    assert '"reasoning_policy": AGENT_REASONING_POLICY' in source
+    assert '"reasoning_policy": CHAT_REASONING_POLICY' in source
+    assert 'AGENT_REASONING_POLICY = os.environ.get("AGENT_REASONING_POLICY", "keep")' in source
+    assert 'CHAT_REASONING_POLICY = os.environ.get("CHAT_REASONING_POLICY", "strip")' in source
+    assert "train_dataset, prep_report = prepare_data(" in source
+    assert "return_report=True" in source
+    assert "prep_report.gemma4_modes" in source
+    assert "Do not append a" in source
     assert 'or "gemma-template.jinja"' not in source
     assert "token=HF_TOKEN or None" in source
     assert 'oversized_policy="trim_followups"' in source

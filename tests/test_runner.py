@@ -5603,7 +5603,10 @@ def test_resume_treats_prompt_level_system_as_part_of_chat_completion_key(tmp_pa
 
     pending = pending_prompt_inputs_for_resume(prompt_inputs, output_dir)
 
-    assert pending == []
+    assert [(item.system, item.prompt) for item in pending] == [
+        (None, "Hello"),
+        ("Be thorough.", "Hello"),
+    ]
 
 
 def test_resume_matches_completed_agent_trace_when_configured_prompt_has_system(tmp_path: Path):
@@ -5624,7 +5627,7 @@ def test_resume_matches_completed_agent_trace_when_configured_prompt_has_system(
 
     pending = pending_prompt_inputs_for_resume(prompt_inputs, output_dir)
 
-    assert pending == []
+    assert pending == prompt_inputs
 
 
 def test_resume_detects_completed_chat_follow_up_prompt_sets(tmp_path: Path):
@@ -6655,7 +6658,7 @@ def test_pi_runner_appends_prompt_level_system_metadata_at_end(tmp_path: Path):
     ]
     trace_file.write_text("\n".join(native_lines) + "\n", encoding="utf-8")
 
-    runner._append_pi_system_prompt_metadata(
+    runner._append_prompt_system_metadata(
         trace_file,
         PromptInput(prompt="Hello", system="Use the prompt-level system."),
     )
@@ -6754,7 +6757,7 @@ def test_pi_runner_does_not_duplicate_prompt_level_system_metadata(tmp_path: Pat
     )
     before = trace_file.read_text(encoding="utf-8")
 
-    runner._append_pi_system_prompt_metadata(
+    runner._append_prompt_system_metadata(
         trace_file,
         PromptInput(prompt="Hello", system="Use the prompt-level system."),
     )

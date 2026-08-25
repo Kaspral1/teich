@@ -11,7 +11,7 @@ import sys
 from typing import Any, cast
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 GITHUB_REPO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -63,7 +63,13 @@ def _raise_csv_field_limit() -> None:
             limit //= 10
 
 
-class MCPConfig(BaseModel):
+class StrictConfigModel(BaseModel):
+    """Base for user-authored configuration that rejects misspelled keys."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class MCPConfig(StrictConfigModel):
     """MCP server configuration."""
     name: str
     command: str | None = None
@@ -95,7 +101,7 @@ class MCPConfig(BaseModel):
         return self
 
 
-class APIConfig(BaseModel):
+class APIConfig(StrictConfigModel):
     """API configuration for OpenAI-compatible endpoints."""
     provider: str = "openai"  # openai, openrouter, azure, etc.
     base_url: str | None = None  # e.g., https://openrouter.ai/api/v1
@@ -103,7 +109,7 @@ class APIConfig(BaseModel):
     wire_api: str = "responses"
 
 
-class LangfuseConfig(BaseModel):
+class LangfuseConfig(StrictConfigModel):
     """Langfuse tracing credentials, set under ``agent.langfuse``.
 
     When enabled, Teich wires each agent's Langfuse integration (the Codex
@@ -135,7 +141,7 @@ class LangfuseConfig(BaseModel):
         return self
 
 
-class CodexAuthConfig(BaseModel):
+class CodexAuthConfig(StrictConfigModel):
     """Codex ChatGPT-subscription auth handling.
 
     When ``use_host_auth`` is enabled, Teich seeds an ``auth.json`` snapshot
@@ -155,7 +161,7 @@ class CodexAuthConfig(BaseModel):
     broker_port: int = Field(default=0, ge=0, le=65535)
 
 
-class ClaudeConfig(BaseModel):
+class ClaudeConfig(StrictConfigModel):
     """Claude Code-specific settings, set under ``agent.claude``.
 
     Subscription auth (Pro/Max): when a long-lived OAuth token is available —
@@ -190,7 +196,7 @@ class ClaudeConfig(BaseModel):
     max_thinking_tokens: int | None = Field(default=None, ge=0)
 
 
-class HarnessContextCaptureConfig(BaseModel):
+class HarnessContextCaptureConfig(StrictConfigModel):
     """Safe simulated capture of client-visible harness instructions and tools.
 
     When enabled, Teich points the configured harness at a local fake provider
@@ -204,7 +210,7 @@ class HarnessContextCaptureConfig(BaseModel):
     timeout_seconds: int = Field(default=45, gt=0, le=300)
 
 
-class AgentConfig(BaseModel):
+class AgentConfig(StrictConfigModel):
     """Agent runtime selection."""
     provider: str = "codex"
     # Langfuse tracing, applied to every agent that supports it (Codex, Claude).
@@ -213,7 +219,7 @@ class AgentConfig(BaseModel):
     claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
 
 
-class ModelConfig(BaseModel):
+class ModelConfig(StrictConfigModel):
     """Model configuration."""
     model: str = "codex-mini-latest"
     approval_policy: str = "never"
@@ -240,7 +246,7 @@ class ModelConfig(BaseModel):
         return self
 
 
-class OutputConfig(BaseModel):
+class OutputConfig(StrictConfigModel):
     """Output configuration."""
     traces_dir: Path = Field(default=Path("./output"))
     sandbox_dir: Path = Field(default=Path("./sandbox"))
@@ -248,7 +254,7 @@ class OutputConfig(BaseModel):
     pretty_name: str = "Agentic Training Traces"
 
 
-class PublishConfig(BaseModel):
+class PublishConfig(StrictConfigModel):
     """Publishing configuration."""
     repo_id: str | None = None
     hf_token: str | None = None
@@ -267,7 +273,7 @@ class PublishConfig(BaseModel):
         return normalized
 
 
-class PromptInput(BaseModel):
+class PromptInput(StrictConfigModel):
     """Structured prompt input row."""
     image: str | None = None
     github_repo: str | None = None
@@ -337,7 +343,7 @@ class PromptInput(BaseModel):
         return [self.prompt, *self.follow_up_prompts]
 
 
-class Config(BaseModel):
+class Config(StrictConfigModel):
     """Main configuration."""
     agent: AgentConfig = Field(default_factory=AgentConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)

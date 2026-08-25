@@ -65,6 +65,7 @@ Useful options:
 - `teich_masking`
 - `tokenize`
 - `chat_template_kwargs`
+- `reasoning_policy` (`"keep"` or `"strip"`)
 
 See [Preparing Data](prepare-data.md).
 

@@ -34,6 +34,13 @@ def test_default_config():
     ]
 
 
+def test_config_rejects_unknown_top_level_and_nested_fields():
+    with pytest.raises(ValueError, match="max_concurency"):
+        Config.model_validate({"max_concurency": 99})
+    with pytest.raises(ValueError, match="reasoning_efort"):
+        Config.model_validate({"model": {"reasoning_efort": "high"}})
+
+
 @pytest.mark.parametrize("field", ["startup_timeout_sec", "tool_timeout_sec"])
 def test_mcp_timeouts_must_be_positive(field: str):
     with pytest.raises(ValueError):

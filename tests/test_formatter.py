@@ -26,6 +26,7 @@ def prepare_and_mask_for_test(
     messages_column="messages",
     tools_column="tools",
     chat_template_kwargs=None,
+    reasoning_policy="keep",
     train_on_reasoning=True,
     train_on_final_answers=True,
     train_on_tools=True,
@@ -41,6 +42,7 @@ def prepare_and_mask_for_test(
         messages_column=messages_column,
         tools_column=tools_column,
         chat_template_kwargs=chat_template_kwargs,
+        reasoning_policy=reasoning_policy,
         train_on_reasoning=train_on_reasoning,
         max_length=max_length,
         drop_oversized_examples=drop_oversized_examples,
@@ -396,6 +398,7 @@ class GemmaLikeOffsetTokenizer(OffsetCountingTokenizer):
         add_generation_prompt=False,
         tools=None,
         enable_thinking=True,
+        preserve_thinking=False,
         **kwargs,
     ):
         self.render_count += 1
@@ -447,6 +450,296 @@ class GemmaLikeOffsetTokenizer(OffsetCountingTokenizer):
         if tokenize:
             return self(rendered)
         return rendered
+
+
+def test_gemma4_rejects_reasoning_when_thinking_is_disabled():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer", "reasoning_content": "reason"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="Gemma 4 thinking is disabled"):
+        prepare_data(
+            dataset,
+            tokenizer,
+            chat_template_kwargs={"enable_thinking": False},
+            strict=True,
+            verbose=False,
+        )
+
+
+@pytest.mark.parametrize("enable_thinking", [None, True])
+def test_gemma4_normalizes_leading_legacy_think_trigger(enable_thinking: bool | None):
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-E4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "system", "content": "<|think|>"},
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    template_kwargs = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
+    prepared, report = prepare_data(
+        dataset,
+        tokenizer,
+        chat_template_kwargs=template_kwargs,
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+
+    assert prepared.num_rows == 1
+    assert "<|think|>" not in prepared[0]["text"]
+    assert report.gemma4_modes == {"thinking": 1}
+    assert report.gemma4_legacy_triggers_normalized == 1
+
+
+def test_gemma4_rejects_legacy_trigger_when_explicitly_disabled():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-E4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "system", "content": "<|think|>"},
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="enable_thinking=False conflicts"):
+        prepare_data(
+            dataset,
+            tokenizer,
+            chat_template_kwargs={"enable_thinking": False},
+            strict=True,
+            verbose=False,
+        )
+
+
+def test_gemma4_auto_mode_handles_mixed_thinking_and_direct_rows():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "reason"},
+                    {"role": "assistant", "content": "answer", "reasoning_content": "analysis"},
+                ],
+                "tools": [],
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "direct"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                "tools": [],
+            },
+        ]
+    )
+
+    prepared, report = prepare_data(
+        dataset,
+        tokenizer,
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+
+    assert "<|channel>thought\nanalysis\n<channel|>" in prepared[0]["text"]
+    assert "<|channel>thought\n<channel|>answer" in prepared[1]["text"]
+    assert report.gemma4_modes == {"thinking": 1, "nonthinking": 1}
+
+    training_data = prepare_and_mask_for_test(dataset, tokenizer, strict=True)
+    thinking_target = tokenizer.decode(
+        [token for token in training_data[0]["labels"] if token != -100]
+    )
+    direct_target = tokenizer.decode(
+        [token for token in training_data[1]["labels"] if token != -100]
+    )
+    assert "analysis" in thinking_target
+    assert thinking_target.endswith("<turn|>")
+    assert "<|channel>thought" not in direct_target
+    assert "answer" in direct_target
+    assert direct_target.endswith("<turn|>")
+
+
+def test_reasoning_policy_strip_makes_reasoning_dataset_direct_for_gemma4():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer", "reasoning_content": "private analysis"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared, report = prepare_data(
+        dataset,
+        tokenizer,
+        reasoning_policy="strip",
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+
+    assert "private analysis" not in prepared[0]["text"]
+    assert "<|channel>thought\n<channel|>answer<turn|>" in prepared[0]["text"]
+    assert report.gemma4_modes == {"nonthinking": 1}
+    assert report.reasoning_stripped_rows == 1
+    assert report.reasoning_stripped_messages == 1
+
+    training_data = prepare_and_mask_for_test(
+        dataset,
+        tokenizer,
+        reasoning_policy="strip",
+        strict=True,
+    )
+    supervised_text = tokenizer.decode(
+        [token for token in training_data[0]["labels"] if token != -100]
+    )
+    assert "private analysis" not in supervised_text
+    assert supervised_text == "answer<turn|>"
+
+
+def test_prepare_data_rejects_unknown_reasoning_policy():
+    with pytest.raises(ValueError, match="reasoning_policy must be one of"):
+        prepare_data(
+            Dataset.from_list(
+                [
+                    {
+                        "messages": [
+                            {"role": "user", "content": "question"},
+                            {"role": "assistant", "content": "answer"},
+                        ],
+                        "tools": [],
+                    }
+                ]
+            ),
+            GemmaLikeOffsetTokenizer(),
+            reasoning_policy="guess",
+            verbose=False,
+        )
+
+
+def test_gemma4_auto_mode_preserves_historical_reasoning():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-31B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "one", "reasoning_content": "reason one"},
+                    {"role": "user", "content": "second"},
+                    {"role": "assistant", "content": "two", "reasoning_content": "reason two"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared, report = prepare_data(
+        dataset,
+        tokenizer,
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+
+    assert "reason one" in prepared[0]["text"]
+    assert "reason two" in prepared[0]["text"]
+    assert report.gemma4_modes == {"thinking": 1}
+
+
+def test_gemma4_rejects_dropped_historical_reasoning():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-31B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "one", "reasoning_content": "reason one"},
+                    {"role": "user", "content": "second"},
+                    {"role": "assistant", "content": "two", "reasoning_content": "reason two"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="preserve_thinking=False"):
+        prepare_data(
+            dataset,
+            tokenizer,
+            chat_template_kwargs={"enable_thinking": True, "preserve_thinking": False},
+            strict=True,
+            verbose=False,
+        )
+
+
+def test_gemma4_nonthinking_training_matches_empty_thought_generation_prefix():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared = prepare_data(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"enable_thinking": False},
+        strict=True,
+        verbose=False,
+    )
+
+    assert "<|turn>model\n<|channel>thought\n<channel|>answer<turn|>" in prepared[0]["text"]
+    training_data = prepare_and_mask_for_test(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"enable_thinking": False},
+        strict=True,
+    )
+    supervised_text = tokenizer.decode(
+        [token for token in training_data[0]["labels"] if token != -100]
+    )
+    assert "<|channel>thought" not in supervised_text
+    assert "answer" in supervised_text
+    assert supervised_text.endswith("<turn|>")
 
 
 def test_reordered_mapping_markers_preserve_typed_tool_spans():
@@ -1145,6 +1438,48 @@ def test_gemma_turn_end_remains_supervised_when_only_reasoning_is_enabled():
     assert "think" in supervised_text
     assert "world" not in supervised_text
     assert supervised_text.endswith("<turn|>")
+
+
+def test_gemma4_literal_model_header_in_user_content_is_not_a_turn_boundary():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    user_content = "Discuss this literal protocol text:\n<|turn>model\nnot an assistant response."
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": "actual answer"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared = prepare_data(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"enable_thinking": False},
+        strict=True,
+        verbose=False,
+    )
+
+    empty_thought = "<|channel>thought\n<channel|>"
+    assert prepared[0]["text"].count(empty_thought) == 1
+    assert f"{user_content}<turn|>" in prepared[0]["text"]
+    assert f"<|turn>model\n{empty_thought}actual answer<turn|>" in prepared[0]["text"]
+
+    training_data = prepare_and_mask_for_test(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"enable_thinking": False},
+        strict=True,
+    )
+    supervised_text = tokenizer.decode(
+        [token for token in training_data[0]["labels"] if token != -100]
+    )
+    assert "not an assistant response" not in supervised_text
+    assert supervised_text == "actual answer<turn|>"
 
 
 def test_gemma_turn_end_remains_supervised_when_only_tool_call_is_enabled():
