@@ -165,6 +165,9 @@ train_dataset = prepare_data(
 )
 ```
 
+`reasoning_effort="low"` is accepted as a compatibility alias and normalized
+to `low_effort=True` before the template is rendered.
+
 For true direct-instruction tuning from a reasoning-bearing source, strip the
 reasoning before rendering. Setting `train_on_reasoning=False` only masks its
 loss; it does not remove reasoning from causal context.

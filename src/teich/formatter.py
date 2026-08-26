@@ -460,6 +460,14 @@ def _resolve_granite42_thinking_contract(
     for key in ("enable_thinking", "low_effort", "truncate_history_thinking"):
         if key in resolved_kwargs and not isinstance(resolved_kwargs[key], bool):
             raise ValueError(f"Granite 4.2 {key} must be a boolean when provided.")
+    reasoning_effort = resolved_kwargs.pop("reasoning_effort", None)
+    if reasoning_effort is not None:
+        if not isinstance(reasoning_effort, str):
+            raise ValueError("Granite 4.2 reasoning_effort must be a string when provided.")
+        # The live template currently accepts reasoning_effort="low" as an
+        # alias, but normalize it so rendering never depends on that optional
+        # compatibility branch. Match the live precedence when both keys exist.
+        resolved_kwargs["low_effort"] = reasoning_effort == "low"
 
     reasoning_indexes = [
         index
@@ -467,10 +475,7 @@ def _resolve_granite42_thinking_contract(
         if message.get("role") in {"assistant", "model"}
         and (_message_reasoning(message) or _message_has_inline_thinking(message))
     ]
-    low_effort = (
-        resolved_kwargs.get("low_effort", False) is True
-        or resolved_kwargs.get("reasoning_effort") == "low"
-    )
+    low_effort = resolved_kwargs.get("low_effort", False) is True
     explicit_thinking = "enable_thinking" in resolved_kwargs
     thinking_enabled = (
         resolved_kwargs["enable_thinking"]

@@ -3363,7 +3363,7 @@ class Granite42LikeOffsetTokenizer(OffsetCountingTokenizer):
                 continue
             if role == "user":
                 content = str(message.get("content") or "")
-                if index == last_user_index and (low_effort or reasoning_effort == "low"):
+                if index == last_user_index and low_effort:
                     content += "\n\n{reasoning effort: low}"
                 parts.append(f"<|im_start|>user\n{content}<|im_end|>\n")
                 continue
@@ -3562,6 +3562,46 @@ def test_granite42_reasoning_policy_strip_creates_direct_training_text():
     )
     assert "private reason" not in prepared[0]["text"]
     assert "<|im_start|>assistant\n<think></think>answer<|im_end|>" in prepared[0]["text"]
+
+
+def test_granite42_forwards_reasoning_effort_low_as_canonical_low_effort():
+    tokenizer = Granite42LikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer", "reasoning_content": "reason"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared, report = prepare_data(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"reasoning_effort": "low"},
+        tokenize=True,
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+
+    assert "question\n\n{reasoning effort: low}<|im_end|>" in prepared[0]["text"]
+    assert report.granite42_modes == {"low_effort": 1}
+
+    full_effort, full_report = prepare_data(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"low_effort": True, "reasoning_effort": "medium"},
+        tokenize=True,
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+    assert "{reasoning effort: low}" not in full_effort[0]["text"]
+    assert full_report.granite42_modes == {"thinking": 1}
 
 
 def test_granite42_rejects_history_truncation_that_would_drop_training_reasoning():
