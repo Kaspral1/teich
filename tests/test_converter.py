@@ -285,7 +285,12 @@ def test_convert_cursor_session_events_preserves_messages_tools_and_trace_type(t
             "message": {
                 "content": [
                     {"type": "thinking", "text": "Need a directory listing."},
-                    {"type": "tool_use", "id": "call-shell", "name": "Shell", "input": {"command": "ls"}},
+                    {
+                        "type": "tool_use",
+                        "id": "call-shell",
+                        "name": "Shell",
+                        "input": {"command": "ls", "json_text": '{"preserve":"as text"}'},
+                    },
                 ]
             },
         },
@@ -315,6 +320,7 @@ def test_convert_cursor_session_events_preserves_messages_tools_and_trace_type(t
     ]
     assert example.messages[1]["reasoning_content"] == "Need a directory listing."
     assert example.messages[1]["tool_calls"][0]["function"]["name"] == "Shell"
+    assert example.messages[1]["tool_calls"][0]["function"]["arguments"]["json_text"] == '{"preserve":"as text"}'
     assert example.messages[2]["tool_call_id"] == "call-shell"
     assert example.messages[2]["content"] == "README.md\nsrc"
     tools_by_name = {tool["function"]["name"]: tool for tool in example.tools}

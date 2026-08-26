@@ -3345,7 +3345,15 @@ def _convert_cursor_trace_to_training_example(
                         continue
                     if not isinstance(tool_call_id, str) or not tool_call_id:
                         tool_call_id = f"{tool_name}_{len(tool_calls) + 1}"
-                    arguments = _normalize_json_like_value(block.get("input") or {})
+                    raw_arguments = block.get("input")
+                    # Cursor tool inputs are already structured. Recursively
+                    # normalizing them would reinterpret legitimate string
+                    # values such as JSON file contents as nested objects.
+                    arguments = (
+                        raw_arguments
+                        if isinstance(raw_arguments, dict)
+                        else _parse_function_arguments(raw_arguments)
+                    )
                     tool_names.add(tool_name)
                     tool_names_by_call_id[tool_call_id] = tool_name
                     tool_argument_samples.setdefault(tool_name, []).append(arguments)
