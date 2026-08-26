@@ -129,6 +129,70 @@ environment and check it with `python -m pip check` before a long run. Teich's
 core environment does not pin the CUDA, PyTorch, Unsloth, and TRL stack because
 those versions depend on the host GPU and CUDA runtime.
 
+## Live Granite 4.2 Models
+
+Teich smoke-tests the released IBM checkpoints with their live remote chat
+template:
+
+- `ibm-granite/granite-4.2-3b`
+- `ibm-granite/granite-4.2-8b`
+- `ibm-granite/granite-4.2-30b`
+
+Granite 4.2 uses `<think>...</think>` reasoning and supports full thinking,
+non-thinking, and low-effort thinking. Leave `enable_thinking` unset during
+preparation for Teich's recommended per-row auto mode. Rows with structured
+assistant reasoning use thinking mode; direct rows use non-thinking mode and
+retain Granite's required `<think></think>` inference primer as masked context.
+The final answer and closing `<|im_end|>` remain supervised.
+
+The live template defaults `truncate_history_thinking=True` for inference to
+save context. That is unsafe as an SFT default because every assistant turn is
+a training target. Teich therefore supplies `truncate_history_thinking=False`
+while preparing Granite 4.2 rows. Explicitly requesting truncation fails closed
+when it would remove historical source reasoning. With `return_report=True`,
+inspect `prep_report.granite42_modes` for `thinking`, `nonthinking`, and
+`low_effort` row counts.
+
+For low-effort reasoning, use the live template's `low_effort=True` setting:
+
+```python
+train_dataset = prepare_data(
+    "username/granite42-reasoning-traces",
+    tokenizer,
+    chat_template_kwargs={"low_effort": True},
+    tokenize=True,
+    strict=True,
+)
+```
+
+`reasoning_effort="low"` is accepted as a compatibility alias and normalized
+to `low_effort=True` before the template is rendered.
+
+For true direct-instruction tuning from a reasoning-bearing source, strip the
+reasoning before rendering. Setting `train_on_reasoning=False` only masks its
+loss; it does not remove reasoning from causal context.
+
+```python
+train_dataset = prepare_data(
+    "username/granite42-direct-traces",
+    tokenizer,
+    reasoning_policy="strip",
+    tokenize=True,
+    strict=True,
+)
+```
+
+Do not add `<think>`, `<think></think>`, or `<|im_end|>` to source messages.
+The live template and Teich's per-row contract produce and mask those protocol
+tokens. Tool results remain masked by default, while assistant tool calls and
+their completed-turn `<|im_end|>` are supervised.
+
+`granite42_example.py` is a complete text-only LoRA example. It defaults to the
+8B checkpoint, uses Granite's per-row auto mode, and applies optional
+`GRANITE42_LOW_EFFORT=1` only to the reasoning-bearing agent source. Override
+`MODEL_NAME` to use the 3B or 30B checkpoint without changing the preparation
+contract.
+
 ## Live Qwen 3.8 Models
 
 Qwen 3.8 has a different native contract and Teich does not apply Gemma's auto
@@ -174,6 +238,40 @@ train_dataset, prep_report = prepare_data(
 Qwen 3.8's non-thinking prompt contains an empty `<think>...</think>` primer.
 Teich keeps that inference-alignment prefix in the rendered text but masks it
 from loss. The final answer and closing `<|im_end|>` remain supervised.
+
+`qwen38_example.py` is a complete text-only LoRA example using the live
+multimodal tokenizer. It keeps thinking and history preservation on for the
+agent source, strips reasoning and disables thinking for the direct-chat
+source, and accepts `QWEN38_REASONING_EFFORT=low|medium|xhigh`.
+
+## Live Qwen 3.6 Models
+
+Qwen 3.6 uses a different contract from Qwen 3.8. It supports explicit
+`enable_thinking` and `preserve_thinking`, but its live template has no
+`reasoning_effort` control. The template normally keeps only reasoning related
+to the latest user message, so multi-turn reasoning SFT should explicitly set
+`preserve_thinking=True`:
+
+```python
+train_dataset = prepare_data(
+    "username/qwen36-agent-traces",
+    tokenizer,
+    chat_template_kwargs={
+        "enable_thinking": True,
+        "preserve_thinking": True,
+    },
+    tokenize=True,
+    strict=True,
+)
+```
+
+For a direct source, use `reasoning_policy="strip"` with
+`enable_thinking=False` and `preserve_thinking=False`. Qwen 3.6 does not use
+the older `/think` or `/nothink` soft switches; do not inject either into data.
+
+`qwen36_example.py` demonstrates both source policies with
+`Qwen/Qwen3.6-35B-A3B`. Override `MODEL_NAME=Qwen/Qwen3.6-27B` to use the dense
+checkpoint with the same preparation contract.
 
 ## Source Reasoning Policy
 
@@ -230,6 +328,10 @@ masked, so reasoning-only and tool-only fine-tunes still learn to stop. Empty
 final assistant messages and unresolved tool-result prefixes do not create
 synthetic `final_answer` spans; the stopping token is attached only after an
 actual enabled target is selected.
+
+For Granite 4.2, the equivalent stopping token is `<|im_end|>`. Each enabled
+assistant reasoning, answer, or tool-call target retains its completed-turn
+terminator, including reasoning-only and tool-only masking policies.
 
 ## Masking Policy
 

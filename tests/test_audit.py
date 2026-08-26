@@ -148,3 +148,52 @@ def test_gemma4_example_uses_live_remote_template_and_safe_masks():
     assert "token=HF_TOKEN or None" in source
     assert 'oversized_policy="trim_followups"' in source
     assert "processing_class=tokenizer" in source
+
+
+def test_model_family_examples_use_live_templates_and_source_level_reasoning_contracts():
+    examples = {
+        "granite42_example.py": [
+            '"ibm-granite/granite-4.2-8b"',
+            "prep_report.granite42_modes",
+            'os.environ.get("GRANITE42_LOW_EFFORT", "0")',
+            'agent_source["chat_template_kwargs"] = {"low_effort": True}',
+        ],
+        "qwen38_example.py": [
+            '"Qwen/Qwen3.8-27B"',
+            'QWEN38_REASONING_EFFORT", "medium"',
+            'REASONING_EFFORT not in {"low", "medium", "xhigh"}',
+            '"reasoning_effort": REASONING_EFFORT',
+            '"preserve_thinking": True',
+        ],
+        "qwen36_example.py": [
+            '"Qwen/Qwen3.6-35B-A3B"',
+            '"preserve_thinking": True',
+            "has no reasoning_effort switch",
+        ],
+    }
+
+    for path, expected_fragments in examples.items():
+        source = Path(path).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+
+        assert '"hf_' not in source
+        assert "CHAT_TEMPLATE_PATH" not in source
+        assert "prepare_data" in source
+        assert "mask_data" in source
+        assert '"reasoning_policy": AGENT_REASONING_POLICY' in source
+        assert '"reasoning_policy": CHAT_REASONING_POLICY' in source
+        assert '"enable_thinking": False' in source or path == "granite42_example.py"
+        assert 'oversized_policy="trim_followups"' in source
+        assert "strict=True" in source
+        assert "return_report=True" in source
+        assert 'dataset_text_field="text"' in source
+        assert "packing=False" in source
+        assert "processing_class=tokenizer" in source
+        assert "DataCollatorForLanguageModeling" not in source
+        assert "token=HF_TOKEN or None" in source
+        assert sum(
+            isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "train"
+            for node in ast.walk(tree)
+        ) == 1
+        for fragment in expected_fragments:
+            assert fragment in source

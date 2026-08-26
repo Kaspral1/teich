@@ -3326,6 +3326,82 @@ class GraniteLikeOffsetTokenizer(OffsetCountingTokenizer):
         return rendered
 
 
+class Granite42LikeOffsetTokenizer(OffsetCountingTokenizer):
+    name_or_path = "ibm-granite/granite-4.2-3b"
+    chat_template = (
+        "{% set truncate_history_thinking = truncate_history_thinking | default(true) %}"
+        "<|im_start|>assistant\\n<think><|im_end|>"
+    )
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize=False,
+        add_generation_prompt=False,
+        tools=None,
+        enable_thinking=True,
+        low_effort=False,
+        reasoning_effort=None,
+        truncate_history_thinking=True,
+        **kwargs,
+    ):
+        self.render_count += 1
+        if kwargs:
+            raise AssertionError(f"Unexpected chat template kwargs: {kwargs}")
+        parts = ["<|im_start|>system\n"]
+        if tools:
+            parts.append("<tools>bash</tools>")
+        parts.append("<|im_end|>\n")
+        last_user_index = max(
+            (index for index, message in enumerate(messages) if message["role"] == "user"),
+            default=-1,
+        )
+        for index, message in enumerate(messages):
+            role = message["role"]
+            if role == "system":
+                continue
+            if role == "user":
+                content = str(message.get("content") or "")
+                if index == last_user_index and low_effort:
+                    content += "\n\n{reasoning effort: low}"
+                parts.append(f"<|im_start|>user\n{content}<|im_end|>\n")
+                continue
+            if role == "assistant":
+                content = str(message.get("content") or "")
+                reasoning = str(message.get("reasoning_content") or "")
+                if truncate_history_thinking and index < last_user_index:
+                    reasoning = ""
+                parts.append("<|im_start|>assistant\n")
+                if reasoning:
+                    parts.append(f"<think>\n{reasoning}\n</think>\n")
+                else:
+                    parts.append("<think></think>")
+                for tool_call in message.get("tool_calls") or []:
+                    function = tool_call["function"]
+                    parts.append(
+                        f"<tool_call>\n<function={function['name']}>\n"
+                        "</function>\n</tool_call>\n"
+                    )
+                parts.append(f"{content}<|im_end|>\n")
+                continue
+            if role == "tool":
+                parts.append(
+                    "<|im_start|>user\n<tool_response>\n"
+                    f"{message.get('content', '')}\n"
+                    "</tool_response>\n<|im_end|>\n"
+                )
+                continue
+            raise AssertionError(f"Unexpected role: {role}")
+        if add_generation_prompt:
+            parts.append("<|im_start|>assistant\n")
+            parts.append("<think>\n" if enable_thinking else "<think></think>")
+        rendered = "".join(parts)
+        if tokenize:
+            return self(rendered)
+        return rendered
+
+
 class QwenMismatchOffsetTokenizer(QwenLikeOffsetTokenizer):
     def apply_chat_template(self, messages, *, add_generation_prompt=False, enable_thinking=True, **kwargs):
         rendered = super().apply_chat_template(
@@ -3380,6 +3456,178 @@ def test_prepare_and_mask_expands_granite_style_assistant_blocks():
         [token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100]
     )
     assert "List files" in masked_text
+
+
+def test_granite42_auto_selects_thinking_mode_and_preserves_reasoning_history():
+    tokenizer = Granite42LikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "one", "reasoning_content": "reason one"},
+                    {"role": "user", "content": "second"},
+                    {"role": "assistant", "content": "two", "reasoning_content": "reason two"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared, report = prepare_data(
+        dataset,
+        tokenizer,
+        tokenize=True,
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+
+    assert "reason one" in prepared[0]["text"]
+    assert "reason two" in prepared[0]["text"]
+    assert report.granite42_modes == {"thinking": 1}
+    training_data = prepare_and_mask_for_test(dataset, tokenizer)
+    supervised_text = tokenizer.decode([token for token in training_data[0]["labels"] if token != -100])
+    assert "reason one" in supervised_text
+    assert "reason two" in supervised_text
+    assert supervised_text.count("<|im_end|>") == 2
+
+
+def test_granite42_auto_selects_nonthinking_mode_and_masks_empty_thought_prefix():
+    tokenizer = Granite42LikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "answer directly"},
+                    {"role": "assistant", "content": "direct answer"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared = prepare_data(dataset, tokenizer, tokenize=True, strict=True, verbose=False)
+    assert "<|im_start|>assistant\n<think></think>direct answer<|im_end|>" in prepared[0]["text"]
+    training_data = prepare_and_mask_for_test(dataset, tokenizer)
+    supervised_text = tokenizer.decode([token for token in training_data[0]["labels"] if token != -100])
+    assert supervised_text == "direct answer<|im_end|>\n"
+
+
+def test_granite42_rejects_reasoning_with_nonthinking_mode():
+    tokenizer = Granite42LikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer", "reasoning_content": "reason"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="Granite 4.2 thinking is disabled"):
+        prepare_data(
+            dataset,
+            tokenizer,
+            chat_template_kwargs={"enable_thinking": False},
+            strict=True,
+            verbose=False,
+        )
+
+
+def test_granite42_reasoning_policy_strip_creates_direct_training_text():
+    tokenizer = Granite42LikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer", "reasoning_content": "private reason"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared = prepare_data(
+        dataset,
+        tokenizer,
+        reasoning_policy="strip",
+        tokenize=True,
+        strict=True,
+        verbose=False,
+    )
+    assert "private reason" not in prepared[0]["text"]
+    assert "<|im_start|>assistant\n<think></think>answer<|im_end|>" in prepared[0]["text"]
+
+
+def test_granite42_forwards_reasoning_effort_low_as_canonical_low_effort():
+    tokenizer = Granite42LikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer", "reasoning_content": "reason"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared, report = prepare_data(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"reasoning_effort": "low"},
+        tokenize=True,
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+
+    assert "question\n\n{reasoning effort: low}<|im_end|>" in prepared[0]["text"]
+    assert report.granite42_modes == {"low_effort": 1}
+
+    full_effort, full_report = prepare_data(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"low_effort": True, "reasoning_effort": "medium"},
+        tokenize=True,
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+    assert "{reasoning effort: low}" not in full_effort[0]["text"]
+    assert full_report.granite42_modes == {"thinking": 1}
+
+
+def test_granite42_rejects_history_truncation_that_would_drop_training_reasoning():
+    tokenizer = Granite42LikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "one", "reasoning_content": "reason one"},
+                    {"role": "user", "content": "second"},
+                    {"role": "assistant", "content": "two", "reasoning_content": "reason two"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="truncate_history_thinking=True would remove reasoning"):
+        prepare_data(
+            dataset,
+            tokenizer,
+            chat_template_kwargs={"truncate_history_thinking": True},
+            strict=True,
+            verbose=False,
+        )
 
 
 def test_prepare_and_mask_falls_back_to_assistant_header_when_qwen_prefix_probe_mismatches():

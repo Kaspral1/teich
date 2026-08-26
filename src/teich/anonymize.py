@@ -1121,7 +1121,7 @@ class TraceAnonymizer:
         token = match.group("value")
         if not self._is_sensitive_name(match.group("name"), token):
             return match.group(0)
-        if token in self._api_replacements:
+        if self._is_redacted_secret_value(token) or token in self._api_replacements:
             return match.group(0)
         replacement = self._api_key_map.get(token)
         if replacement is None:

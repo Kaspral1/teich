@@ -24,3 +24,7 @@ projects/
 .DS_Store
 Thumbs.db
 unsloth_compiled_cache/
+
+# Local dataset conversion inputs and generated artifacts
+/dataset (1).jsonl
+/dataset-1-conversion/
