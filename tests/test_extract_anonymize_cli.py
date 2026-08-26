@@ -2562,6 +2562,16 @@ def test_anonymize_generic_secret_handles_escaped_json_and_ignores_non_secret_as
     assert anonymizer.counts["api_key"] == 1
 
 
+def test_anonymize_generic_secret_preserves_redacted_values_across_passes():
+    text = "service_api_token=redacted_secret_abcdefghijklmnop"
+
+    anonymizer = anonymize_module.TraceAnonymizer()
+    redacted = anonymizer.anonymize_text(text)
+
+    assert redacted == text
+    assert anonymizer.counts["api_key"] == 0
+
+
 def test_pool_upload_is_reserved_until_backend_exists(tmp_path: Path):
     result = runner.invoke(app, ["pool", "upload", str(tmp_path)])
 
