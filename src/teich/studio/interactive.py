@@ -31,6 +31,7 @@ from typing import Any
 
 from ..config import Config, PromptInput
 from ..runner import (
+    DOCKER_CLEANUP_TIMEOUT_SECONDS,
     HERMES_DEFAULT_TOOLSETS,
     PI_SESSIONS_DIR_IN_CONTAINER,
     RUNTIME_CONTAINER_USER,
@@ -41,8 +42,11 @@ from ..runner import (
     HermesRunner,
     PiRunner,
     _make_tree_world_writable,
+    _terminate_process_tree,
 )
 from .events import display_event
+
+SUBPROCESS_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 TEXT_SUBPROCESS_KWARGS: dict[str, Any] = {
     "text": True,
@@ -51,20 +55,30 @@ TEXT_SUBPROCESS_KWARGS: dict[str, Any] = {
 }
 
 SCROLLBACK_LIMIT = 2 * 1024 * 1024  # bytes of terminal history kept for reconnects
+EVENT_LOG_LIMIT = 10_000
+SESSION_HISTORY_LIMIT = 50
 
 
 class EventLog:
     """Append-only event list with a condition for SSE long-polling."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_events: int = EVENT_LOG_LIMIT) -> None:
         self._events: list[dict[str, Any]] = []
         self._condition = threading.Condition()
+        self._first_seq = 0
+        self._next_seq = 0
+        self._max_events = max(1, max_events)
         self.closed = False
 
     def append(self, event: dict[str, Any]) -> None:
         with self._condition:
-            event = {**event, "seq": len(self._events), "ts": time.time()}
+            event = {**event, "seq": self._next_seq, "ts": time.time()}
+            self._next_seq += 1
             self._events.append(event)
+            overflow = len(self._events) - self._max_events
+            if overflow > 0:
+                del self._events[:overflow]
+                self._first_seq += overflow
             self._condition.notify_all()
 
     def close(self) -> None:
@@ -75,9 +89,11 @@ class EventLog:
     def wait_for(self, start_index: int, timeout: float = 15.0) -> list[dict[str, Any]]:
         """Return events at/after start_index, blocking up to timeout if none yet."""
         with self._condition:
-            if len(self._events) <= start_index and not self.closed:
+            start_index = max(start_index, self._first_seq)
+            if self._next_seq <= start_index and not self.closed:
                 self._condition.wait(timeout=timeout)
-            return self._events[start_index:]
+            start_index = max(start_index, self._first_seq)
+            return self._events[start_index - self._first_seq:]
 
     def snapshot(self) -> list[dict[str, Any]]:
         with self._condition:
@@ -85,14 +101,10 @@ class EventLog:
 
 
 def _terminate(process: subprocess.Popen | None) -> None:
-    if process is None or process.poll() is not None:
+    if process is None:
         return
     try:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
+        _terminate_process_tree(process)
     except OSError:
         pass
 
@@ -100,11 +112,15 @@ def _terminate(process: subprocess.Popen | None) -> None:
 def _remove_container(container_name: str | None) -> None:
     if not container_name:
         return
-    subprocess.run(
-        ["docker", "rm", "-f", container_name],
-        capture_output=True,
-        **TEXT_SUBPROCESS_KWARGS,
-    )
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            capture_output=True,
+            timeout=DOCKER_CLEANUP_TIMEOUT_SECONDS,
+            **TEXT_SUBPROCESS_KWARGS,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return
 
 
 class TerminalBridge:
@@ -143,6 +159,11 @@ class TerminalBridge:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 bufsize=0,
+                creationflags=(
+                    SUBPROCESS_CREATE_NO_WINDOW
+                    if os.name == "nt"
+                    else 0
+                ),
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
@@ -195,6 +216,11 @@ class TerminalBridge:
         """Register a listener and return the scrollback to replay."""
         with self._lock:
             self._listeners.add(listener)
+            return "".join(self._scrollback)
+
+    def scrollback(self) -> str:
+        """Return a consistent snapshot for a slow websocket to replay."""
+        with self._lock:
             return "".join(self._scrollback)
 
     def detach(self, listener: Callable[[str], None]) -> None:
@@ -336,6 +362,7 @@ class InteractiveSession:
             if self.provider == "hermes":
                 runner._write_hermes_runtime_config(self._home_dir)
             else:
+                runner._prepare_agent_home(self._home_dir)
                 self._claude_existing_sessions = {
                     p.resolve() for p in runner._list_native_session_files(self._home_dir)
                 }
@@ -575,10 +602,7 @@ class InteractiveSession:
         model = self._chat_model or self.config.get_effective_model()
         row: dict[str, Any] = {
             "messages": self._chat_messages,
-            "prompt": self.turn_prompts[0],
             "follow_up_prompts": self.turn_prompts[1:],
-            "thinking": "\n\n".join(thinking_parts) or None,
-            "response": responses[-1] if responses else "",
             "responses": responses,
             "model": model,
             "provider": self.config.api.provider,
@@ -591,6 +615,10 @@ class InteractiveSession:
                 "interactive": True,
             },
         }
+        if len(self.turn_prompts) == 1:
+            row["prompt"] = self.turn_prompts[0]
+            row["thinking"] = "\n\n".join(thinking_parts) or None
+            row["response"] = responses[-1] if responses else ""
         if self.system:
             row["system"] = self.system
         return row
@@ -642,6 +670,7 @@ class SessionManager:
     def create(self, config: Config, *, github_repo: str | None = None, system: str | None = None) -> InteractiveSession:
         session = InteractiveSession(config, github_repo=github_repo, system=system)
         with self._lock:
+            self._prune_locked()
             self._sessions[session.id] = session
         session.start_async()
         return session
@@ -660,6 +689,18 @@ class SessionManager:
 
     def remove(self, session_id: str) -> None:
         with self._lock:
+            self._sessions.pop(session_id, None)
+
+    def _prune_locked(self) -> None:
+        overflow = len(self._sessions) - SESSION_HISTORY_LIMIT + 1
+        if overflow <= 0:
+            return
+        completed = [
+            session_id
+            for session_id, session in self._sessions.items()
+            if session.status in {"finished", "saved", "discarded", "error"}
+        ]
+        for session_id in completed[:overflow]:
             self._sessions.pop(session_id, None)
 
     def shutdown(self) -> None:

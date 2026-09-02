@@ -94,6 +94,10 @@ def _apply_tools_snapshot(rows: list[dict], tools: list[dict[str, Any]]) -> list
         return rows
     updated_rows: list[dict] = []
     for row in rows:
+        row_tools = row.get("tools")
+        if isinstance(row_tools, list) and row_tools:
+            updated_rows.append(row)
+            continue
         updated = dict(row)
         updated["tools"] = tools
         updated_rows.append(updated)
@@ -175,12 +179,16 @@ def load_traces(
     max_examples: int | None = None,
     drop_incomplete_traces: bool = True,
 ) -> Dataset:
-    if max_examples is not None and max_examples < 0:
-        raise ValueError("max_examples must be non-negative.")
+    if max_examples is not None and (
+        not isinstance(max_examples, int) or isinstance(max_examples, bool) or max_examples < 0
+    ):
+        raise ValueError("max_examples must be a non-negative integer.")
     effective_token = _resolve_hf_token(token, hf_token)
     source_path = Path(source)
     if source_path.exists():
         root = source_path
+    elif isinstance(source, Path):
+        raise FileNotFoundError(f"Local trace path not found: {source_path}")
     else:
         root = Path(
             snapshot_download(

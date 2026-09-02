@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from .harness_capture import TEICH_HARNESS_CONTEXT_EVENT_TYPE
 from .tool_schema import (
     CODEX_BUILTIN_TOOLS,
     CURSOR_BUILTIN_TOOLS,
@@ -873,14 +874,56 @@ class TrainingExample:
     messages: list[dict[str, Any]]
     tools: list[dict[str, Any]]
     metadata: dict[str, Any]
+    system: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        row = {
             "prompt": self.prompt,
             "messages": self.messages,
             "tools": self.tools,
             "metadata": self.metadata,
         }
+        if isinstance(self.system, str) and self.system.strip():
+            row["system"] = self.system.strip()
+        category = self.metadata.get("category")
+        if isinstance(category, str) and category.strip():
+            row["category"] = category.strip()
+        return row
+
+
+def _apply_harness_context_capture(
+    example: TrainingExample,
+    events: list[dict[str, Any]],
+) -> TrainingExample:
+    payload: dict[str, Any] | None = None
+    for event in events:
+        if event.get("type") != TEICH_HARNESS_CONTEXT_EVENT_TYPE:
+            continue
+        candidate = event.get("payload")
+        if isinstance(candidate, dict):
+            payload = candidate
+    if payload is None:
+        return example
+    system = payload.get("system")
+    if isinstance(system, str) and system.strip():
+        example.system = system.strip()
+    example.tools = _merge_harness_capture_tools(example.tools, payload.get("tools"))
+    context_metadata = {
+        key: deepcopy(payload[key])
+        for key in (
+            "source",
+            "harness",
+            "harness_version",
+            "wire_api",
+            "model",
+            "captured_at",
+            "context_hash",
+        )
+        if payload.get(key) is not None
+    }
+    context_metadata["tool_count"] = len(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else 0
+    example.metadata["harness_context"] = context_metadata
+    return example
 
 
 def _normalize_timestamp_value(value: Any) -> str | None:
@@ -1506,7 +1549,11 @@ def _merge_schemas(schemas: list[dict[str, Any]]) -> dict[str, Any]:
     if schema_types == {"object"}:
         return _merge_object_schemas(unique)
     if schema_types == {"array"}:
-        item_schemas = [schema.get("items") for schema in unique if isinstance(schema.get("items"), dict)]
+        item_schemas: list[dict[str, Any]] = []
+        for schema in unique:
+            items = schema.get("items")
+            if isinstance(items, dict):
+                item_schemas.append(items)
         merged: dict[str, Any] = {"type": "array"}
         if item_schemas:
             merged["items"] = _merge_schemas(item_schemas)
@@ -1687,6 +1734,41 @@ def _merge_tools_with_builtin_trace_tools(raw_tools: Any, trace_type: Any) -> li
     _add_builtin_tools_for_trace_type(trace_type, explicit_tools, tool_names, tool_schemas)
     _add_explicit_tools(row_tools, explicit_tools, tool_names, tool_schemas)
     return _build_tools_from_snapshots_and_calls(tool_names, tool_schemas, {}, explicit_tools)
+
+
+def _merge_harness_capture_tools(
+    existing_tools: list[dict[str, Any]],
+    captured_tools: Any,
+) -> list[dict[str, Any]]:
+    """Add request-captured tools without replacing trace-native schemas."""
+    merged = deepcopy(existing_tools)
+    named = {
+        name
+        for tool in merged
+        if isinstance(tool, dict) and (name := _tool_entry_name(tool)) is not None
+    }
+    unnamed = {
+        json.dumps(tool, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        for tool in merged
+        if isinstance(tool, dict) and _tool_entry_name(tool) is None
+    }
+    if not isinstance(captured_tools, list):
+        return merged
+    for raw_tool in captured_tools:
+        if not isinstance(raw_tool, dict):
+            continue
+        tool = deepcopy(raw_tool)
+        name = _tool_entry_name(tool)
+        if name is not None:
+            if name not in named:
+                merged.append(tool)
+                named.add(name)
+            continue
+        signature = json.dumps(tool, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        if signature not in unnamed:
+            merged.append(tool)
+            unnamed.add(signature)
+    return merged
 
 
 def _build_tools_from_snapshots_and_calls(
@@ -2246,18 +2328,18 @@ def _claude_context_from_system_event(event: dict[str, Any]) -> str | None:
     if subtype in {None, "local_command", "turn_duration"}:
         return None
     if subtype == "stop_hook_summary":
-        content = _claude_string_list(event.get("hookAdditionalContext"))
-        if content:
-            return "Claude Code stop hook context:\n" + "\n".join(content)
+        hook_context = _claude_string_list(event.get("hookAdditionalContext"))
+        if hook_context:
+            return "Claude Code stop hook context:\n" + "\n".join(hook_context)
         return None
-    content = event.get("content")
-    if not isinstance(content, str) or not content.strip():
+    event_content = event.get("content")
+    if not isinstance(event_content, str) or not event_content.strip():
         return None
     if subtype == "away_summary":
-        return "Claude Code away summary:\n" + content.strip()
+        return "Claude Code away summary:\n" + event_content.strip()
     if subtype == "informational":
-        return "Claude Code notice:\n" + content.strip()
-    return f"Claude Code system event ({subtype}):\n{content.strip()}"
+        return "Claude Code notice:\n" + event_content.strip()
+    return f"Claude Code system event ({subtype}):\n{event_content.strip()}"
 
 
 def _append_claude_system_context(
@@ -2410,9 +2492,9 @@ def _convert_claude_code_trace_to_training_example(
                             tool_names.add(tool_name)
                             tool_schemas.setdefault(tool_name, _claude_deferred_tool_schema(tool_name))
                         elif isinstance(tool, dict):
-                            name = tool.get("name")
-                            if isinstance(name, str) and name.strip():
-                                tool_name = name.strip()
+                            definition_name = tool.get("name")
+                            if isinstance(definition_name, str) and definition_name.strip():
+                                tool_name = definition_name.strip()
                                 tool_names.add(tool_name)
                                 schema = _claude_code_tool_schema_from_definition(tool)
                                 if schema:
@@ -2491,24 +2573,24 @@ def _convert_claude_code_trace_to_training_example(
                     if not isinstance(block, dict) or block.get("type") != "tool_use":
                         continue
                     tool_call_id = block.get("id")
-                    tool_name = block.get("name")
-                    if not isinstance(tool_call_id, str) or not isinstance(tool_name, str):
+                    block_tool_name = block.get("name")
+                    if not isinstance(tool_call_id, str) or not isinstance(block_tool_name, str):
                         continue
-                    if not tool_call_id or not tool_name:
+                    if not tool_call_id or not block_tool_name:
                         continue
                     arguments = _normalize_json_like_value(block.get("input") or {})
-                    tool_names.add(tool_name)
+                    tool_names.add(block_tool_name)
                     tool_schemas.setdefault(
-                        tool_name,
-                        _claude_deferred_tool_schema(tool_name, include_parameters=False),
+                        block_tool_name,
+                        _claude_deferred_tool_schema(block_tool_name, include_parameters=False),
                     )
-                    tool_argument_samples.setdefault(tool_name, []).append(arguments)
+                    tool_argument_samples.setdefault(block_tool_name, []).append(arguments)
                     tool_calls.append(
                         {
                             "id": tool_call_id,
                             "type": "function",
                             "function": {
-                                "name": tool_name,
+                                "name": block_tool_name,
                                 "arguments": arguments,
                             },
                         }
@@ -3026,14 +3108,14 @@ def _hermes_conversation_to_events(conversation: Any) -> list[dict[str, Any]]:
                         },
                     }
                 )
-            event: dict[str, Any] = {"role": "assistant", "content": content}
+            message_event: dict[str, Any] = {"role": "assistant", "content": content}
             if thinking_blocks:
-                event["reasoning_content"] = "\n\n".join(block for block in thinking_blocks if block)
+                message_event["reasoning_content"] = "\n\n".join(block for block in thinking_blocks if block)
             if tool_calls:
-                event["tool_calls"] = tool_calls
+                message_event["tool_calls"] = tool_calls
             if timestamp:
-                event["timestamp"] = timestamp
-            events.append(event)
+                message_event["timestamp"] = timestamp
+            events.append(message_event)
     return events
 
 
@@ -3263,7 +3345,15 @@ def _convert_cursor_trace_to_training_example(
                         continue
                     if not isinstance(tool_call_id, str) or not tool_call_id:
                         tool_call_id = f"{tool_name}_{len(tool_calls) + 1}"
-                    arguments = _normalize_json_like_value(block.get("input") or {})
+                    raw_arguments = block.get("input")
+                    # Cursor tool inputs are already structured. Recursively
+                    # normalizing them would reinterpret legitimate string
+                    # values such as JSON file contents as nested objects.
+                    arguments = (
+                        raw_arguments
+                        if isinstance(raw_arguments, dict)
+                        else _parse_function_arguments(raw_arguments)
+                    )
                     tool_names.add(tool_name)
                     tool_names_by_call_id[tool_call_id] = tool_name
                     tool_argument_samples.setdefault(tool_name, []).append(arguments)
@@ -3500,15 +3590,15 @@ def _convert_codex_trace_to_training_example(
                 else:
                     assistant_message["tool_calls"] = [tool_call]
             else:
-                assistant_message: dict[str, Any] = {
+                new_assistant_message: dict[str, Any] = {
                     "role": "assistant",
                     "content": "",
                     "tool_calls": [tool_call],
                 }
                 if pending_reasoning_parts:
-                    assistant_message["reasoning_content"] = "\n\n".join(pending_reasoning_parts)
+                    new_assistant_message["reasoning_content"] = "\n\n".join(pending_reasoning_parts)
                     pending_reasoning_parts = []
-                messages.append(assistant_message)
+                messages.append(new_assistant_message)
             continue
 
         if payload_type == "function_call_output":
@@ -3789,8 +3879,50 @@ def _is_hermes_export_session(value: Any) -> bool:
     )
 
 
+def _is_chat_completion_training_row(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return isinstance(value.get("prompt"), str) and (
+        isinstance(value.get("response"), str)
+        or isinstance(value.get("thinking"), str)
+    )
+
+
 def _is_structured_training_row(value: Any) -> bool:
-    return isinstance(value, dict) and isinstance(value.get("messages"), list) and not _is_hermes_export_session(value)
+    return (
+        isinstance(value, dict)
+        and not _is_hermes_export_session(value)
+        and (
+            isinstance(value.get("messages"), list)
+            or _is_chat_completion_training_row(value)
+        )
+    )
+
+
+_STRUCTURED_ROW_METADATA_KEYS = (
+    "id",
+    "schema_version",
+    "provider",
+    "source_system",
+    "effort",
+    "reasoning_capture",
+    "auth",
+    "completed_at",
+    "duration_ms",
+    "stop_reason",
+    "request_id",
+    "message_id",
+    "reported_cost_usd",
+    "authorship",
+    "family",
+    "category",
+    "domain",
+    "capability",
+    "subcategory",
+    "mode",
+    "difficulty",
+    "source",
+)
 
 
 def _normalize_training_message(message: Any) -> dict[str, Any] | None:
@@ -3856,6 +3988,8 @@ def _structured_training_example_from_row(
     row: dict[str, Any],
     row_index: int,
 ) -> TrainingExample:
+    raw_system = row.get("system")
+    system = raw_system.strip() if isinstance(raw_system, str) and raw_system.strip() else None
     raw_messages = row.get("messages")
     first_message_timestamp = _first_message_timestamp_from_events(
         raw_messages if isinstance(raw_messages, list) else [],
@@ -3863,9 +3997,8 @@ def _structured_training_example_from_row(
     )
     messages = normalize_training_messages(raw_messages)
     if not messages:
-        system = row.get("system")
-        if isinstance(system, str) and system.strip():
-            messages.append({"role": "system", "content": system.strip()})
+        if system:
+            messages.append({"role": "system", "content": system})
         prompt = row.get("prompt")
         if isinstance(prompt, str) and prompt.strip():
             messages.append({"role": "user", "content": prompt.strip()})
@@ -3877,19 +4010,28 @@ def _structured_training_example_from_row(
         if assistant_message["content"] or "reasoning_content" in assistant_message:
             messages.append(assistant_message)
     raw_tools = row.get("tools") if isinstance(row.get("tools"), list) else []
-    prompt = row.get("prompt") if isinstance(row.get("prompt"), str) else _prompt_from_messages(messages)
-    metadata = dict(row.get("metadata")) if isinstance(row.get("metadata"), dict) else {}
+    raw_prompt = row.get("prompt")
+    prompt = raw_prompt if isinstance(raw_prompt, str) else _prompt_from_messages(messages)
+    raw_metadata = row.get("metadata")
+    metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
     if isinstance(row.get("model"), str) and row.get("model"):
         metadata.setdefault("model", row["model"])
+    if isinstance(row.get("provider"), str) and row.get("provider"):
+        metadata.setdefault("model_provider", row["provider"])
     if isinstance(row.get("usage"), dict) and row.get("usage"):
         metadata.setdefault("usage", row["usage"])
+    for key in _STRUCTURED_ROW_METADATA_KEYS:
+        if key in row and row[key] is not None:
+            metadata.setdefault(key, row[key])
     metadata.setdefault("source_file", source_file.name)
     metadata.setdefault("source_line", row_index)
     metadata.setdefault(
         "trace_type",
         "chat" if any(key in row for key in ("system", "thinking", "response", "model")) and not raw_tools else "structured",
     )
-    tools = _merge_tools_with_builtin_trace_tools(raw_tools, metadata.get("trace_type"))
+    raw_trace_type = metadata.get("trace_type")
+    trace_type = raw_trace_type if isinstance(raw_trace_type, str) else None
+    tools = _merge_tools_with_builtin_trace_tools(raw_tools, trace_type)
     if first_message_timestamp:
         metadata.setdefault(FIRST_MESSAGE_TIMESTAMP_METADATA_KEY, first_message_timestamp)
     return TrainingExample(
@@ -3898,6 +4040,7 @@ def _structured_training_example_from_row(
         messages=messages,
         tools=tools,
         metadata=metadata,
+        system=system,
     )
 
 
@@ -3911,20 +4054,22 @@ def convert_trace_to_training_example(trace_file: Path) -> TrainingExample:
         return _structured_training_example_from_row(trace_file, events[0], 1)
     trace_type = _detect_trace_type(events)
     if trace_type == "claude_code":
-        return _convert_claude_code_trace_to_training_example(trace_file, events)
-    if trace_type == "droid":
-        return _convert_droid_trace_to_training_example(trace_file, events)
-    if trace_type == "hermes":
-        return _convert_hermes_trace_to_training_example(trace_file, events)
-    if trace_type == "cursor":
-        return _convert_cursor_trace_to_training_example(trace_file, events)
-    if trace_type == "external_agent":
-        return _convert_external_agent_trace_to_training_example(trace_file, events)
-    if trace_type == "openclaw":
-        return _convert_pi_trace_to_training_example(trace_file, events, trace_type="openclaw")
-    if trace_type == "pi":
-        return _convert_pi_trace_to_training_example(trace_file, events)
-    return _convert_codex_trace_to_training_example(trace_file, events)
+        example = _convert_claude_code_trace_to_training_example(trace_file, events)
+    elif trace_type == "droid":
+        example = _convert_droid_trace_to_training_example(trace_file, events)
+    elif trace_type == "hermes":
+        example = _convert_hermes_trace_to_training_example(trace_file, events)
+    elif trace_type == "cursor":
+        example = _convert_cursor_trace_to_training_example(trace_file, events)
+    elif trace_type == "external_agent":
+        example = _convert_external_agent_trace_to_training_example(trace_file, events)
+    elif trace_type == "openclaw":
+        example = _convert_pi_trace_to_training_example(trace_file, events, trace_type="openclaw")
+    elif trace_type == "pi":
+        example = _convert_pi_trace_to_training_example(trace_file, events)
+    else:
+        example = _convert_codex_trace_to_training_example(trace_file, events)
+    return _apply_harness_context_capture(example, events)
 
 
 def _jsonl_files(source: Path) -> list[Path]:
@@ -3948,7 +4093,8 @@ def _convert_jsonl_file_to_training_rows(jsonl_file: Path, *, skip_invalid_lines
         ]
     trace_type = _detect_trace_type(rows)
     if trace_type == "claude_code":
-        return [_convert_claude_code_trace_to_training_example(jsonl_file, rows).to_dict()]
+        example = _convert_claude_code_trace_to_training_example(jsonl_file, rows)
+        return [_apply_harness_context_capture(example, rows).to_dict()]
     if trace_type == "droid":
         return [_convert_droid_trace_to_training_example(jsonl_file, rows).to_dict()]
     if trace_type == "hermes":
@@ -3971,7 +4117,8 @@ def _convert_jsonl_file_to_training_rows(jsonl_file: Path, *, skip_invalid_lines
         return [_convert_pi_trace_to_training_example(jsonl_file, rows, trace_type="openclaw").to_dict()]
     if trace_type == "pi":
         return [_convert_pi_trace_to_training_example(jsonl_file, rows).to_dict()]
-    return [_convert_codex_trace_to_training_example(jsonl_file, rows).to_dict()]
+    example = _convert_codex_trace_to_training_example(jsonl_file, rows)
+    return [_apply_harness_context_capture(example, rows).to_dict()]
 
 
 def convert_traces_to_training_data(traces_dir: Path | str, *, skip_invalid_lines: bool = False) -> list[dict[str, Any]]:

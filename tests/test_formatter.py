@@ -11,6 +11,7 @@ from teich import load_traces, mask_data, prepare_data, preview_sft_example, row
 from teich.converter import convert_trace_to_training_example
 from teich.formatter import (
     PrepareReport,
+    _expand_typed_spans,
     _labels_from_offsets,
     _reconcile_marker_boundary_whitespace,
     _strip_markers_and_collect_spans,
@@ -25,7 +26,10 @@ def prepare_and_mask_for_test(
     messages_column="messages",
     tools_column="tools",
     chat_template_kwargs=None,
+    reasoning_policy="keep",
     train_on_reasoning=True,
+    train_on_final_answers=True,
+    train_on_tools=True,
     max_length=None,
     include_debug_columns=False,
     drop_oversized_examples=True,
@@ -38,6 +42,7 @@ def prepare_and_mask_for_test(
         messages_column=messages_column,
         tools_column=tools_column,
         chat_template_kwargs=chat_template_kwargs,
+        reasoning_policy=reasoning_policy,
         train_on_reasoning=train_on_reasoning,
         max_length=max_length,
         drop_oversized_examples=drop_oversized_examples,
@@ -50,7 +55,15 @@ def prepare_and_mask_for_test(
         args=SimpleNamespace(dataset_text_field="text", max_length=max_length if drop_oversized_examples else None, packing=False),
         tokenizer=tokenizer,
     )
-    trainer = mask_data(trainer, tokenizer=tokenizer, train_on_reasoning=train_on_reasoning, audit=False, verbose=False)
+    trainer = mask_data(
+        trainer,
+        tokenizer=tokenizer,
+        train_on_reasoning=train_on_reasoning,
+        train_on_final_answers=train_on_final_answers,
+        train_on_tools=train_on_tools,
+        audit=False,
+        verbose=False,
+    )
     training_data = trainer.train_dataset
     if include_debug_columns:
         rows = []
@@ -188,6 +201,56 @@ class OffsetCountingTokenizer(CountingTokenizer):
         output = super().__call__(text, add_special_tokens=add_special_tokens, return_attention_mask=return_attention_mask)
         if return_offsets_mapping:
             output["offset_mapping"] = [(index, index + 1) for index in range(len(text))]
+        return output
+
+
+class BatchOffsetCountingTokenizer(OffsetCountingTokenizer):
+    def __init__(self):
+        super().__init__()
+        self.batch_tokenize_count = 0
+
+    def __call__(self, text, add_special_tokens=False, return_attention_mask=True, return_offsets_mapping=False):
+        if not isinstance(text, list):
+            return super().__call__(
+                text,
+                add_special_tokens=add_special_tokens,
+                return_attention_mask=return_attention_mask,
+                return_offsets_mapping=return_offsets_mapping,
+            )
+        self.batch_tokenize_count += 1
+        rows = [
+            OffsetCountingTokenizer.__call__(
+                self,
+                item,
+                add_special_tokens=add_special_tokens,
+                return_attention_mask=return_attention_mask,
+                return_offsets_mapping=return_offsets_mapping,
+            )
+            for item in text
+        ]
+        output = {"input_ids": [row["input_ids"] for row in rows]}
+        if return_attention_mask:
+            output["attention_mask"] = [row["attention_mask"] for row in rows]
+        if return_offsets_mapping:
+            output["offset_mapping"] = [row["offset_mapping"] for row in rows]
+        return output
+
+
+class PaddedBatchOffsetTokenizer(BatchOffsetCountingTokenizer):
+    def __call__(self, text, add_special_tokens=False, return_attention_mask=True, return_offsets_mapping=False):
+        output = super().__call__(
+            text,
+            add_special_tokens=add_special_tokens,
+            return_attention_mask=return_attention_mask,
+            return_offsets_mapping=return_offsets_mapping,
+        )
+        if isinstance(text, list):
+            for index in range(len(text)):
+                output["input_ids"][index].append(0)
+                if return_attention_mask:
+                    output["attention_mask"][index].append(0)
+                if return_offsets_mapping:
+                    output["offset_mapping"][index].append((0, 0))
         return output
 
 
@@ -335,6 +398,7 @@ class GemmaLikeOffsetTokenizer(OffsetCountingTokenizer):
         add_generation_prompt=False,
         tools=None,
         enable_thinking=True,
+        preserve_thinking=False,
         **kwargs,
     ):
         self.render_count += 1
@@ -386,6 +450,296 @@ class GemmaLikeOffsetTokenizer(OffsetCountingTokenizer):
         if tokenize:
             return self(rendered)
         return rendered
+
+
+def test_gemma4_rejects_reasoning_when_thinking_is_disabled():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer", "reasoning_content": "reason"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="Gemma 4 thinking is disabled"):
+        prepare_data(
+            dataset,
+            tokenizer,
+            chat_template_kwargs={"enable_thinking": False},
+            strict=True,
+            verbose=False,
+        )
+
+
+@pytest.mark.parametrize("enable_thinking", [None, True])
+def test_gemma4_normalizes_leading_legacy_think_trigger(enable_thinking: bool | None):
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-E4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "system", "content": "<|think|>"},
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    template_kwargs = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
+    prepared, report = prepare_data(
+        dataset,
+        tokenizer,
+        chat_template_kwargs=template_kwargs,
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+
+    assert prepared.num_rows == 1
+    assert "<|think|>" not in prepared[0]["text"]
+    assert report.gemma4_modes == {"thinking": 1}
+    assert report.gemma4_legacy_triggers_normalized == 1
+
+
+def test_gemma4_rejects_legacy_trigger_when_explicitly_disabled():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-E4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "system", "content": "<|think|>"},
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="enable_thinking=False conflicts"):
+        prepare_data(
+            dataset,
+            tokenizer,
+            chat_template_kwargs={"enable_thinking": False},
+            strict=True,
+            verbose=False,
+        )
+
+
+def test_gemma4_auto_mode_handles_mixed_thinking_and_direct_rows():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "reason"},
+                    {"role": "assistant", "content": "answer", "reasoning_content": "analysis"},
+                ],
+                "tools": [],
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "direct"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                "tools": [],
+            },
+        ]
+    )
+
+    prepared, report = prepare_data(
+        dataset,
+        tokenizer,
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+
+    assert "<|channel>thought\nanalysis\n<channel|>" in prepared[0]["text"]
+    assert "<|channel>thought\n<channel|>answer" in prepared[1]["text"]
+    assert report.gemma4_modes == {"thinking": 1, "nonthinking": 1}
+
+    training_data = prepare_and_mask_for_test(dataset, tokenizer, strict=True)
+    thinking_target = tokenizer.decode(
+        [token for token in training_data[0]["labels"] if token != -100]
+    )
+    direct_target = tokenizer.decode(
+        [token for token in training_data[1]["labels"] if token != -100]
+    )
+    assert "analysis" in thinking_target
+    assert thinking_target.endswith("<turn|>")
+    assert "<|channel>thought" not in direct_target
+    assert "answer" in direct_target
+    assert direct_target.endswith("<turn|>")
+
+
+def test_reasoning_policy_strip_makes_reasoning_dataset_direct_for_gemma4():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer", "reasoning_content": "private analysis"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared, report = prepare_data(
+        dataset,
+        tokenizer,
+        reasoning_policy="strip",
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+
+    assert "private analysis" not in prepared[0]["text"]
+    assert "<|channel>thought\n<channel|>answer<turn|>" in prepared[0]["text"]
+    assert report.gemma4_modes == {"nonthinking": 1}
+    assert report.reasoning_stripped_rows == 1
+    assert report.reasoning_stripped_messages == 1
+
+    training_data = prepare_and_mask_for_test(
+        dataset,
+        tokenizer,
+        reasoning_policy="strip",
+        strict=True,
+    )
+    supervised_text = tokenizer.decode(
+        [token for token in training_data[0]["labels"] if token != -100]
+    )
+    assert "private analysis" not in supervised_text
+    assert supervised_text == "answer<turn|>"
+
+
+def test_prepare_data_rejects_unknown_reasoning_policy():
+    with pytest.raises(ValueError, match="reasoning_policy must be one of"):
+        prepare_data(
+            Dataset.from_list(
+                [
+                    {
+                        "messages": [
+                            {"role": "user", "content": "question"},
+                            {"role": "assistant", "content": "answer"},
+                        ],
+                        "tools": [],
+                    }
+                ]
+            ),
+            GemmaLikeOffsetTokenizer(),
+            reasoning_policy="guess",
+            verbose=False,
+        )
+
+
+def test_gemma4_auto_mode_preserves_historical_reasoning():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-31B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "one", "reasoning_content": "reason one"},
+                    {"role": "user", "content": "second"},
+                    {"role": "assistant", "content": "two", "reasoning_content": "reason two"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared, report = prepare_data(
+        dataset,
+        tokenizer,
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+
+    assert "reason one" in prepared[0]["text"]
+    assert "reason two" in prepared[0]["text"]
+    assert report.gemma4_modes == {"thinking": 1}
+
+
+def test_gemma4_rejects_dropped_historical_reasoning():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-31B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "one", "reasoning_content": "reason one"},
+                    {"role": "user", "content": "second"},
+                    {"role": "assistant", "content": "two", "reasoning_content": "reason two"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="preserve_thinking=False"):
+        prepare_data(
+            dataset,
+            tokenizer,
+            chat_template_kwargs={"enable_thinking": True, "preserve_thinking": False},
+            strict=True,
+            verbose=False,
+        )
+
+
+def test_gemma4_nonthinking_training_matches_empty_thought_generation_prefix():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared = prepare_data(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"enable_thinking": False},
+        strict=True,
+        verbose=False,
+    )
+
+    assert "<|turn>model\n<|channel>thought\n<channel|>answer<turn|>" in prepared[0]["text"]
+    training_data = prepare_and_mask_for_test(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"enable_thinking": False},
+        strict=True,
+    )
+    supervised_text = tokenizer.decode(
+        [token for token in training_data[0]["labels"] if token != -100]
+    )
+    assert "<|channel>thought" not in supervised_text
+    assert "answer" in supervised_text
+    assert supervised_text.endswith("<turn|>")
 
 
 def test_reordered_mapping_markers_preserve_typed_tool_spans():
@@ -1050,11 +1404,255 @@ def test_prepare_and_mask_can_exclude_reasoning_from_gemma_style_supervision():
     row = training_data[0]
     assert row["text"] == "<bos><|turn>user\nhello<turn|>\n<|turn>model\n<|channel>thought\nthink\n<channel|>world<turn|>\n"
     supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
-    assert supervised_text == "world"
+    assert supervised_text == "world<turn|>"
     masked_text = tokenizer.decode(
         [token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100]
     )
     assert "<|channel>thought\nthink\n<channel|>" in masked_text
+    assert "<turn|>" not in masked_text.rsplit("<|turn>model\n", 1)[-1]
+
+
+def test_gemma_turn_end_remains_supervised_when_only_reasoning_is_enabled():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "world", "reasoning_content": "think"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    training_data = prepare_and_mask_for_test(
+        dataset,
+        tokenizer,
+        train_on_reasoning=True,
+        train_on_final_answers=False,
+    )
+
+    row = training_data[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    assert "think" in supervised_text
+    assert "world" not in supervised_text
+    assert supervised_text.endswith("<turn|>")
+
+
+def test_gemma4_literal_model_header_in_user_content_is_not_a_turn_boundary():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    user_content = "Discuss this literal protocol text:\n<|turn>model\nnot an assistant response."
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": "actual answer"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared = prepare_data(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"enable_thinking": False},
+        strict=True,
+        verbose=False,
+    )
+
+    empty_thought = "<|channel>thought\n<channel|>"
+    assert prepared[0]["text"].count(empty_thought) == 1
+    assert f"{user_content}<turn|>" in prepared[0]["text"]
+    assert f"<|turn>model\n{empty_thought}actual answer<turn|>" in prepared[0]["text"]
+
+    training_data = prepare_and_mask_for_test(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"enable_thinking": False},
+        strict=True,
+    )
+    supervised_text = tokenizer.decode(
+        [token for token in training_data[0]["labels"] if token != -100]
+    )
+    assert "not an assistant response" not in supervised_text
+    assert supervised_text == "actual answer<turn|>"
+
+
+def test_gemma_turn_end_remains_supervised_when_only_tool_call_is_enabled():
+    class ToolTurnClosingGemmaTokenizer(GemmaLikeOffsetTokenizer):
+        def apply_chat_template(self, *args, **kwargs):
+            rendered = super().apply_chat_template(*args, **kwargs)
+            if isinstance(rendered, str):
+                rendered = rendered.replace("<tool_call|>", "<tool_call|><turn|>\n")
+            return rendered
+
+    tokenizer = ToolTurnClosingGemmaTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "list files"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": {"command": "ls"}},
+                            }
+                        ],
+                    },
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "bash", "parameters": {"type": "object"}},
+                    }
+                ],
+            }
+        ]
+    )
+
+    training_data = prepare_and_mask_for_test(
+        dataset,
+        tokenizer,
+        train_on_reasoning=False,
+        train_on_final_answers=False,
+        train_on_tools=True,
+    )
+
+    row = training_data[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    assert "<|tool_call>call:bash" in supervised_text
+    assert "ls" in supervised_text
+    assert supervised_text.endswith("<turn|>")
+
+
+def test_gemma_empty_final_message_does_not_create_a_degenerate_final_answer_span():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "list files"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "inspect first",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": {"command": "ls"}},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "name": "bash", "content": "SECRET"},
+                    {"role": "assistant", "content": ""},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    prepared = prepare_data(dataset, tokenizer, tokenize=True, strict=True, verbose=False)
+    spans = prepared[0]["teich_supervised_spans"]
+    assert not any(span.get("kind") == "final_answer" for span in spans)
+
+    trainer = SimpleNamespace(
+        train_dataset=prepared,
+        eval_dataset=None,
+        args=SimpleNamespace(dataset_text_field="text", max_length=None, packing=False),
+        tokenizer=tokenizer,
+    )
+    trainer = mask_data(
+        trainer,
+        tokenizer=tokenizer,
+        train_on_reasoning=True,
+        train_on_final_answers=True,
+        train_on_tools=True,
+        audit=True,
+        verbose=False,
+    )
+    row = trainer.train_dataset[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+    assert "inspect first" in supervised_text
+    assert '<|tool_call>call:bash{command:"ls"}<tool_call|>' in supervised_text
+    assert "SECRET" not in supervised_text
+    assert supervised_text.endswith("<turn|>")
+    assert supervised_text.count("<turn|>") == 1
+
+
+def test_gemma_tool_only_mask_does_not_cross_two_tool_response_boundaries():
+    tokenizer = GemmaLikeOffsetTokenizer()
+    tokenizer.name_or_path = "google/gemma-4-26B-A4B-it"
+    messages = [{"role": "user", "content": "inspect twice"}]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+            },
+        }
+    ]
+    for index, command in enumerate(("ls", "pwd"), start=1):
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": f"narration {index}",
+                    "tool_calls": [
+                        {
+                            "id": f"call_{index}",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": {"command": command}},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{index}",
+                    "name": "bash",
+                    "content": f"SECRET_RESPONSE_{index}",
+                },
+            ]
+        )
+    messages.append({"role": "assistant", "content": "final text"})
+
+    training_data = prepare_and_mask_for_test(
+        Dataset.from_list([{"messages": messages, "tools": tools}]),
+        tokenizer,
+        train_on_reasoning=False,
+        train_on_final_answers=False,
+        train_on_tools=True,
+        strict=True,
+    )
+    row = training_data[0]
+    supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
+
+    assert 'call:bash{command:"ls"}' in supervised_text
+    assert 'call:bash{command:"pwd"}' in supervised_text
+    assert "narration 1" not in supervised_text
+    assert "narration 2" not in supervised_text
+    assert "final text" not in supervised_text
+    assert "SECRET_RESPONSE_1" not in supervised_text
+    assert "SECRET_RESPONSE_2" not in supervised_text
+    assert supervised_text.count("<turn|>") == 1
 
 
 def test_prepare_and_mask_falls_back_when_gemma_drops_marker_boundaries_with_thinking_disabled():
@@ -1088,7 +1686,7 @@ def test_prepare_and_mask_falls_back_when_gemma_drops_marker_boundaries_with_thi
 
     row = training_data[0]
     supervised_text = tokenizer.decode([token for token in row["labels"] if token != -100])
-    assert supervised_text == "world"
+    assert supervised_text == "world<turn|>"
 
 
 def test_prepare_data_rejects_reserved_chat_template_kwargs():
@@ -1617,6 +2215,96 @@ def test_prepare_data_trims_oversized_followups_before_dropping():
     assert "follow up" not in prepared[0]["text"]
     assert "later" not in prepared[0]["text"]
     assert len(prepared[0]["input_ids"]) <= 60
+
+
+def test_prepare_data_finds_longest_fitting_followup_prefix_without_linear_rerenders():
+    tokenizer = LengthFilteringTokenizer()
+    messages = []
+    for index in range(64):
+        messages.extend(
+            [
+                {"role": "user", "content": f"question-{index}-" + ("x" * 20)},
+                {"role": "assistant", "content": f"answer-{index}-" + ("y" * 20)},
+            ]
+        )
+    dataset = Dataset.from_list([{"messages": messages, "tools": []}])
+
+    prepared = prepare_data(
+        dataset,
+        tokenizer,
+        max_length=180,
+        oversized_policy="trim_followups",
+        tokenize=True,
+        verbose=False,
+    )
+
+    assert prepared.num_rows == 1
+    assert len(prepared[0]["input_ids"]) <= 180
+    assert "question-0-" in prepared[0]["text"]
+    assert "question-63-" not in prepared[0]["text"]
+    # Initial render + O(log(turns)) candidate renders. The old loop rendered
+    # all 63 prefixes and took quadratic time as conversations grew.
+    assert tokenizer.render_count < 30
+
+
+def test_mask_data_batches_offset_tokenization_across_rows():
+    tokenizer = BatchOffsetCountingTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": f"question {index}"},
+                    {"role": "assistant", "content": f"answer {index}", "reasoning_content": "reason"},
+                ],
+                "tools": [],
+            }
+            for index in range(4)
+        ]
+    )
+    prepared = prepare_data(dataset, tokenizer, tokenize=True, verbose=False)
+    trainer = SimpleNamespace(
+        train_dataset=prepared,
+        eval_dataset=None,
+        args=SimpleNamespace(dataset_text_field="text", max_length=None, packing=False),
+        tokenizer=tokenizer,
+    )
+
+    trainer = mask_data(trainer, tokenizer=tokenizer, audit=False, verbose=False)
+
+    assert trainer.train_dataset.num_rows == 4
+    assert tokenizer.batch_tokenize_count == 1
+
+
+def test_mask_data_falls_back_when_batch_offset_tokenization_adds_padding():
+    tokenizer = PaddedBatchOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": f"question {index}"},
+                    {"role": "assistant", "content": f"answer {index}", "reasoning_content": "reason"},
+                ],
+                "tools": [],
+            }
+            for index in range(2)
+        ]
+    )
+    prepared = prepare_data(dataset, tokenizer, tokenize=True, verbose=False)
+    trainer = SimpleNamespace(
+        train_dataset=prepared,
+        eval_dataset=None,
+        args=SimpleNamespace(dataset_text_field="text", max_length=None, packing=False),
+        tokenizer=tokenizer,
+    )
+
+    trainer = mask_data(trainer, tokenizer=tokenizer, audit=False, verbose=False)
+
+    assert trainer.train_dataset.num_rows == 2
+    assert tokenizer.batch_tokenize_count == 1
+    assert all(
+        len(row["input_ids"]) == len(row["labels"])
+        for row in trainer.train_dataset
+    )
 
 
 def test_prepare_data_only_trims_rows_with_multiple_user_turns():
@@ -2638,6 +3326,82 @@ class GraniteLikeOffsetTokenizer(OffsetCountingTokenizer):
         return rendered
 
 
+class Granite42LikeOffsetTokenizer(OffsetCountingTokenizer):
+    name_or_path = "ibm-granite/granite-4.2-3b"
+    chat_template = (
+        "{% set truncate_history_thinking = truncate_history_thinking | default(true) %}"
+        "<|im_start|>assistant\\n<think><|im_end|>"
+    )
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize=False,
+        add_generation_prompt=False,
+        tools=None,
+        enable_thinking=True,
+        low_effort=False,
+        reasoning_effort=None,
+        truncate_history_thinking=True,
+        **kwargs,
+    ):
+        self.render_count += 1
+        if kwargs:
+            raise AssertionError(f"Unexpected chat template kwargs: {kwargs}")
+        parts = ["<|im_start|>system\n"]
+        if tools:
+            parts.append("<tools>bash</tools>")
+        parts.append("<|im_end|>\n")
+        last_user_index = max(
+            (index for index, message in enumerate(messages) if message["role"] == "user"),
+            default=-1,
+        )
+        for index, message in enumerate(messages):
+            role = message["role"]
+            if role == "system":
+                continue
+            if role == "user":
+                content = str(message.get("content") or "")
+                if index == last_user_index and low_effort:
+                    content += "\n\n{reasoning effort: low}"
+                parts.append(f"<|im_start|>user\n{content}<|im_end|>\n")
+                continue
+            if role == "assistant":
+                content = str(message.get("content") or "")
+                reasoning = str(message.get("reasoning_content") or "")
+                if truncate_history_thinking and index < last_user_index:
+                    reasoning = ""
+                parts.append("<|im_start|>assistant\n")
+                if reasoning:
+                    parts.append(f"<think>\n{reasoning}\n</think>\n")
+                else:
+                    parts.append("<think></think>")
+                for tool_call in message.get("tool_calls") or []:
+                    function = tool_call["function"]
+                    parts.append(
+                        f"<tool_call>\n<function={function['name']}>\n"
+                        "</function>\n</tool_call>\n"
+                    )
+                parts.append(f"{content}<|im_end|>\n")
+                continue
+            if role == "tool":
+                parts.append(
+                    "<|im_start|>user\n<tool_response>\n"
+                    f"{message.get('content', '')}\n"
+                    "</tool_response>\n<|im_end|>\n"
+                )
+                continue
+            raise AssertionError(f"Unexpected role: {role}")
+        if add_generation_prompt:
+            parts.append("<|im_start|>assistant\n")
+            parts.append("<think>\n" if enable_thinking else "<think></think>")
+        rendered = "".join(parts)
+        if tokenize:
+            return self(rendered)
+        return rendered
+
+
 class QwenMismatchOffsetTokenizer(QwenLikeOffsetTokenizer):
     def apply_chat_template(self, messages, *, add_generation_prompt=False, enable_thinking=True, **kwargs):
         rendered = super().apply_chat_template(
@@ -2692,6 +3456,178 @@ def test_prepare_and_mask_expands_granite_style_assistant_blocks():
         [token_id for token_id, label in zip(row["input_ids"], row["labels"]) if label == -100]
     )
     assert "List files" in masked_text
+
+
+def test_granite42_auto_selects_thinking_mode_and_preserves_reasoning_history():
+    tokenizer = Granite42LikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "one", "reasoning_content": "reason one"},
+                    {"role": "user", "content": "second"},
+                    {"role": "assistant", "content": "two", "reasoning_content": "reason two"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared, report = prepare_data(
+        dataset,
+        tokenizer,
+        tokenize=True,
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+
+    assert "reason one" in prepared[0]["text"]
+    assert "reason two" in prepared[0]["text"]
+    assert report.granite42_modes == {"thinking": 1}
+    training_data = prepare_and_mask_for_test(dataset, tokenizer)
+    supervised_text = tokenizer.decode([token for token in training_data[0]["labels"] if token != -100])
+    assert "reason one" in supervised_text
+    assert "reason two" in supervised_text
+    assert supervised_text.count("<|im_end|>") == 2
+
+
+def test_granite42_auto_selects_nonthinking_mode_and_masks_empty_thought_prefix():
+    tokenizer = Granite42LikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "answer directly"},
+                    {"role": "assistant", "content": "direct answer"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared = prepare_data(dataset, tokenizer, tokenize=True, strict=True, verbose=False)
+    assert "<|im_start|>assistant\n<think></think>direct answer<|im_end|>" in prepared[0]["text"]
+    training_data = prepare_and_mask_for_test(dataset, tokenizer)
+    supervised_text = tokenizer.decode([token for token in training_data[0]["labels"] if token != -100])
+    assert supervised_text == "direct answer<|im_end|>\n"
+
+
+def test_granite42_rejects_reasoning_with_nonthinking_mode():
+    tokenizer = Granite42LikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer", "reasoning_content": "reason"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="Granite 4.2 thinking is disabled"):
+        prepare_data(
+            dataset,
+            tokenizer,
+            chat_template_kwargs={"enable_thinking": False},
+            strict=True,
+            verbose=False,
+        )
+
+
+def test_granite42_reasoning_policy_strip_creates_direct_training_text():
+    tokenizer = Granite42LikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer", "reasoning_content": "private reason"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared = prepare_data(
+        dataset,
+        tokenizer,
+        reasoning_policy="strip",
+        tokenize=True,
+        strict=True,
+        verbose=False,
+    )
+    assert "private reason" not in prepared[0]["text"]
+    assert "<|im_start|>assistant\n<think></think>answer<|im_end|>" in prepared[0]["text"]
+
+
+def test_granite42_forwards_reasoning_effort_low_as_canonical_low_effort():
+    tokenizer = Granite42LikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer", "reasoning_content": "reason"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    prepared, report = prepare_data(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"reasoning_effort": "low"},
+        tokenize=True,
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+
+    assert "question\n\n{reasoning effort: low}<|im_end|>" in prepared[0]["text"]
+    assert report.granite42_modes == {"low_effort": 1}
+
+    full_effort, full_report = prepare_data(
+        dataset,
+        tokenizer,
+        chat_template_kwargs={"low_effort": True, "reasoning_effort": "medium"},
+        tokenize=True,
+        strict=True,
+        return_report=True,
+        verbose=False,
+    )
+    assert "{reasoning effort: low}" not in full_effort[0]["text"]
+    assert full_report.granite42_modes == {"thinking": 1}
+
+
+def test_granite42_rejects_history_truncation_that_would_drop_training_reasoning():
+    tokenizer = Granite42LikeOffsetTokenizer()
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "one", "reasoning_content": "reason one"},
+                    {"role": "user", "content": "second"},
+                    {"role": "assistant", "content": "two", "reasoning_content": "reason two"},
+                ],
+                "tools": [],
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="truncate_history_thinking=True would remove reasoning"):
+        prepare_data(
+            dataset,
+            tokenizer,
+            chat_template_kwargs={"truncate_history_thinking": True},
+            strict=True,
+            verbose=False,
+        )
 
 
 def test_prepare_and_mask_falls_back_to_assistant_header_when_qwen_prefix_probe_mismatches():
@@ -3551,6 +4487,60 @@ def test_new_gemma4_template_strict_markers_tolerate_trimmed_embedded_thinking()
     assert "gh issue view 1123 --json title,body" in supervised_text
 
 
+def test_new_gemma4_unresolved_tool_call_does_not_label_tool_response_prefix_as_answer():
+    jinja2 = pytest.importorskip("jinja2")
+    template_path = Path("new_gemma_4_template.jinja")
+    if not template_path.exists():
+        pytest.skip(f"{template_path} is not available")
+
+    tokenizer = RealJinjaChatTemplateTokenizer(template_path, jinja2)
+    answer = "A" * 92
+    tools = _real_template_tool_call_dataset()[0]["tools"]
+
+    def row(content: str) -> dict[str, object]:
+        return {
+            "messages": [
+                {"role": "user", "content": "Inspect the repository."},
+                {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": {"command": "ls"}},
+                        }
+                    ],
+                },
+            ],
+            "tools": tools,
+        }
+
+    prepared = prepare_data(
+        Dataset.from_list([row(""), row(answer)]),
+        tokenizer,
+        tokenize=True,
+        strict=True,
+        verbose=False,
+    )
+
+    assert prepared[0]["text"].endswith("<|tool_response>")
+    assert not any(
+        span.get("kind") == "final_answer"
+        for span in prepared[0]["teich_supervised_spans"]
+    )
+
+    final_spans = [
+        span
+        for span in prepared[1]["teich_supervised_spans"]
+        if span.get("kind") == "final_answer"
+    ]
+    assert len(final_spans) == 1
+    assert prepared[1]["text"][final_spans[0]["start"] : final_spans[0]["end"]] == answer
+    assert prepared[1]["text"][final_spans[0]["end"] :].startswith("<|tool_call>")
+    assert prepared[1]["text"].endswith("<|tool_response>")
+
+
 def test_marker_boundary_whitespace_reconciliation_handles_insertions_and_deletions():
     spans = [{"start": 5, "end": 12, "kind": "final_answer", "role": "assistant"}]
     deleted = _reconcile_marker_boundary_whitespace("start\n\nanswer", spans, "startanswer")
@@ -3595,6 +4585,103 @@ def test_strip_markers_collects_json_escaped_marker_variants():
             "role": "assistant",
         }
     ]
+
+
+def test_strip_markers_scales_to_thousands_of_raw_and_escaped_markers():
+    marker_count = 4_000
+    markers = [
+        {
+            "start_marker": f"\ue000AGD{index}S\ue001",
+            "end_marker": f"\ue000AGD{index}E\ue001",
+            "kind": "final_answer",
+            "role": "assistant",
+        }
+        for index in range(marker_count)
+    ]
+    marked_parts: list[str] = []
+    expected_parts: list[str] = []
+    expected_spans: list[dict[str, object]] = []
+    cleaned_length = 0
+    for index, marker in enumerate(markers):
+        payload = f"answer-{index}-" + ("x" * 192)
+        if index % 2:
+            start_marker = json.dumps(marker["start_marker"])[1:-1]
+            end_marker = json.dumps(marker["end_marker"])[1:-1]
+        else:
+            start_marker = marker["start_marker"]
+            end_marker = marker["end_marker"]
+        marked_parts.extend((start_marker, payload, end_marker))
+        expected_parts.append(payload)
+        expected_spans.append(
+            {
+                "start": cleaned_length,
+                "end": cleaned_length + len(payload),
+                "source_start": cleaned_length,
+                "source_end": cleaned_length + len(payload),
+                "kind": "final_answer",
+                "role": "assistant",
+            }
+        )
+        cleaned_length += len(payload)
+
+    stripped = _strip_markers_and_collect_spans("".join(marked_parts), markers)
+
+    assert stripped == ("".join(expected_parts), expected_spans)
+
+
+def test_expand_typed_spans_indexes_large_conversations_once():
+    block_count = 1_200
+    assistant_prefix = "<|im_start|>assistant\n"
+    assistant_suffix = "<|im_end|>\n"
+    text_parts: list[str] = []
+    spans: list[dict[str, object]] = []
+    expected_bounds: list[tuple[int, int]] = []
+    cursor = 0
+    for index in range(block_count):
+        reasoning_prefix = "<think>\n"
+        reasoning = f"reason-{index}"
+        reasoning_suffix = "</think>\n"
+        answer = f"answer-{index}-" + ("y" * 448)
+        block = (
+            assistant_prefix
+            + reasoning_prefix
+            + reasoning
+            + reasoning_suffix
+            + answer
+            + assistant_suffix
+        )
+        block_end = cursor + len(block)
+        expected_bounds.append((cursor + len(assistant_prefix), block_end))
+        reasoning_start = cursor + len(assistant_prefix) + len(reasoning_prefix)
+        answer_start = reasoning_start + len(reasoning) + len(reasoning_suffix)
+        spans.extend(
+            (
+                {
+                    "start": reasoning_start,
+                    "end": reasoning_start + len(reasoning),
+                    "kind": "reasoning",
+                    "role": "assistant",
+                },
+                {
+                    "start": answer_start,
+                    "end": answer_start + len(answer),
+                    "kind": "final_answer",
+                    "role": "assistant",
+                },
+            )
+        )
+        text_parts.append(block)
+        cursor = block_end
+    text = "".join(text_parts)
+
+    expanded = _expand_typed_spans(text, spans, (assistant_prefix,))
+
+    assert len(expanded) == block_count * 2
+    for index, expected in enumerate(expected_bounds):
+        reasoning_span = expanded[index * 2]
+        final_span = expanded[index * 2 + 1]
+        assert (reasoning_span["start"], reasoning_span["end"]) == expected
+        assert (final_span["start"], final_span["end"]) == expected
 
 
 def test_actual_qwen_template_receives_normalized_mapping_tool_arguments():

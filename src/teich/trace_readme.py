@@ -449,7 +449,7 @@ def build_traces_readme(
         lines.extend(
             [
                 "Each file is newline-delimited JSON where every line is already a training example.",
-                "Chat-only datasets include `messages` plus convenience fields like optional `system`, `prompt`, `follow_up_prompts`, `thinking`, `response`, and `responses`.",
+                "Chat-only datasets use `messages` as the authoritative conversation. Single-turn rows may include `prompt`, `thinking`, and `response`; multi-turn rows include `follow_up_prompts` and `responses` instead.",
                 "Tool datasets can include the same normalized `messages` structure together with a `tools` field.",
                 "",
             ]
@@ -502,7 +502,7 @@ def build_traces_readme(
             "",
             f"Use this dataset as `{dataset_reference}` with Teich's data preparation and training utilities.",
             "If you do not want Teich to handle chat-template formatting or masking, run `teich convert` "
-            "to write standalone OpenAI-style JSONL rows with `prompt`, `messages`, `tools`, and `metadata`.",
+            "to write standalone OpenAI-style JSONL rows with `prompt`, `messages`, `tools`, `metadata`, and an optional captured `system` field.",
             f"Training setup details evolve over time, so the maintained guide lives in the [Teich training docs]({TEICH_TRAINING_DOCS_URL}).",
             f"For loading, mixing, converting, and validating Teich datasets, see [Preparing Data]({TEICH_PREPARE_DOCS_URL}).",
             "",

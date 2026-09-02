@@ -9,7 +9,9 @@ from pathlib import Path
 import sys
 from threading import Event, RLock, Thread
 from typing import Any
+import uuid
 
+import click
 import typer
 from huggingface_hub import HfApi
 from rich.console import Console, Group
@@ -28,6 +30,7 @@ from .runner import (
     ChatRunner,
     ClaudeCodeRunner,
     CodexRunner,
+    DockerRuntimeRunner,
     HermesRunner,
     PiRunner,
     SessionProgressUpdate,
@@ -44,6 +47,7 @@ ROOT_EXTRA_HELP = """\
 Common workflows:
   teich init my-project
   teich generate -c config.yaml
+  teich capture-context -c config.yaml
   teich extract claude --model fable-5 --out data
   teich convert data --out teich-training.jsonl
   teich studio
@@ -80,7 +84,8 @@ Default stores:
 
 After extraction:
   teich convert data --out teich-training.jsonl
-  This writes standalone OpenAI-style JSONL rows with prompt, messages, tools, and metadata for trainers that do not import Teich.
+  This writes standalone OpenAI-style JSONL rows with prompt, messages, tools,
+  metadata, and an optional captured system field for trainers that do not import Teich.
 """
 GENERATE_EXTRA_HELP = """\
 Typical generated project flow:
@@ -103,7 +108,8 @@ Examples:
   teich convert output/session.jsonl --out session.training.jsonl
 
 Output format:
-  Newline-delimited JSON rows with prompt, messages, tools, and metadata.
+  Newline-delimited JSON rows with prompt, messages, tools, metadata, and an
+  optional captured system field.
   This is useful when your trainer can consume standalone OpenAI-style message rows without importing Teich.
 
 Use prepare_data() and mask_data() when you want tokenizer-specific rendering and exact response-only labels.
@@ -114,8 +120,11 @@ Examples:
   teich anonymize data --in-place
 
 What is scrubbed:
-  API keys, email addresses, and home-directory usernames.
+  Known credential formats, high-confidence secret assignments, personal email
+  addresses, and home-directory usernames.
   Embedded base64 media payloads are preserved for conversation context.
+
+Reported totals are replacement occurrences, not estimates of unique secrets.
 
 This is a best-effort safety pass. Review data before publishing or uploading.
 """
@@ -146,7 +155,7 @@ For Hugging Face dataset uploads today, use teich generate or teich extract and 
 class ExtraHelpCommand(TyperCommand):
     extra_help = ""
 
-    def format_help(self, ctx: typer.Context, formatter: typer.HelpFormatter) -> None:
+    def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         super().format_help(ctx, formatter)
         if self.extra_help:
             formatter.write("\n" + self.extra_help)
@@ -155,7 +164,7 @@ class ExtraHelpCommand(TyperCommand):
 class ExtraHelpGroup(TyperGroup):
     extra_help = ""
 
-    def format_help(self, ctx: typer.Context, formatter: typer.HelpFormatter) -> None:
+    def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         super().format_help(ctx, formatter)
         if self.extra_help:
             formatter.write("\n" + self.extra_help)
@@ -183,6 +192,7 @@ app.add_typer(pool_app, name="pool")
 NON_DATA_TRACE_DIR_NAMES = {"partials", "failures"}
 UPLOAD_IGNORE_PATTERNS = ["partials/**", "failures/**"]
 UPLOAD_METADATA_PATTERNS = ["README.md", "tools.json"]
+UPLOAD_DATA_PATTERNS = ["*.jsonl", "**/*.jsonl", "*.metadata.json", "**/*.metadata.json"]
 
 
 def _upload_ignore_patterns(cfg: Config) -> list[str]:
@@ -210,7 +220,7 @@ def _anonymize_progress_bar():
             for key, count in file_report.replacements.items():
                 totals[key] = totals.get(key, 0) + count
             bar.set_postfix(
-                keys=totals["api_key"],
+                credentials=totals["api_key"],
                 emails=totals["email"],
                 users=totals["username"],
                 file=file_report.path.name,
@@ -317,6 +327,7 @@ def _upload_dataset_folder(
             folder_path=str(folder_path),
             repo_type="dataset",
             private=private,
+            allow_patterns=UPLOAD_DATA_PATTERNS,
             ignore_patterns=list(dict.fromkeys([*ignore_patterns, *UPLOAD_METADATA_PATTERNS])),
         )
     else:
@@ -325,6 +336,7 @@ def _upload_dataset_folder(
             repo_id=repo_id,
             repo_type="dataset",
             commit_message="Upload teich dataset output",
+            allow_patterns=[*UPLOAD_DATA_PATTERNS, *UPLOAD_METADATA_PATTERNS],
             ignore_patterns=ignore_patterns,
         )
     return str(repo_url)
@@ -516,8 +528,8 @@ def _run_extract_command(
         totals = result.anonymize_totals
         console.print(
             "[cyan]Automatically scrambled[/cyan] "
-            f"{totals.get('api_key', 0)} API keys, "
-            f"{totals.get('email', 0)} email addresses, and "
+            f"{totals.get('api_key', 0)} credential-like value occurrences, "
+            f"{totals.get('email', 0)} email address occurrences, and "
             f"{totals.get('username', 0)} username references",
             soft_wrap=True,
         )
@@ -591,7 +603,7 @@ def anonymize(
     ),
     in_place: bool = typer.Option(False, "--in-place", help="Overwrite files in the input path"),
 ) -> None:
-    """Replace emails, home-directory usernames, and API keys with deterministic dummy values."""
+    """Replace likely credentials, personal emails, and home usernames with dummy values."""
     try:
         report = _anonymize_with_progress(input_path, output, in_place=in_place)
     except (FileNotFoundError, ValueError) as exc:
@@ -602,12 +614,20 @@ def anonymize(
     destination = report.input_path if in_place else report.output_path
     console.print(f"[green]Anonymized {report.files_changed}/{len(report.files)} file(s) into {destination}[/green]")
     if totals:
+        display_names = {
+            "api_key": "credential_occurrences",
+            "email": "email_occurrences",
+            "username": "username_references",
+        }
         console.print(
             "[cyan]Replacements:[/cyan] "
-            + " ".join(f"{key}={value}" for key, value in sorted(totals.items()))
+            + " ".join(
+                f"{display_names.get(key, key)}={value}"
+                for key, value in sorted(totals.items())
+            )
         )
     else:
-        console.print("[yellow]No emails, usernames, or API keys were detected.[/yellow]")
+        console.print("[yellow]No likely credentials, personal emails, or usernames were detected.[/yellow]")
 
 
 @app.command(
@@ -644,7 +664,10 @@ def convert(
             handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     console.print(f"[green]Converted {len(rows)} trace row{'s' if len(rows) != 1 else ''} to {output}[/green]")
-    console.print("[cyan]Output format:[/cyan] Teich JSONL with prompt, messages, tools, and metadata.")
+    console.print(
+        "[cyan]Output format:[/cyan] Teich JSONL with prompt, messages, tools, metadata, "
+        "and an optional captured system field."
+    )
 
 
 @pool_app.command(
@@ -660,6 +683,61 @@ def pool_upload(
     console.print(f"[cyan]Ready path:[/cyan] {path}")
     console.print("[dim]The command is reserved until the site has its database and upload API deployed.[/dim]")
     raise typer.Exit(1)
+
+
+@app.command(
+    "capture-context",
+    help="Simulate one local provider request and save client-visible harness context.",
+    short_help="Capture harness instructions and tool schemas locally.",
+)
+def capture_context(
+    config: Path = typer.Option(
+        Path("config.yaml"),
+        "--config",
+        "-c",
+        help="Generation config whose harness settings should be simulated",
+    ),
+    output: Path = typer.Option(
+        Path("harness-context.json"),
+        "--output",
+        "-o",
+        help="Destination JSON file",
+    ),
+) -> None:
+    """Capture context without contacting or consuming quota from a real provider."""
+    if not config.exists():
+        console.print(f"[red]Config file not found: {config}[/red]")
+        raise typer.Exit(1)
+    cfg = Config.from_yaml(config)
+    provider = cfg.get_agent_provider()
+    if provider == "codex":
+        runner: DockerRuntimeRunner = CodexRunner(cfg)
+    elif provider in CLAUDE_PROVIDER_ALIASES:
+        runner = ClaudeCodeRunner(cfg)
+    else:
+        console.print("[red]Harness capture currently supports codex and claude-code.[/red]")
+        raise typer.Exit(1)
+    console.print(
+        f"[cyan]Simulating one {provider} request locally; no provider credentials or quota are used.[/cyan]"
+    )
+    try:
+        capture = runner.capture_harness_context()
+    except Exception as exc:
+        console.print(f"[red]Harness capture failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(capture.to_dict(), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    console.print(
+        f"[green]Captured {len(capture.tools)} tools and {len(capture.system)} system characters to {output}.[/green]"
+    )
 
 
 @app.command(
@@ -751,6 +829,7 @@ def generate(
 
     # Run generation
     try:
+        runner: DockerRuntimeRunner
         if agent_provider == "codex":
             runner = CodexRunner(cfg)
             if cfg.agent.codex.use_host_auth:
@@ -1111,15 +1190,24 @@ agent:
   # Teich passes it into each container and withholds ANTHROPIC_API_KEY (an API
   # key silently wins over subscription auth inside Claude Code and would bill
   # the API). Usage counts against your plan's rate limits, not API credits,
-  # and the token is safe at any max_concurrency.
-  # fallback_model forwards as --fallback-model (a model or list, tried in
-  # order on overload); always_thinking writes alwaysThinkingEnabled into the
-  # container's ~/.claude/settings.json; max_thinking_tokens sets
-  # MAX_THINKING_TOKENS in the container (0 disables thinking where allowed).
+  # Teich spaces subscription request starts by 45 seconds by default to avoid
+  # hammering plan rate limits. This includes follow-ups and retries, is shared
+  # across concurrent workers, and is ignored for API-key/custom-base-URL runs.
+  # fallback_model is a model or list Teich switches to across interactive
+  # batch retries (Claude's own --fallback-model is print-mode-only). Studio
+  # starts with the configured primary model. Batch generation uses a real
+  # interactive PTY, and
+  # always_thinking/show_thinking_summaries default to true so readable summaries
+  # can reach Claude's native trace. Set either false to opt out. They write
+  # alwaysThinkingEnabled/showThinkingSummaries into ~/.claude/settings.json.
+  # max_thinking_tokens sets MAX_THINKING_TOKENS in the container (0 disables
+  # thinking where allowed).
   # claude:
   #   oauth_token: null               # prefer CLAUDE_CODE_OAUTH_TOKEN in the env
+  #   subscription_request_delay_seconds: 45  # 0 disables subscription pacing
   #   fallback_model: [sonnet, haiku]
   #   always_thinking: true
+  #   show_thinking_summaries: true
   #   max_thinking_tokens: null
 
   # Trace each agent session to Langfuse (https://langfuse.com). Works for Codex
@@ -1160,6 +1248,13 @@ model:
   # reasoning summaries in traces (Codex's default can emit empty summaries).
   # Leave null to use Codex's default.
   reasoning_summary: null
+
+  # Optional explicit Codex capability toggle, forwarded as
+  # model_supports_reasoning_summaries. Set true together with
+  # reasoning_summary: detailed when gathering the richest readable summaries,
+  # especially for custom provider/model IDs Codex cannot identify. This never
+  # decrypts or exposes the provider's hidden raw chain-of-thought.
+  reasoning_summaries_enabled: null
 
   # Optional Codex service tier. Set to "fast" to enable Codex fast mode: it
   # runs ~1.5x faster at a higher credit rate and requires ChatGPT subscription
@@ -1269,6 +1364,16 @@ openai_api_key: null
 #     call or edit, briefly explain what you're doing and why; after a command or
 #     test runs, state what you concluded before the next step.
 developer_instructions: null
+
+# Codex/Claude Code only. Simulate one request against Teich's local fake
+# provider before generation and append the client-visible harness instructions
+# and tool schemas to each raw trace. This never contacts the real provider and
+# never stores authentication headers or user messages. The converter exposes
+# the captured instructions as a top-level `system` column.
+capture_harness_context:
+  enabled: false
+  required: true
+  timeout_seconds: 45
 '''
 
 
@@ -1279,13 +1384,16 @@ def _configure_studio_event_loop_policy(
 ) -> bool:
     if platform != "win32":
         return False
-    if asyncio_module is None:
-        import asyncio as asyncio_module
+    module = asyncio_module
+    if module is None:
+        import asyncio
 
-    policy_cls = getattr(asyncio_module, "WindowsSelectorEventLoopPolicy", None)
+        module = asyncio
+
+    policy_cls = getattr(module, "WindowsSelectorEventLoopPolicy", None)
     if policy_cls is None:
         return False
-    asyncio_module.set_event_loop_policy(policy_cls())
+    module.set_event_loop_policy(policy_cls())
     return True
 
 

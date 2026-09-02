@@ -1,0 +1,42 @@
+# Claude Code generation with extended thinking and readable thinking summaries.
+#
+# Prerequisites:
+#   claude setup-token
+#   export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
+#
+# Run from the repository root:
+#   uvx teich generate -c examples/config.claude-code-thinking.yaml
+#
+# Claude Code writes emitted `thinking` blocks into its native transcript.
+# Anthropic may still return opaque `redacted_thinking` blocks for safety;
+# Teich preserves those blocks but cannot decrypt them.
+
+agent:
+  provider: claude-code
+  claude:
+    subscription_request_delay_seconds: 45
+    always_thinking: true
+    show_thinking_summaries: true
+
+model:
+  model: opus
+  approval_policy: never
+  sandbox: danger-full-access
+  reasoning_effort: max
+
+# One local fake Anthropic Messages request records Claude Code's client-visible
+# system prompt and tool declarations without consuming subscription quota.
+capture_harness_context:
+  enabled: true
+  required: true
+
+prompts_file: prompts.jsonl
+
+output:
+  traces_dir: ./output/claude-code-thinking
+  sandbox_dir: ./sandbox/claude-code-thinking
+  failures_dir: ./failures/claude-code-thinking
+  pretty_name: Claude Code Thinking Traces
+
+max_concurrency: 1
+timeout_seconds: 1800

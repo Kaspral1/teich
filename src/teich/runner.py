@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 import json
@@ -39,6 +39,7 @@ from .converter import (
     normalize_codex_trace_event,
     normalize_codex_trace_events,
 )
+from .harness_capture import HarnessCaptureServer, HarnessContextCapture
 from .tool_schema import snapshot_configured_tools
 
 RUNTIME_IMAGE_NAME = "teich-runtime:v3"
@@ -47,6 +48,8 @@ RUNTIME_DOCKERFILE_NAME = "codex-runtime.Dockerfile"
 RUNTIME_CONTAINER_USER = "codex"
 CODEX_HOME_IN_CONTAINER = "/home/codex/.codex"
 CLAUDE_HOME_IN_CONTAINER = "/home/codex/.claude"
+CLAUDE_STATE_FILE_NAME = "teich-claude-state.json"
+CLAUDE_STATE_IN_CONTAINER = "/home/codex/.claude.json"
 HERMES_HOME_IN_CONTAINER = "/home/codex/.hermes"
 
 # Langfuse Codex observability plugin: baked into the tracing-enabled runtime
@@ -70,6 +73,8 @@ HERMES_TRACE_WRITE_LOCK = threading.Lock()
 CHAT_REQUEST_MAX_ATTEMPTS = 3
 AGENT_TURN_RETRY_LIMIT = 3
 NON_DATA_TRACE_DIR_NAMES = {"partials", "failures"}
+DOCKER_CONTROL_TIMEOUT_SECONDS = 30
+DOCKER_CLEANUP_TIMEOUT_SECONDS = 30
 
 
 def _make_tree_world_writable(path: Path) -> None:
@@ -134,7 +139,48 @@ def _is_non_data_trace_path(path: Path, traces_dir: Path, excluded_dirs: list[Pa
     return False
 
 
-TEXT_SUBPROCESS_KWARGS = {"text": True, "encoding": "utf-8", "errors": "replace"}
+TEXT_SUBPROCESS_KWARGS: dict[str, Any] = {
+    "text": True,
+    "encoding": "utf-8",
+    "errors": "replace",
+}
+SUBPROCESS_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+if os.name == "nt":
+    # Teich owns these background CLI processes and consumes their output via
+    # pipes. They do not need a host console, and suppressing one prevents
+    # conhost.exe accumulation in long Windows generation runs.
+    TEXT_SUBPROCESS_KWARGS["creationflags"] = SUBPROCESS_CREATE_NO_WINDOW
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[Any],
+    *,
+    timeout: float = 5,
+    windows: bool | None = None,
+) -> None:
+    """Terminate an owned subprocess and its descendants."""
+    if process.poll() is not None:
+        return
+    use_taskkill = os.name == "nt" if windows is None else windows
+    if use_taskkill:
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+            check=False,
+            **TEXT_SUBPROCESS_KWARGS,
+        )
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 LOCAL_PROVIDER_PROXY_SCRIPT_NAME = "local_provider_proxy.js"
 CLAUDE_OPENROUTER_PROXY_SCRIPT_NAME = "claude_openrouter_proxy.js"
 CLAUDE_OPENROUTER_PROXY_PORT = 17891
@@ -580,14 +626,7 @@ def _prompt_completion_key(prompt_input: PromptInput | str) -> str:
 
 
 def _prompt_resume_key(prompt_input: PromptInput | str) -> str:
-    if isinstance(prompt_input, str):
-        prompt_parts = [_prompt_text_completion_key(prompt_input)]
-    else:
-        prompt_parts = [
-            _prompt_text_completion_key(prompt)
-            for prompt in prompt_input.turn_prompts()
-        ]
-    return "\n\n--- follow-up ---\n\n".join(prompt_parts)
+    return _prompt_completion_key(prompt_input)
 
 
 def _agent_turn_prompts(prompt: str, prompt_input: PromptInput | None) -> list[str]:
@@ -837,6 +876,36 @@ def _system_from_training_example(example: dict[str, Any]) -> str | None:
     return None
 
 
+def _system_from_teich_trace_events(events: list[dict[str, Any]]) -> str | None:
+    for event in reversed(events):
+        if event.get("type") != "custom" or event.get("customType") != PI_SYSTEM_PROMPT_CUSTOM_TYPE:
+            continue
+        data = event.get("data")
+        system = data.get("systemPrompt") if isinstance(data, dict) else None
+        if isinstance(system, str) and system.strip():
+            return system.strip()
+    return None
+
+
+def _trace_includes_system_prompt(events: list[dict[str, Any]], system_prompt: str) -> bool:
+    expected = system_prompt.strip()
+    if _system_from_teich_trace_events(events) == expected:
+        return True
+    for event in events:
+        candidates = [event]
+        candidates.extend(
+            value
+            for key in ("message", "payload")
+            if isinstance((value := event.get(key)), dict)
+        )
+        for candidate in candidates:
+            if candidate.get("role") not in {"system", "developer"}:
+                continue
+            if _message_text(candidate.get("content")) == expected:
+                return True
+    return False
+
+
 def completed_prompt_keys_from_outputs(traces_dir: Path, excluded_dirs: list[Path] | None = None) -> set[str]:
     if not traces_dir.exists():
         return set()
@@ -851,11 +920,17 @@ def completed_prompt_keys_from_outputs(traces_dir: Path, excluded_dirs: list[Pat
             if structured_rows is not None:
                 examples = structured_rows
             else:
-                examples = [convert_trace_to_training_example(path).to_dict()]
+                events = _read_jsonl_dict_events(path) or []
+                example = convert_trace_to_training_example(path).to_dict()
+                recorded_system = _system_from_teich_trace_events(events)
+                if recorded_system and not _system_from_training_example(example):
+                    example["system"] = recorded_system
+                examples = [example]
         except (OSError, json.JSONDecodeError, ValueError):
             continue
         for example in examples:
-            prompt = example.get("prompt") if isinstance(example.get("prompt"), str) else ""
+            raw_prompt = example.get("prompt")
+            prompt = raw_prompt if isinstance(raw_prompt, str) else ""
             if not prompt.strip():
                 prompt = _prompt_from_training_messages(example.get("messages"))
             if not isinstance(prompt, str) or not prompt.strip():
@@ -941,15 +1016,19 @@ def prompt_inputs_for_run(
 class DockerRuntimeRunner:
     """Shared Docker runtime used by agent runners."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, *, _ensure_image: bool = True):
         self.config = config
         self.image_name = self._runtime_image_name()
         self._configured_tools_snapshot: list[dict[str, Any]] | None = None
+        self._harness_context_capture: HarnessContextCapture | None = None
+        self._harness_context_capture_attempted = False
+        self._harness_context_capture_lock = threading.Lock()
         self._active_processes: dict[subprocess.Popen[str], str | None] = {}
         self._active_processes_lock = threading.Lock()
         self._active_containers: set[str] = set()
         self._active_containers_lock = threading.Lock()
-        self._ensure_image()
+        if _ensure_image:
+            self._ensure_image()
 
     def _runtime_image_name(self) -> str:
         return RUNTIME_IMAGE_NAME
@@ -970,8 +1049,140 @@ class DockerRuntimeRunner:
             for event in events:
                 handle.write(json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n")
 
+    def _append_harness_context_metadata(self, trace_path: Path) -> None:
+        capture = self._harness_context_capture
+        if capture is None or not trace_path.exists():
+            return
+        events = _read_jsonl_dict_events(trace_path) or []
+        if any(event.get("type") == "teich_harness_context" for event in events):
+            return
+        self._append_jsonl_events(trace_path, [capture.to_trace_event()])
+
+    def _append_prompt_system_metadata(self, trace_path: Path, prompt_input: PromptInput | None) -> None:
+        if prompt_input is None or not isinstance(prompt_input.system, str) or not trace_path.exists():
+            return
+        system_prompt = prompt_input.system.strip()
+        if not system_prompt:
+            return
+        events = _read_jsonl_dict_events(trace_path) or []
+        if _trace_includes_system_prompt(events, system_prompt):
+            return
+        self._append_jsonl_events(
+            trace_path,
+            [
+                {
+                    "type": "custom",
+                    "id": f"teich-system-{uuid.uuid4().hex[:8]}",
+                    "parentId": None,
+                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "customType": PI_SYSTEM_PROMPT_CUSTOM_TYPE,
+                    "data": {"systemPrompt": system_prompt, "source": "teich"},
+                }
+            ],
+        )
+
     def _finalize_trace_export(self, trace_path: Path, prompt_input: PromptInput | None = None) -> None:
-        return
+        self._append_harness_context_metadata(trace_path)
+        self._append_prompt_system_metadata(trace_path, prompt_input)
+
+    def capture_harness_context(self) -> HarnessContextCapture:
+        raise RuntimeError(
+            f"Harness-context capture is not supported for {self.config.get_agent_provider()}. "
+            "Use agent.provider: codex or claude-code."
+        )
+
+    def _ensure_harness_context_capture(self) -> HarnessContextCapture | None:
+        capture_config = self.config.capture_harness_context
+        if not capture_config.enabled:
+            return None
+        if self._harness_context_capture_attempted:
+            return self._harness_context_capture
+        with self._harness_context_capture_lock:
+            if self._harness_context_capture_attempted:
+                return self._harness_context_capture
+            try:
+                capture = self.capture_harness_context()
+                if not capture.system.strip():
+                    raise RuntimeError(
+                        f"{self.config.get_agent_provider()} simulated request contained no system instructions"
+                    )
+                self._harness_context_capture = capture
+            except Exception:
+                if capture_config.required:
+                    raise
+            self._harness_context_capture_attempted = True
+            return self._harness_context_capture
+
+    def _harness_cli_version(self, executable: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["docker", "run", "--rm", self.image_name, executable, "--version"],
+                capture_output=True,
+                check=False,
+                timeout=DOCKER_CONTROL_TIMEOUT_SECONDS,
+                **TEXT_SUBPROCESS_KWARGS,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        version = (result.stdout or result.stderr).strip()
+        return version.splitlines()[0].strip() if version else None
+
+    def _run_harness_capture_command(
+        self,
+        command: list[str],
+        server: HarnessCaptureServer,
+        *,
+        container_name: str,
+        stdin_text: str | None = None,
+    ) -> HarnessContextCapture:
+        process: subprocess.Popen[str] | None = None
+        stdout_handle = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
+        stderr_handle = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE if stdin_text is not None else None,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                **TEXT_SUBPROCESS_KWARGS,
+            )
+            if stdin_text is not None and process.stdin is not None:
+                process.stdin.write(stdin_text)
+                process.stdin.close()
+            deadline = time.monotonic() + self.config.capture_harness_context.timeout_seconds
+            while time.monotonic() < deadline:
+                capture = server.wait(min(0.1, max(0.0, deadline - time.monotonic())))
+                if capture is not None:
+                    return capture
+                if process.poll() is not None:
+                    break
+            stdout_handle.flush()
+            stderr_handle.flush()
+            stdout_handle.seek(0)
+            stderr_handle.seek(0)
+            details = stderr_handle.read().strip() or stdout_handle.read().strip()
+            suffix = f": {details[-2000:]}" if details else ""
+            raise RuntimeError(
+                f"{self.config.get_agent_provider()} did not send a simulated provider request "
+                f"within {self.config.capture_harness_context.timeout_seconds}s{suffix}"
+            )
+        finally:
+            if process is not None and process.poll() is None:
+                self._terminate_process(process, container_name)
+            else:
+                self._remove_container(container_name)
+            stdout_handle.close()
+            stderr_handle.close()
+
+    def run_session(
+        self,
+        prompt: str,
+        session_id: str | None = None,
+        progress_callback: SessionProgressCallback | None = None,
+        progress_base: SessionProgressUpdate | None = None,
+        prompt_input: PromptInput | None = None,
+    ) -> Path:
+        raise NotImplementedError
 
     @staticmethod
     def _runtime_dockerfile_path() -> Path:
@@ -986,6 +1197,7 @@ class DockerRuntimeRunner:
                 ["docker", "image", "inspect", self.image_name, "--format", "{{.Created}}"],
                 capture_output=True,
                 check=True,
+                timeout=DOCKER_CONTROL_TIMEOUT_SECONDS,
                 **TEXT_SUBPROCESS_KWARGS,
             )
         except subprocess.CalledProcessError:
@@ -1009,6 +1221,7 @@ class DockerRuntimeRunner:
                 ["docker", "images", "-q", self.image_name],
                 capture_output=True,
                 check=True,
+                timeout=DOCKER_CONTROL_TIMEOUT_SECONDS,
                 **TEXT_SUBPROCESS_KWARGS,
             )
             if not result.stdout.strip():
@@ -1019,8 +1232,14 @@ class DockerRuntimeRunner:
             dockerfile_mtime = datetime.fromtimestamp(dockerfile_path.stat().st_mtime, tz=timezone.utc)
             if image_created_at is None or image_created_at < dockerfile_mtime:
                 self._build_image()
-        except subprocess.CalledProcessError:
-            self._build_image()
+        except FileNotFoundError as exc:
+            raise RuntimeError("Docker is not installed or is not available on PATH.") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Docker did not respond while Teich checked the runtime image.") from exc
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or "")
+            details = stderr.strip() or str(exc)
+            raise RuntimeError(f"Docker could not inspect the Teich runtime image: {details}") from exc
 
     def _build_image(self) -> None:
         """Build the Docker image."""
@@ -1099,12 +1318,18 @@ class DockerRuntimeRunner:
     def _remove_container(container_name: str | None) -> None:
         if not container_name:
             return
-        subprocess.run(
-            ["docker", "rm", "-f", container_name],
-            capture_output=True,
-            check=False,
-            **TEXT_SUBPROCESS_KWARGS,
-        )
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                capture_output=True,
+                check=False,
+                timeout=DOCKER_CLEANUP_TIMEOUT_SECONDS,
+                **TEXT_SUBPROCESS_KWARGS,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            # Cleanup is best-effort and must not hide the original run error
+            # or hang shutdown indefinitely when Docker is unavailable.
+            return
 
     def _terminate_process(
         self,
@@ -1114,13 +1339,7 @@ class DockerRuntimeRunner:
         remove_container: bool = True,
     ) -> None:
         try:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+            _terminate_process_tree(process)
         finally:
             if remove_container:
                 self._remove_container(container_name)
@@ -1140,7 +1359,13 @@ class DockerRuntimeRunner:
     @staticmethod
     def _start_container(command: list[str]) -> None:
         try:
-            subprocess.run(command, capture_output=True, check=True, **TEXT_SUBPROCESS_KWARGS)
+            subprocess.run(
+                command,
+                capture_output=True,
+                check=True,
+                timeout=DOCKER_CONTROL_TIMEOUT_SECONDS,
+                **TEXT_SUBPROCESS_KWARGS,
+            )
         except FileNotFoundError as exc:
             if shutil.which(command[0]) is None:
                 raise RuntimeError(
@@ -1152,6 +1377,10 @@ class DockerRuntimeRunner:
             stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or "")
             details = stderr.strip() or stdout.strip() or str(exc)
             raise RuntimeError(f"Failed to start Docker runtime container: {details}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Docker did not start the runtime container within {DOCKER_CONTROL_TIMEOUT_SECONDS} seconds."
+            ) from exc
 
     def _start_tracked_container(self, command: list[str], container_name: str | None) -> None:
         self._register_active_container(container_name)
@@ -1640,7 +1869,7 @@ class DockerRuntimeRunner:
         return None
 
     def _openrouter_usage_from_generation_ids(self, generation_ids: set[str]) -> dict[str, Any] | None:
-        usages = [
+        usages: list[dict[str, Any] | None] = [
             usage
             for generation_id in sorted(generation_ids)
             if (usage := self._openrouter_generation_usage(generation_id)) is not None
@@ -1910,6 +2139,7 @@ class DockerRuntimeRunner:
         prompt_inputs: list[PromptInput] | None = None,
         resume: bool = False,
     ) -> list[Path]:
+        self._ensure_harness_context_capture()
         prompt_inputs = prompt_inputs if prompt_inputs is not None else self.config.get_prompt_inputs()
         prompt_inputs = prompt_inputs_for_run(
             prompt_inputs,
@@ -2047,12 +2277,12 @@ class DockerRuntimeRunner:
 class CodexRunner(DockerRuntimeRunner):
     """Manages Docker-based Codex sessions."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, *, _ensure_image: bool = True):
         self._broker: CodexTokenBroker | None = None
         self._broker_lock = threading.Lock()
         self._langfuse_plugin_cache: Path | None = None
         self._langfuse_plugin_lock = threading.Lock()
-        super().__init__(config)
+        super().__init__(config, _ensure_image=_ensure_image)
 
     def _runtime_image_name(self) -> str:
         if self.config.agent.langfuse.enabled:
@@ -2272,6 +2502,9 @@ class CodexRunner(DockerRuntimeRunner):
             lines.append(
                 f"model_reasoning_summary = {self._toml_string(self.config.model.reasoning_summary)}"
             )
+        if self.config.model.reasoning_summaries_enabled is not None:
+            enabled = str(self.config.model.reasoning_summaries_enabled).lower()
+            lines.append(f"model_supports_reasoning_summaries = {enabled}")
         if self.config.model.service_tier:
             lines.append(
                 f"service_tier = {self._toml_string(self.config.model.service_tier)}"
@@ -2433,7 +2666,55 @@ class CodexRunner(DockerRuntimeRunner):
         self._append_jsonl_events(trace_path, metadata_events)
 
     def _finalize_trace_export(self, trace_path: Path, prompt_input: PromptInput | None = None) -> None:
+        super()._finalize_trace_export(trace_path, prompt_input)
         self._append_codex_available_tool_schemas(trace_path)
+
+    def capture_harness_context(self) -> HarnessContextCapture:
+        """Run Codex once against Teich's local Responses-compatible recorder."""
+        capture_config = self.config.model_copy(deep=True)
+        capture_config.capture_harness_context.enabled = False
+        capture_config.api.provider = "teich-capture"
+        capture_config.api.wire_api = "responses"
+        capture_config.agent.codex.use_host_auth = False
+        capture_config.agent.langfuse.enabled = False
+        capture_config.openai_api_key = None
+        version = self._harness_cli_version("codex")
+        with HarnessCaptureServer(
+            harness="codex",
+            harness_version=version,
+            minimum_tools=1,
+        ) as server:
+            capture_config.api.base_url = server.base_url
+            capture_config.api.api_key = server.secret
+            capture_runner = CodexRunner(capture_config, _ensure_image=False)
+            capture_runner.image_name = self.image_name
+            workspace_root = Path(tempfile.mkdtemp(prefix="teich-codex-context-workspace-"))
+            workspace = workspace_root / "workspace"
+            codex_home = Path(tempfile.mkdtemp(prefix="teich-codex-context-home-"))
+            container_name = self._container_name("codex-context", uuid.uuid4().hex)
+            prompt = (
+                "This is a local Teich harness-context capture preflight. "
+                "Return the completion marker; do not call tools or modify files."
+            )
+            try:
+                workspace.mkdir(parents=True, exist_ok=True)
+                _make_tree_world_writable(workspace_root)
+                capture_runner._write_codex_config(codex_home)
+                command = capture_runner._build_codex_command(
+                    prompt,
+                    workspace,
+                    codex_home,
+                    container_name,
+                )
+                return capture_runner._run_harness_capture_command(
+                    command,
+                    server,
+                    container_name=container_name,
+                    stdin_text=prompt,
+                )
+            finally:
+                shutil.rmtree(workspace_root, ignore_errors=True)
+                shutil.rmtree(codex_home, ignore_errors=True)
 
     def _codex_base_url_and_proxy_target(self) -> tuple[str | None, str | None]:
         configured_base_url = self.config.get_base_url()
@@ -3221,13 +3502,35 @@ class ExternalCliRunner(DockerRuntimeRunner):
 
 
 class ClaudeCodeRunner(ExternalCliRunner):
-    """Runs Claude Code in non-interactive stream-json mode."""
+    """Runs Claude Code through an interactive PTY and exports its native trace."""
 
     provider_name = "claude-code"
     container_kind = "claude"
     home_in_container = CLAUDE_HOME_IN_CONTAINER
     source_name = "claude-code"
     default_model_provider = "anthropic"
+
+    def __init__(self, config: Config, *, _ensure_image: bool = True):
+        super().__init__(config, _ensure_image=_ensure_image)
+        self._subscription_request_lock = threading.Lock()
+        self._last_subscription_request_at: float | None = None
+
+    def _wait_for_subscription_request_slot(self) -> float:
+        """Space Claude subscription request starts without affecting API runs."""
+        delay = self.config.agent.claude.subscription_request_delay_seconds
+        if delay <= 0 or not self.config.claude_host_auth_active():
+            return 0.0
+
+        waited = 0.0
+        with self._subscription_request_lock:
+            now = time.monotonic()
+            if self._last_subscription_request_at is not None:
+                remaining = self._last_subscription_request_at + delay - now
+                if remaining > 0:
+                    time.sleep(remaining)
+                    waited = remaining
+            self._last_subscription_request_at = time.monotonic()
+        return waited
 
     def _runtime_image_name(self) -> str:
         if self.config.agent.langfuse.enabled:
@@ -3238,6 +3541,68 @@ class ClaudeCodeRunner(ExternalCliRunner):
         if self.config.agent.langfuse.enabled:
             return ["--build-arg", "TEICH_INSTALL_LANGFUSE=1"]
         return []
+
+    def capture_harness_context(self) -> HarnessContextCapture:
+        """Run Claude Code once against Teich's local Messages recorder."""
+        capture_config = self.config.model_copy(deep=True)
+        capture_config.capture_harness_context.enabled = False
+        capture_config.api.provider = "anthropic"
+        capture_config.api.wire_api = "messages"
+        capture_config.api.api_key = None
+        capture_config.openai_api_key = None
+        capture_config.agent.claude.oauth_token = None
+        capture_config.agent.langfuse.enabled = False
+        version = self._harness_cli_version("claude")
+        with HarnessCaptureServer(
+            harness="claude-code",
+            harness_version=version,
+            minimum_tools=1,
+        ) as server:
+            capture_config.api.base_url = server.base_url
+            capture_config.api.api_key = server.secret
+            capture_runner = ClaudeCodeRunner(capture_config, _ensure_image=False)
+            capture_runner.image_name = self.image_name
+            workspace_root = Path(tempfile.mkdtemp(prefix="teich-claude-context-workspace-"))
+            workspace = workspace_root / "workspace"
+            home_dir = Path(tempfile.mkdtemp(prefix="teich-claude-context-home-"))
+            container_name = self._container_name("claude-context", uuid.uuid4().hex)
+            prompt = (
+                "This is a local Teich harness-context capture preflight. "
+                "Return the completion marker; do not call tools or modify files."
+            )
+            try:
+                workspace.mkdir(parents=True, exist_ok=True)
+                _make_tree_world_writable(workspace_root)
+                capture_runner._prepare_agent_home(home_dir)
+                prompt_file = workspace / TEICH_PROMPT_FILE_NAME
+                prompt_file.write_text(prompt, encoding="utf-8")
+                prompt_file.chmod(0o666)
+                command = capture_runner._build_external_command(
+                    workspace,
+                    home_dir,
+                    container_name,
+                )
+                # ANTHROPIC_API_KEY triggers Claude Code's interactive
+                # first-use approval dialog. The equivalent custom gateway
+                # bearer-token path avoids that UI and is scoped to this local
+                # recorder only.
+                api_key_assignment = f"ANTHROPIC_API_KEY={server.secret}"
+                command = [
+                    f"ANTHROPIC_AUTH_TOKEN={server.secret}"
+                    if argument == api_key_assignment
+                    else argument
+                    for argument in command
+                ]
+                image_index = command.index(capture_runner.image_name)
+                command[image_index:image_index] = ["-e", "ANTHROPIC_API_KEY="]
+                return capture_runner._run_harness_capture_command(
+                    command,
+                    server,
+                    container_name=container_name,
+                )
+            finally:
+                shutil.rmtree(workspace_root, ignore_errors=True)
+                shutil.rmtree(home_dir, ignore_errors=True)
 
     def _langfuse_env_items(self) -> list[tuple[str, str]]:
         langfuse = self.config.agent.langfuse
@@ -3259,17 +3624,43 @@ class ClaudeCodeRunner(ExternalCliRunner):
 
     def _prepare_agent_home(self, home_dir: Path) -> None:
         settings = self._claude_settings()
-        if not settings:
-            return
-        settings_path = home_dir / "settings.json"
-        settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
-        settings_path.chmod(0o666)
+        if settings:
+            settings_path = home_dir / "settings.json"
+            settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+            settings_path.chmod(0o666)
+        # Claude Code 2.1.220+ stores onboarding state in ~/.claude.json rather
+        # than ~/.claude/settings.json. Containers use a fresh HOME each run,
+        # so seed and mount only the non-secret UI state or the CLI blocks at
+        # the theme picker before it can send a provider request.
+        state_path = home_dir / CLAUDE_STATE_FILE_NAME
+        state_path.write_text(
+            json.dumps(
+                {
+                    "hasCompletedOnboarding": True,
+                    "bypassPermissionsModeAccepted": True,
+                    "theme": "dark",
+                    "projects": {
+                        WORKSPACE_IN_CONTAINER: {
+                            "hasTrustDialogAccepted": True,
+                        }
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        state_path.chmod(0o666)
 
     def _claude_settings(self) -> dict[str, object]:
         """Compose the container's ~/.claude/settings.json from config."""
         settings: dict[str, object] = {}
         if self.config.agent.claude.always_thinking is not None:
             settings["alwaysThinkingEnabled"] = self.config.agent.claude.always_thinking
+        if self.config.agent.claude.show_thinking_summaries is not None:
+            settings["showThinkingSummaries"] = (
+                self.config.agent.claude.show_thinking_summaries
+            )
         if self.config.agent.langfuse.enabled:
             hook = {"hooks": [{"type": "command", "command": CLAUDE_LANGFUSE_HOOK_COMMAND}]}
             settings["hooks"] = {"Stop": [hook], "SessionEnd": [hook]}
@@ -3335,10 +3726,35 @@ class ClaudeCodeRunner(ExternalCliRunner):
         model = self.config.get_effective_model().strip().lower()
         return not (model.startswith("claude-") or model.startswith("anthropic/claude-"))
 
-    def _claude_visible_model(self) -> str:
+    def _claude_visible_model(self, model_override: str | None = None) -> str:
         if self._needs_openrouter_model_proxy():
             return CLAUDE_OPENROUTER_SURROGATE_MODEL
-        return self.config.get_effective_model()
+        return model_override or self.config.get_effective_model()
+
+    def _claude_retry_models(self) -> list[str | None]:
+        """Return first-party models to try across Teich's interactive retries."""
+        models: list[str | None] = [None]
+        # Claude's native --fallback-model flag is print-mode-only. For the
+        # interactive capture path, Teich switches --model itself on retries.
+        # Custom proxy targets are fixed in the container environment and
+        # therefore cannot be changed safely between turns.
+        if self.config.get_base_url():
+            return models
+        fallback = self.config.get_claude_fallback_model()
+        if not fallback:
+            return models
+        primary = self.config.get_effective_model().strip().casefold()
+        seen = {primary}
+        for name in fallback.split(","):
+            normalized = name.strip()
+            key = normalized.casefold()
+            if not normalized or key in seen:
+                continue
+            seen.add(key)
+            models.append(normalized)
+            if len(models) >= AGENT_TURN_RETRY_LIMIT + 1:
+                break
+        return models
 
     def _base_url_env_items(self) -> list[tuple[str, str]]:
         if not self._needs_openrouter_model_proxy():
@@ -3412,8 +3828,6 @@ class ClaudeCodeRunner(ExternalCliRunner):
         args: list[str] = []
         if self.config.model.reasoning_effort:
             args.extend(["--effort", self.config.model.reasoning_effort])
-        if fallback_model := self.config.get_claude_fallback_model():
-            args.extend(["--fallback-model", fallback_model])
         return args
 
     def _build_shell_command(
@@ -3421,15 +3835,13 @@ class ClaudeCodeRunner(ExternalCliRunner):
         *,
         continue_session: bool = False,
         resume_session_id: str | None = None,
+        model_override: str | None = None,
     ) -> str:
         claude_command = [
             "claude",
-            "-p",
-            "--output-format",
-            "stream-json",
-            "--verbose",
+            "--ax-screen-reader",
             "--model",
-            self._claude_visible_model(),
+            self._claude_visible_model(model_override),
         ]
         permission_mode = self._permission_mode()
         if permission_mode:
@@ -3441,7 +3853,53 @@ class ClaudeCodeRunner(ExternalCliRunner):
             claude_command.extend(["--resume", resume_session_id])
         elif continue_session:
             claude_command.append("--continue")
-        return f"{shlex.join(claude_command)} < {shlex.quote(WORKSPACE_IN_CONTAINER + '/' + TEICH_PROMPT_FILE_NAME)}"
+        prompt_path = shlex.quote(WORKSPACE_IN_CONTAINER + "/" + TEICH_PROMPT_FILE_NAME)
+        interactive_command = f"exec {shlex.join(claude_command)} \"$(cat {prompt_path})\""
+        return f"script -qfec {shlex.quote(interactive_command)} /dev/null"
+
+    def _build_external_docker_base_command(
+        self,
+        workspace: Path,
+        home_dir: Path,
+        container_name: str,
+        *,
+        detached: bool = False,
+    ) -> list[str]:
+        command = super()._build_external_docker_base_command(
+            workspace,
+            home_dir,
+            container_name,
+            detached=detached,
+        )
+        state_path = home_dir / CLAUDE_STATE_FILE_NAME
+        command[-1:-1] = ["-v", f"{state_path}:{CLAUDE_STATE_IN_CONTAINER}"]
+        if not detached:
+            command.insert(2, "-i")
+        return command
+
+    def _build_external_exec_command(
+        self,
+        container_name: str,
+        *,
+        continue_session: bool = False,
+        resume_session_id: str | None = None,
+        model_override: str | None = None,
+    ) -> list[str]:
+        command = super()._build_external_exec_command(
+            container_name,
+            continue_session=continue_session,
+            resume_session_id=resume_session_id,
+        )
+        if model_override is not None:
+            command[-1] = self._wrap_external_shell_command(
+                self._build_shell_command(
+                    continue_session=continue_session,
+                    resume_session_id=resume_session_id,
+                    model_override=model_override,
+                )
+            )
+        command.insert(2, "-i")
+        return command
 
     def _build_external_command(
         self,
@@ -3451,20 +3909,37 @@ class ClaudeCodeRunner(ExternalCliRunner):
         *,
         continue_session: bool = False,
         resume_session_id: str | None = None,
+        model_override: str | None = None,
     ) -> list[str]:
         if not self._needs_openrouter_model_proxy():
-            return super()._build_external_command(
-                workspace,
-                home_dir,
-                container_name,
-                continue_session=continue_session,
-                resume_session_id=resume_session_id,
+            if model_override is None:
+                return super()._build_external_command(
+                    workspace,
+                    home_dir,
+                    container_name,
+                    continue_session=continue_session,
+                    resume_session_id=resume_session_id,
+                )
+            command = self._build_external_docker_base_command(workspace, home_dir, container_name)
+            command.extend(
+                [
+                    "bash",
+                    "-lc",
+                    self._wrap_external_shell_command(
+                        self._build_shell_command(
+                            continue_session=continue_session,
+                            resume_session_id=resume_session_id,
+                            model_override=model_override,
+                        )
+                    ),
+                ]
             )
+            return command
         self._write_openrouter_proxy(home_dir)
         command = self._build_external_docker_base_command(workspace, home_dir, container_name)
         shell_command = self._wrap_external_shell_command(
             f"{self._openrouter_proxy_shell_prefix()}"
-            f"{self._build_shell_command(continue_session=continue_session, resume_session_id=resume_session_id)}"
+            f"{self._build_shell_command(continue_session=continue_session, resume_session_id=resume_session_id, model_override=model_override)}"
         )
         command.extend(
             [
@@ -3499,6 +3974,23 @@ class ClaudeCodeRunner(ExternalCliRunner):
                 return session_id.strip()
         return None
 
+    def _native_interactive_turns_complete(
+        self,
+        trace_path: Path,
+        turn_prompts: list[str],
+    ) -> bool:
+        events = _read_jsonl_dict_events(trace_path)
+        if not events:
+            return False
+        completed_turn_markers = sum(
+            1
+            for event in events
+            if event.get("type") == "system" and event.get("subtype") == "turn_duration"
+        )
+        if completed_turn_markers < len(turn_prompts):
+            return False
+        return self._trace_contains_completed_turns(trace_path, turn_prompts)
+
     def _run_native_process_with_progress(
         self,
         command: list[str],
@@ -3510,14 +4002,19 @@ class ClaudeCodeRunner(ExternalCliRunner):
         started_at: datetime,
         progress_callback: SessionProgressCallback | None,
         progress_base: SessionProgressUpdate | None,
+        expected_turns: list[str] | None = None,
+        remove_container_on_error: bool = True,
     ) -> tuple[str, str]:
         process: subprocess.Popen[str] | None = None
         stdout_handle = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
         stderr_handle = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
+        exit_requested_at: float | None = None
+        exit_enter_repeated = False
         try:
             try:
                 process = subprocess.Popen(
                     command,
+                    stdin=subprocess.PIPE,
                     stdout=stdout_handle,
                     stderr=stderr_handle,
                     **TEXT_SUBPROCESS_KWARGS,
@@ -3566,6 +4063,21 @@ class ClaudeCodeRunner(ExternalCliRunner):
                                         metrics=metrics,
                                     )
                                 )
+                            if (
+                                expected_turns
+                                and exit_requested_at is None
+                                and self._native_interactive_turns_complete(
+                                    trace_path,
+                                    expected_turns,
+                                )
+                            ):
+                                if process.stdin is None:
+                                    raise RuntimeError(
+                                        "Claude interactive process has no stdin for graceful exit"
+                                    )
+                                process.stdin.write("/exit\r")
+                                process.stdin.flush()
+                                exit_requested_at = time.monotonic()
                 elif progress_callback and progress_base and time.monotonic() - last_heartbeat >= 5.0:
                     last_heartbeat = time.monotonic()
                     progress_callback(
@@ -3581,6 +4093,15 @@ class ClaudeCodeRunner(ExternalCliRunner):
                             details="waiting for Claude Code trace",
                         )
                     )
+
+                if exit_requested_at is not None and process.stdin is not None:
+                    exit_wait = time.monotonic() - exit_requested_at
+                    if exit_wait >= 2.0 and not exit_enter_repeated:
+                        process.stdin.write("\r")
+                        process.stdin.flush()
+                        exit_enter_repeated = True
+                    if exit_wait >= 10.0:
+                        process.terminate()
 
                 if return_code is not None:
                     stdout_handle.flush()
@@ -3604,7 +4125,11 @@ class ClaudeCodeRunner(ExternalCliRunner):
                 time.sleep(0.5)
         except BaseException:
             if process is not None:
-                self._terminate_process(process, container_name)
+                self._terminate_process(
+                    process,
+                    container_name,
+                    remove_container=remove_container_on_error,
+                )
             raise
         finally:
             if process is not None:
@@ -3645,14 +4170,17 @@ class ClaudeCodeRunner(ExternalCliRunner):
                 (workspace / TEICH_PROMPT_FILE_NAME).write_text(turn_prompt, encoding="utf-8")
                 (workspace / TEICH_PROMPT_FILE_NAME).chmod(0o666)
                 expected_turns = turn_prompts[: turn_index + 1]
+                retry_models = self._claude_retry_models()
                 for attempt in range(AGENT_TURN_RETRY_LIMIT + 1):
                     continue_session = turn_index > 0 or attempt > 0
                     resume_session_id = native_resume_session_id if continue_session else None
+                    model_override = retry_models[min(attempt, len(retry_models) - 1)]
                     if len(turn_prompts) > 1:
                         command = self._build_external_exec_command(
                             container_name,
                             continue_session=continue_session,
                             resume_session_id=resume_session_id,
+                            model_override=model_override,
                         )
                     else:
                         command = self._build_external_command(
@@ -3661,10 +4189,12 @@ class ClaudeCodeRunner(ExternalCliRunner):
                             container_name,
                             continue_session=continue_session,
                             resume_session_id=resume_session_id,
+                            model_override=model_override,
                         )
                     process_error: subprocess.CalledProcessError | None = None
                     details = ""
                     try:
+                        self._wait_for_subscription_request_slot()
                         self._run_native_process_with_progress(
                             command,
                             container_name,
@@ -3674,6 +4204,8 @@ class ClaudeCodeRunner(ExternalCliRunner):
                             started_at=started_at,
                             progress_callback=progress_callback,
                             progress_base=progress_base,
+                            expected_turns=expected_turns,
+                            remove_container_on_error=len(turn_prompts) <= 1,
                         )
                     except subprocess.CalledProcessError as exc:
                         process_error = exc
@@ -3717,6 +4249,7 @@ class ClaudeCodeRunner(ExternalCliRunner):
                 self._discard_output_file(trace_path)
                 failure_trace_saved = True
                 raise RuntimeError(f"Session {session_id[:8]} stopped before completing all Claude Code turns")
+            self._finalize_trace_export(trace_path, prompt_input)
             self._copy_workspace_snapshot(workspace, self._sandbox_destination(trace_path))
             return trace_path
         except BaseException:
@@ -4215,7 +4748,7 @@ class HermesRunner(ExternalCliRunner):
                         final_exports = self._export_completed_hermes_state_sessions(home_dir, workspace, turn_prompts)
                         parsed_session_id = self._parse_hermes_stdout_session_id("\n".join([*stdout_parts, stdout]))
                         destination = (
-                            final_exports.get(parsed_session_id)
+                            (final_exports.get(parsed_session_id) if parsed_session_id else None)
                             or next((path for sid, path in final_exports.items() if sid.startswith(session_id)), None)
                             or next(
                                 (path for sid, path in final_exports.items() if self._trace_has_no_parent(path)),
@@ -4249,15 +4782,19 @@ class HermesRunner(ExternalCliRunner):
             if not final_exports:
                 raise RuntimeError(f"Session {session_id[:8]} failed: Hermes did not write any state.db sessions")
             parsed_session_id = self._parse_hermes_stdout_session_id("\n".join(stdout_parts))
-            destination = (
-                final_exports.get(parsed_session_id)
-                or next((path for sid, path in final_exports.items() if sid.startswith(session_id)), None)
-                or next(
-                    (path for sid, path in final_exports.items() if self._trace_has_no_parent(path)),
+            destination = final_exports.get(parsed_session_id) if parsed_session_id else None
+            if destination is None:
+                destination = next(
+                    (path for sid, path in final_exports.items() if sid.startswith(session_id)),
                     None,
                 )
-                or next(iter(final_exports.values()), fallback_destination)
-            )
+            if destination is None:
+                destination = next(
+                    (path for path in final_exports.values() if self._trace_has_no_parent(path)),
+                    None,
+                )
+            if destination is None:
+                destination = next(iter(final_exports.values()), fallback_destination)
             self._copy_workspace_snapshot(workspace, self._sandbox_destination(destination))
             return destination
         except BaseException:
@@ -4299,6 +4836,37 @@ class ChatRunner(DockerRuntimeRunner):
     def __init__(self, config: Config):
         self.config = config
         self.image_name = RUNTIME_IMAGE_NAME
+        self._chat_cancel_events: dict[int, threading.Event] = {}
+        self._chat_cancel_lock = threading.Lock()
+
+    def _register_chat_cancel_event(self, cancel_event: threading.Event) -> None:
+        thread_id = threading.get_ident()
+        with self._chat_cancel_lock:
+            self._chat_cancel_events[thread_id] = cancel_event
+
+    def _unregister_chat_cancel_event(self) -> None:
+        thread_id = threading.get_ident()
+        with self._chat_cancel_lock:
+            self._chat_cancel_events.pop(thread_id, None)
+
+    def _chat_batch_cancelled(self) -> bool:
+        thread_id = threading.get_ident()
+        with self._chat_cancel_lock:
+            cancel_event = self._chat_cancel_events.get(thread_id)
+        return cancel_event is not None and cancel_event.is_set()
+
+    def _raise_if_chat_batch_cancelled(self) -> None:
+        if self._chat_batch_cancelled():
+            raise RuntimeError("Chat batch was cancelled before this response could be saved.")
+
+    def _terminate_active_processes(self) -> None:
+        # Chat requests run in Python worker threads rather than child
+        # processes. Signal every live batch so it stops before another API
+        # turn or output write once the in-flight socket call returns.
+        with self._chat_cancel_lock:
+            cancel_events = list(self._chat_cancel_events.values())
+        for cancel_event in cancel_events:
+            cancel_event.set()
 
     def _default_base_url(self) -> str:
         provider = self.config.api.provider.strip().lower()
@@ -4395,29 +4963,37 @@ class ChatRunner(DockerRuntimeRunner):
         if isinstance(payload, dict):
             summary = payload.get("summary")
             if isinstance(summary, list):
-                parts = [
-                    item.get("text", "").strip()
-                    for item in summary
-                    if isinstance(item, dict) and isinstance(item.get("text"), str) and item.get("text").strip()
-                ]
+                parts: list[str] = []
+                for item in summary:
+                    if not isinstance(item, dict):
+                        continue
+                    item_text = item.get("text")
+                    if isinstance(item_text, str) and item_text.strip():
+                        parts.append(item_text.strip())
                 if parts:
                     return "\n\n".join(parts)
             text = payload.get("text")
             if isinstance(text, str) and text.strip():
                 return text.strip()
         if isinstance(payload, list):
-            parts = [
+            reasoning_candidates = [
                 ChatRunner._extract_reasoning_text(item)
                 for item in payload
             ]
-            merged = [part for part in parts if isinstance(part, str) and part.strip()]
+            merged = [
+                part
+                for part in reasoning_candidates
+                if isinstance(part, str) and part.strip()
+            ]
             if merged:
                 return "\n\n".join(merged)
         return None
 
     def _parse_chat_response(self, payload: dict[str, Any]) -> tuple[str, str | None, dict[str, Any] | None, str]:
-        model = payload.get("model") if isinstance(payload.get("model"), str) and payload.get("model") else self.config.get_effective_model()
-        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+        raw_model = payload.get("model")
+        model = raw_model if isinstance(raw_model, str) and raw_model else self.config.get_effective_model()
+        raw_usage = payload.get("usage")
+        usage = raw_usage if isinstance(raw_usage, dict) else None
         if self._wire_api() in {"completions", "chat_completions", "chat-completions", "openai-completions"}:
             choices = payload.get("choices")
             if not isinstance(choices, list) or not choices:
@@ -4460,12 +5036,18 @@ class ChatRunner(DockerRuntimeRunner):
             return None
         input_tokens = TraceMetrics._int_value(usage.get("input") or usage.get("prompt_tokens") or usage.get("input_tokens"))
         output_tokens = TraceMetrics._int_value(usage.get("output") or usage.get("completion_tokens") or usage.get("output_tokens"))
+        output_token_details = usage.get("output_tokens_details")
+        if not isinstance(output_token_details, dict):
+            output_token_details = {}
+        completion_token_details = usage.get("completion_tokens_details")
+        if not isinstance(completion_token_details, dict):
+            completion_token_details = {}
         reasoning_tokens = TraceMetrics._int_value(
             usage.get("reasoning")
             or usage.get("reasoning_tokens")
             or usage.get("reasoning_output_tokens")
-            or (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
-            or (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+            or output_token_details.get("reasoning_tokens")
+            or completion_token_details.get("reasoning_tokens")
         )
         prompt_token_details = usage.get("prompt_tokens_details")
         if not isinstance(prompt_token_details, dict):
@@ -4480,11 +5062,13 @@ class ChatRunner(DockerRuntimeRunner):
             or prompt_token_details.get("cache_write_tokens")
         )
         total_tokens = TraceMetrics._int_value(usage.get("totalTokens") or usage.get("total_tokens"))
-        normalized = {
+        normalized: dict[str, Any] = {
             "input": input_tokens,
             "output": output_tokens,
             "reasoning": reasoning_tokens,
-            "totalTokens": total_tokens or (input_tokens + output_tokens + reasoning_tokens),
+            # OpenAI-compatible APIs report reasoning as a subset of output
+            # tokens. Do not count that subset twice when total_tokens is absent.
+            "totalTokens": total_tokens or (input_tokens + output_tokens),
         }
         if cache_read_tokens:
             normalized["cacheRead"] = cache_read_tokens
@@ -4583,6 +5167,7 @@ class ChatRunner(DockerRuntimeRunner):
         history: list[dict[str, str]] | None = None,
         system_prompt: str | None = None,
     ) -> tuple[str, str | None, dict[str, Any] | None, str]:
+        self._raise_if_chat_batch_cancelled()
         body = self._chat_request_body(prompt, history, system_prompt)
         request = Request(
             self._chat_endpoint(),
@@ -4600,6 +5185,7 @@ class ChatRunner(DockerRuntimeRunner):
             raise RuntimeError(f"Chat request failed: {exc.reason}") from exc
         except json.JSONDecodeError as exc:
             raise RuntimeError("Chat request returned invalid JSON.") from exc
+        self._raise_if_chat_batch_cancelled()
         payload = self._raise_for_chat_api_error(payload)
         content, thinking, usage, model = self._parse_chat_response(payload)
         if not content and not thinking:
@@ -4670,9 +5256,12 @@ class ChatRunner(DockerRuntimeRunner):
         return row
 
     @staticmethod
-    def _merge_usage_totals(usages: list[dict[str, Any] | None]) -> dict[str, Any] | None:
-        normalized_usages = [ChatRunner._normalize_usage(usage) for usage in usages if isinstance(usage, dict)]
-        normalized_usages = [usage for usage in normalized_usages if usage is not None]
+    def _merge_usage_totals(usages: Sequence[dict[str, Any] | None]) -> dict[str, Any] | None:
+        normalized_usages: list[dict[str, Any]] = []
+        for usage in usages:
+            normalized_usage = ChatRunner._normalize_usage(usage)
+            if normalized_usage is not None:
+                normalized_usages.append(normalized_usage)
         if not normalized_usages:
             return None
         totals: dict[str, Any] = {
@@ -4708,7 +5297,7 @@ class ChatRunner(DockerRuntimeRunner):
                     if isinstance(generation_id, str) and generation_id.strip()
                 )
         if not totals["totalTokens"]:
-            totals["totalTokens"] = totals["input"] + totals["output"] + totals["reasoning"]
+            totals["totalTokens"] = totals["input"] + totals["output"]
         if cache_read_tokens:
             totals["cacheRead"] = cache_read_tokens
         if cache_write_tokens:
@@ -4954,7 +5543,6 @@ class ChatRunner(DockerRuntimeRunner):
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt, "thinking": None})
         responses: list[str] = []
-        thinking_parts: list[str | None] = []
         usages: list[dict[str, Any] | None] = []
         model = self.config.get_effective_model()
 
@@ -4965,16 +5553,11 @@ class ChatRunner(DockerRuntimeRunner):
             history.append({"role": "user", "content": prompt})
             history.append({"role": "assistant", "content": content})
             responses.append(content)
-            thinking_parts.append(thinking)
             usages.append(usage)
 
-        thinking_text = "\n\n".join(part for part in thinking_parts if isinstance(part, str) and part.strip()) or None
         row: dict[str, Any] = {
             "messages": messages,
-            "prompt": prompt_input.prompt,
             "follow_up_prompts": prompt_input.follow_up_prompts,
-            "thinking": thinking_text,
-            "response": responses[-1] if responses else "",
             "responses": responses,
             "model": model,
             "provider": self.config.api.provider,
@@ -5001,7 +5584,6 @@ class ChatRunner(DockerRuntimeRunner):
         messages = self._chat_messages_from_row(existing_row, prompt_input)
         history = self._chat_history_from_messages(messages)
         responses = self._chat_row_responses(existing_row, messages)
-        thinking_parts = self._chat_thinking_parts_from_messages(messages)
         usages: list[dict[str, Any] | None] = [
             existing_row.get("usage") if isinstance(existing_row.get("usage"), dict) else None
         ]
@@ -5015,12 +5597,10 @@ class ChatRunner(DockerRuntimeRunner):
             history.append({"role": "user", "content": prompt})
             history.append({"role": "assistant", "content": content})
             responses.append(content)
-            if isinstance(thinking, str) and thinking.strip():
-                thinking_parts.append(thinking.strip())
             usages.append(usage)
 
-        thinking_text = "\n\n".join(thinking_parts) or None
-        metadata = existing_row.get("metadata") if isinstance(existing_row.get("metadata"), dict) else {}
+        raw_metadata = existing_row.get("metadata")
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
         metadata = {
             **metadata,
             "trace_type": "chat",
@@ -5030,10 +5610,7 @@ class ChatRunner(DockerRuntimeRunner):
         }
         row = {
             "messages": messages,
-            "prompt": prompt_input.prompt,
             "follow_up_prompts": prompt_input.follow_up_prompts,
-            "thinking": thinking_text,
-            "response": responses[-1] if responses else "",
             "responses": responses,
             "model": model,
             "provider": self.config.api.provider,
@@ -5051,8 +5628,10 @@ class ChatRunner(DockerRuntimeRunner):
         append_lock: threading.Lock | None,
     ) -> dict[str, Any]:
         training_row = self._request_chat_conversation(prompt_input)
+        self._raise_if_chat_batch_cancelled()
         if append_lock is not None:
             with append_lock:
+                self._raise_if_chat_batch_cancelled()
                 rows = self._read_chat_training_rows(destination)
                 if not self._chat_rows_include_completed_prompt(rows, prompt_input):
                     self._append_chat_training_row(destination, training_row)
@@ -5246,15 +5825,19 @@ class ChatRunner(DockerRuntimeRunner):
                             datetime.now(timezone.utc),
                             time.monotonic() + self.config.timeout_seconds,
                         )
-                    self._run_chat_prompt_task(
-                        f"prompt-{prompt_index}",
-                        prompt_index,
-                        total_prompts,
-                        prompt_input,
-                        destination,
-                        progress_callback,
-                        append_lock,
-                    )
+                    self._register_chat_cancel_event(stop_event)
+                    try:
+                        self._run_chat_prompt_task(
+                            f"prompt-{prompt_index}",
+                            prompt_index,
+                            total_prompts,
+                            prompt_input,
+                            destination,
+                            progress_callback,
+                            append_lock,
+                        )
+                    finally:
+                        self._unregister_chat_cancel_event()
                 except Exception as exc:
                     with error_lock:
                         errors.append(exc)
@@ -5277,6 +5860,7 @@ class ChatRunner(DockerRuntimeRunner):
                     for prompt_index, (prompt_input, started_at, deadline) in running.items():
                         if now >= deadline:
                             timed_out = (prompt_index, prompt_input, started_at)
+                            stop_event.set()
                             break
                 if timed_out is not None:
                     prompt_index, prompt_input, started_at = timed_out
@@ -5286,7 +5870,6 @@ class ChatRunner(DockerRuntimeRunner):
                     )
                     with error_lock:
                         errors.append(error)
-                    stop_event.set()
                     if progress_callback:
                         progress_callback(
                             SessionProgressUpdate(
@@ -5638,78 +6221,6 @@ class PiRunner(DockerRuntimeRunner):
         shutil.copyfile(source_path, destination)
 
     @staticmethod
-    def _prompt_input_system_prompt(prompt_input: PromptInput | None) -> str | None:
-        if prompt_input is None or not isinstance(prompt_input.system, str):
-            return None
-        system_prompt = prompt_input.system.strip()
-        return system_prompt or None
-
-    @classmethod
-    def _pi_trace_includes_system_prompt(cls, trace_path: Path, system_prompt: str) -> bool:
-        expected = system_prompt.strip()
-        if not expected:
-            return True
-        try:
-            with trace_path.open("r", encoding="utf-8") as source:
-                for raw_line in source:
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    event = json.loads(line)
-                    if not isinstance(event, dict):
-                        continue
-                    if event.get("type") == "custom" and event.get("customType") == PI_SYSTEM_PROMPT_CUSTOM_TYPE:
-                        data = event.get("data")
-                        recorded = data.get("systemPrompt") if isinstance(data, dict) else None
-                        if isinstance(recorded, str) and recorded.strip() == expected:
-                            return True
-                        continue
-                    if event.get("type") != "message":
-                        continue
-                    payload = event.get("message")
-                    if not isinstance(payload, dict) or payload.get("role") not in {"system", "developer"}:
-                        continue
-                    if cls._pi_first_text(payload.get("content")).strip() == expected:
-                        return True
-        except (OSError, json.JSONDecodeError):
-            return False
-        return False
-
-    @staticmethod
-    def _pi_first_text(content: Any) -> str:
-        if isinstance(content, str):
-            return content
-        if not isinstance(content, list):
-            return ""
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") != "text":
-                continue
-            text = block.get("text")
-            if isinstance(text, str):
-                return text
-        return ""
-
-    def _append_pi_system_prompt_metadata(self, trace_path: Path, prompt_input: PromptInput | None) -> None:
-        system_prompt = self._prompt_input_system_prompt(prompt_input)
-        if not system_prompt or self._pi_trace_includes_system_prompt(trace_path, system_prompt):
-            return
-        event = {
-            "type": "custom",
-            "id": f"teich-system-{uuid.uuid4().hex[:8]}",
-            "parentId": None,
-            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "customType": PI_SYSTEM_PROMPT_CUSTOM_TYPE,
-            "data": {
-                "systemPrompt": system_prompt,
-                "source": "teich",
-            },
-        }
-        with trace_path.open("a", encoding="utf-8") as destination:
-            destination.write(json.dumps(event, separators=(",", ":")) + "\n")
-
-    @staticmethod
     def _pi_trace_includes_available_tools(trace_path: Path) -> bool:
         try:
             with trace_path.open("r", encoding="utf-8") as source:
@@ -5749,7 +6260,7 @@ class PiRunner(DockerRuntimeRunner):
             destination.write(json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n")
 
     def _finalize_trace_export(self, trace_path: Path, prompt_input: PromptInput | None = None) -> None:
-        self._append_pi_system_prompt_metadata(trace_path, prompt_input)
+        super()._finalize_trace_export(trace_path, prompt_input)
         self._append_pi_available_tools_metadata(trace_path)
 
     def _latest_session_source_file(self, session_id: str, session_dir: Path, started_at: datetime) -> Path:

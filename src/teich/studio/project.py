@@ -257,7 +257,8 @@ class ProjectState:
 
     def list_traces(self) -> list[dict[str, Any]]:
         data = self.read_config_data()
-        output = data.get("output") if isinstance(data.get("output"), dict) else {}
+        raw_output = data.get("output")
+        output = raw_output if isinstance(raw_output, dict) else {}
         traces_dir = self.resolve_path(output.get("traces_dir") or "./output")
         failures_dir = self.resolve_path(output.get("failures_dir") or "./failures")
         if not traces_dir.exists():
@@ -287,7 +288,8 @@ class ProjectState:
 
     def trace_file(self, name: str) -> Path:
         data = self.read_config_data()
-        output = data.get("output") if isinstance(data.get("output"), dict) else {}
+        raw_output = data.get("output")
+        output = raw_output if isinstance(raw_output, dict) else {}
         traces_dir = self.resolve_path(output.get("traces_dir") or "./output")
         candidate = (traces_dir / name).resolve()
         if not candidate.is_relative_to(traces_dir.resolve()):

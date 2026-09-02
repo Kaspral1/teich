@@ -1007,6 +1007,7 @@ function connectTerminalSocket(session, term) {
   socket.onmessage = (event) => {
     const message = JSON.parse(event.data);
     if (message.type === "stdout") {
+      if (message.reset) term.reset();
       term.write(message.data);
     } else if (message.type === "exit") {
       term.writeln(`\r\n\x1b[38;5;208m${message.detail || "Session ended."}\x1b[0m`);
@@ -1218,7 +1219,7 @@ function refreshDatasetIfVisible() {
 
 function featureColumns(preview) {
   const names = (preview.dataset.features || []).map((feature) => feature.name);
-  const preferred = ["prompt", "response", "model", "messages", "tools", "metadata"];
+  const preferred = ["prompt", "system", "response", "model", "messages", "tools", "metadata"];
   const columns = preferred.filter((name) => names.includes(name));
   for (const name of names) {
     if (!columns.includes(name) && columns.length < 7) columns.push(name);

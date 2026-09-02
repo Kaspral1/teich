@@ -47,6 +47,245 @@ trainer.train()
 
 Keep `packing=False` for this flow because packed datasets merge row boundaries before masking.
 
+## Live Gemma 4 Models
+
+For the live Google Gemma 4 instruction checkpoints, keep the chat template
+loaded from the selected model repository. The supported smoke-tested targets
+are:
+
+- `google/gemma-4-E4B-it`
+- `google/gemma-4-26B-A4B-it`
+- `google/gemma-4-31B-it`
+
+Gemma 4's thinking mode is a prompt protocol, so Teich resolves it for every
+row before rendering. Leave `enable_thinking` unset for the recommended auto
+mode:
+
+- a row containing assistant `reasoning_content`, `thinking`, or `reasoning`
+  becomes a thinking row;
+- a row without assistant reasoning becomes a non-thinking row;
+- thinking rows automatically receive `enable_thinking=True` and
+  `preserve_thinking=True`, preserving historical reasoning in multi-turn data;
+- a leading legacy `<|think|>` in system/developer content is removed and used
+  as a thinking-mode hint. `PrepareReport` records the migration, while triggers
+  in any other position are rejected.
+
+The live template, not the source data, inserts `<|think|>` into the system
+turn. The 26B-A4B and 31B generation prompts also insert an empty thought
+channel in non-thinking mode while E4B does not. Teich discovers that behavior
+from the loaded template and mirrors the prefix in completed SFT turns while
+keeping the synthetic prefix masked.
+
+Explicit `{"enable_thinking": True}` and `{"enable_thinking": False}` remain
+available when an entire source must be forced to one mode. Teich automatically
+enables history preservation for the explicit thinking case. Contradictions
+fail closed: forcing non-thinking on a reasoning-bearing row, or explicitly
+disabling `preserve_thinking` when historical reasoning would disappear,
+raises an error instead of producing inconsistent training text.
+
+Do not replace `tokenizer.chat_template` unless you are intentionally testing a
+maintained fork. Teich supervises the closing `<turn|>` token for completed
+Gemma responses while keeping system, user, tool-response, and generated prompt
+prefix context masked.
+
+Thinking and non-thinking examples can therefore be mixed in the same source
+without any template configuration:
+
+```python
+train_dataset, prep_report = prepare_data(
+    "username/mixed-gemma-traces",
+    tokenizer,
+    tokenize=True,
+    strict=True,
+    return_report=True,
+)
+```
+
+With `return_report=True`, inspect `prep_report.gemma4_modes` for the resolved
+thinking/non-thinking counts and
+`prep_report.gemma4_legacy_triggers_normalized` for migrated legacy rows.
+Source-level `chat_template_kwargs` are still useful as explicit policy
+overrides, but are no longer required merely to mix the two modes.
+
+`gemma4_example.py` uses the live remote template by default. Set
+`CHAT_TEMPLATE_PATH` only to opt into a local custom template. Its
+`GEMMA4_THINKING_MODE` defaults to `auto`; use `thinking` or `nonthinking` only
+to force a homogeneous source. The older `GEMMA4_ENABLE_THINKING` variable is
+still accepted for compatibility. Set `MODEL_REVISION` when a reproducible
+non-`main` revision is required. Set
+`HF_TOKEN` to an account that has accepted the Gemma repository terms when the
+checkpoint is not already available through the local Hugging Face login.
+
+The example keeps reasoning in its agent source and strips reasoning from its
+direct-chat source. Override those source policies with
+`AGENT_REASONING_POLICY` or `CHAT_REASONING_POLICY` when using datasets with a
+different contract. It prints the resolved Gemma mode counts, stripped-row
+count, and maximum token length before training. Do not add `<turn|>` to source
+messages: Teich derives and supervises the live template's completed-turn
+terminator automatically.
+
+Run the example in a dedicated, internally consistent Unsloth training
+environment and check it with `python -m pip check` before a long run. Teich's
+core environment does not pin the CUDA, PyTorch, Unsloth, and TRL stack because
+those versions depend on the host GPU and CUDA runtime.
+
+## Live Granite 4.2 Models
+
+Teich smoke-tests the released IBM checkpoints with their live remote chat
+template:
+
+- `ibm-granite/granite-4.2-3b`
+- `ibm-granite/granite-4.2-8b`
+- `ibm-granite/granite-4.2-30b`
+
+Granite 4.2 uses `<think>...</think>` reasoning and supports full thinking,
+non-thinking, and low-effort thinking. Leave `enable_thinking` unset during
+preparation for Teich's recommended per-row auto mode. Rows with structured
+assistant reasoning use thinking mode; direct rows use non-thinking mode and
+retain Granite's required `<think></think>` inference primer as masked context.
+The final answer and closing `<|im_end|>` remain supervised.
+
+The live template defaults `truncate_history_thinking=True` for inference to
+save context. That is unsafe as an SFT default because every assistant turn is
+a training target. Teich therefore supplies `truncate_history_thinking=False`
+while preparing Granite 4.2 rows. Explicitly requesting truncation fails closed
+when it would remove historical source reasoning. With `return_report=True`,
+inspect `prep_report.granite42_modes` for `thinking`, `nonthinking`, and
+`low_effort` row counts.
+
+For low-effort reasoning, use the live template's `low_effort=True` setting:
+
+```python
+train_dataset = prepare_data(
+    "username/granite42-reasoning-traces",
+    tokenizer,
+    chat_template_kwargs={"low_effort": True},
+    tokenize=True,
+    strict=True,
+)
+```
+
+`reasoning_effort="low"` is accepted as a compatibility alias and normalized
+to `low_effort=True` before the template is rendered.
+
+For true direct-instruction tuning from a reasoning-bearing source, strip the
+reasoning before rendering. Setting `train_on_reasoning=False` only masks its
+loss; it does not remove reasoning from causal context.
+
+```python
+train_dataset = prepare_data(
+    "username/granite42-direct-traces",
+    tokenizer,
+    reasoning_policy="strip",
+    tokenize=True,
+    strict=True,
+)
+```
+
+Do not add `<think>`, `<think></think>`, or `<|im_end|>` to source messages.
+The live template and Teich's per-row contract produce and mask those protocol
+tokens. Tool results remain masked by default, while assistant tool calls and
+their completed-turn `<|im_end|>` are supervised.
+
+`granite42_example.py` is a complete text-only LoRA example. It defaults to the
+8B checkpoint, uses Granite's per-row auto mode, and applies optional
+`GRANITE42_LOW_EFFORT=1` only to the reasoning-bearing agent source. Override
+`MODEL_NAME` to use the 3B or 30B checkpoint without changing the preparation
+contract.
+
+## Live Qwen 3.8 Models
+
+Qwen 3.8 has a different native contract and Teich does not apply Gemma's auto
+mode rules to it. The live `Qwen/Qwen3.8-27B` template defaults to thinking,
+defaults `reasoning_effort` to `xhigh`, and preserves historical
+`reasoning_content` unless `preserve_thinking=False` is supplied. To train its
+native reasoning behavior, retain those defaults or set only the desired
+effort:
+
+```python
+train_dataset = prepare_data(
+    "username/qwen38-reasoning-traces",
+    tokenizer,
+    chat_template_kwargs={"reasoning_effort": "medium"},
+    tokenize=True,
+    strict=True,
+)
+```
+
+Supported live efforts are `low`, `medium`, and `xhigh`. Continue to use
+`train_on_reasoning=True` in `mask_data()` when those reasoning tokens should
+receive loss.
+
+For direct instruction tuning from a dataset that still contains reasoning,
+remove the reasoning before rendering and explicitly select Qwen's
+non-thinking template mode:
+
+```python
+train_dataset, prep_report = prepare_data(
+    "username/mixed-source-traces",
+    tokenizer,
+    reasoning_policy="strip",
+    chat_template_kwargs={
+        "enable_thinking": False,
+        "preserve_thinking": False,
+    },
+    return_report=True,
+    tokenize=True,
+    strict=True,
+)
+```
+
+Qwen 3.8's non-thinking prompt contains an empty `<think>...</think>` primer.
+Teich keeps that inference-alignment prefix in the rendered text but masks it
+from loss. The final answer and closing `<|im_end|>` remain supervised.
+
+`qwen38_example.py` is a complete text-only LoRA example using the live
+multimodal tokenizer. It keeps thinking and history preservation on for the
+agent source, strips reasoning and disables thinking for the direct-chat
+source, and accepts `QWEN38_REASONING_EFFORT=low|medium|xhigh`.
+
+## Live Qwen 3.6 Models
+
+Qwen 3.6 uses a different contract from Qwen 3.8. It supports explicit
+`enable_thinking` and `preserve_thinking`, but its live template has no
+`reasoning_effort` control. The template normally keeps only reasoning related
+to the latest user message, so multi-turn reasoning SFT should explicitly set
+`preserve_thinking=True`:
+
+```python
+train_dataset = prepare_data(
+    "username/qwen36-agent-traces",
+    tokenizer,
+    chat_template_kwargs={
+        "enable_thinking": True,
+        "preserve_thinking": True,
+    },
+    tokenize=True,
+    strict=True,
+)
+```
+
+For a direct source, use `reasoning_policy="strip"` with
+`enable_thinking=False` and `preserve_thinking=False`. Qwen 3.6 does not use
+the older `/think` or `/nothink` soft switches; do not inject either into data.
+
+`qwen36_example.py` demonstrates both source policies with
+`Qwen/Qwen3.6-35B-A3B`. Override `MODEL_NAME=Qwen/Qwen3.6-27B` to use the dense
+checkpoint with the same preparation contract.
+
+## Source Reasoning Policy
+
+`reasoning_policy="keep"` is the default and leaves structured assistant
+reasoning for the loaded chat template to handle according to its own model
+contract. `reasoning_policy="strip"` removes normalized `reasoning_content`
+before rendering. This is deliberately independent of
+`mask_data(train_on_reasoning=False)`: masking keeps gold reasoning in the
+causal context, whereas stripping creates a true instruction-only example.
+
+The policy can be set per source in a mixed dataset. `PrepareReport` records
+the affected row and message counts in `reasoning_stripped_rows` and
+`reasoning_stripped_messages`.
+
 ## What `mask_data()` Does
 
 Before `mask_data()`, the trainer dataset usually contains:
@@ -76,7 +315,23 @@ Where:
 - prompt, user, system, developer, and tool-output context stays masked by default
 - assistant reasoning, final answers, and tool calls become supervised by default
 
+When the tokenizer supports batched offset mappings, `mask_data()` tokenizes
+each dataset-map batch together instead of issuing one tokenizer call per row.
+
 For Qwen-style templates, the initial `<think>` tag is intentionally included in supervision.
+
+For Gemma 4, Teich supervises exactly one closing `<turn|>` for a completed
+model turn whenever reasoning, final-answer, or tool-call supervision is
+enabled for that turn. It does not add a second terminator inside a continuing
+tool-call chain. The terminator remains a target even when the final answer is
+masked, so reasoning-only and tool-only fine-tunes still learn to stop. Empty
+final assistant messages and unresolved tool-result prefixes do not create
+synthetic `final_answer` spans; the stopping token is attached only after an
+actual enabled target is selected.
+
+For Granite 4.2, the equivalent stopping token is `<|im_end|>`. Each enabled
+assistant reasoning, answer, or tool-call target retains its completed-turn
+terminator, including reasoning-only and tool-only masking policies.
 
 ## Masking Policy
 

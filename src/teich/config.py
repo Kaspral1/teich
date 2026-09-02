@@ -8,10 +8,10 @@ import os
 from pathlib import Path
 import re
 import sys
-from typing import Any
+from typing import Any, cast
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 GITHUB_REPO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -63,7 +63,13 @@ def _raise_csv_field_limit() -> None:
             limit //= 10
 
 
-class MCPConfig(BaseModel):
+class StrictConfigModel(BaseModel):
+    """Base for user-authored configuration that rejects misspelled keys."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class MCPConfig(StrictConfigModel):
     """MCP server configuration."""
     name: str
     command: str | None = None
@@ -75,8 +81,8 @@ class MCPConfig(BaseModel):
     bearer_token_env_var: str | None = None
     http_headers: dict[str, str] = Field(default_factory=dict)
     env_http_headers: dict[str, str] = Field(default_factory=dict)
-    startup_timeout_sec: int | None = None
-    tool_timeout_sec: int | None = None
+    startup_timeout_sec: int | None = Field(default=None, gt=0)
+    tool_timeout_sec: int | None = Field(default=None, gt=0)
     enabled: bool = True
     required: bool = False
     enabled_tools: list[str] = Field(default_factory=list)
@@ -95,7 +101,7 @@ class MCPConfig(BaseModel):
         return self
 
 
-class APIConfig(BaseModel):
+class APIConfig(StrictConfigModel):
     """API configuration for OpenAI-compatible endpoints."""
     provider: str = "openai"  # openai, openrouter, azure, etc.
     base_url: str | None = None  # e.g., https://openrouter.ai/api/v1
@@ -103,7 +109,7 @@ class APIConfig(BaseModel):
     wire_api: str = "responses"
 
 
-class LangfuseConfig(BaseModel):
+class LangfuseConfig(StrictConfigModel):
     """Langfuse tracing credentials, set under ``agent.langfuse``.
 
     When enabled, Teich wires each agent's Langfuse integration (the Codex
@@ -135,7 +141,7 @@ class LangfuseConfig(BaseModel):
         return self
 
 
-class CodexAuthConfig(BaseModel):
+class CodexAuthConfig(StrictConfigModel):
     """Codex ChatGPT-subscription auth handling.
 
     When ``use_host_auth`` is enabled, Teich seeds an ``auth.json`` snapshot
@@ -155,7 +161,7 @@ class CodexAuthConfig(BaseModel):
     broker_port: int = Field(default=0, ge=0, le=65535)
 
 
-class ClaudeConfig(BaseModel):
+class ClaudeConfig(StrictConfigModel):
     """Claude Code-specific settings, set under ``agent.claude``.
 
     Subscription auth (Pro/Max): when a long-lived OAuth token is available —
@@ -169,19 +175,42 @@ class ClaudeConfig(BaseModel):
     pay-per-token API credits, and the token is safe to share across any
     ``max_concurrency`` (no rotation, unlike Codex).
 
-    ``fallback_model``, ``always_thinking``, and ``max_thinking_tokens`` are
-    Claude Code passthroughs: ``--fallback-model`` (a single model/alias or a
-    list; Claude Code uses up to 3 after dedup), ``alwaysThinkingEnabled`` in
-    the container's ``~/.claude/settings.json``, and the ``MAX_THINKING_TOKENS``
-    container env (0 disables thinking on models that allow it).
+    ``subscription_request_delay_seconds`` spaces request starts when
+    subscription auth is active, including follow-ups and Teich retries. It is
+    ignored for API-key and custom-base-URL runs. The remaining fields are
+    Claude Code controls: ``fallback_model`` is a single model/alias or list
+    that Teich tries across interactive batch retries (up to 3 after dedup),
+    ``always_thinking`` and ``show_thinking_summaries`` default to true and become
+    ``alwaysThinkingEnabled`` and ``showThinkingSummaries`` in the container's
+    ``~/.claude/settings.json``. Claude Code batch generation runs through a
+    real interactive PTY because readable summaries are unavailable in
+    non-interactive ``-p`` mode. Set either field to false to opt out.
+    ``max_thinking_tokens`` becomes the ``MAX_THINKING_TOKENS`` container env
+    (0 disables thinking where allowed).
     """
     oauth_token: str | None = None
+    subscription_request_delay_seconds: float = Field(default=45.0, ge=0)
     fallback_model: str | list[str] | None = None
-    always_thinking: bool | None = None
+    always_thinking: bool | None = True
+    show_thinking_summaries: bool | None = True
     max_thinking_tokens: int | None = Field(default=None, ge=0)
 
 
-class AgentConfig(BaseModel):
+class HarnessContextCaptureConfig(StrictConfigModel):
+    """Safe simulated capture of client-visible harness instructions and tools.
+
+    When enabled, Teich points the configured harness at a local fake provider
+    for one preflight request before generation. No real provider request or
+    subscription quota is used. The captured context is appended to every raw
+    trace and exposed as the top-level ``system`` field during conversion.
+    """
+
+    enabled: bool = False
+    required: bool = True
+    timeout_seconds: int = Field(default=45, gt=0, le=300)
+
+
+class AgentConfig(StrictConfigModel):
     """Agent runtime selection."""
     provider: str = "codex"
     # Langfuse tracing, applied to every agent that supports it (Codex, Claude).
@@ -190,17 +219,20 @@ class AgentConfig(BaseModel):
     claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
 
 
-class ModelConfig(BaseModel):
+class ModelConfig(StrictConfigModel):
     """Model configuration."""
     model: str = "codex-mini-latest"
     approval_policy: str = "never"
     sandbox: str = "danger-full-access"
     reasoning_effort: str | None = None
     reasoning_summary: str | None = None
+    reasoning_summaries_enabled: bool | None = None
     service_tier: str | None = None
     context_length: int | None = None
     approval_mode: str | None = "none"
-    pi_model_overrides: dict[str, object] = Field(default_factory=lambda: {"maxTokens": 131072})
+    pi_model_overrides: dict[str, object] = Field(
+        default_factory=lambda: {"maxTokens": cast(object, 131072)}
+    )
 
     @model_validator(mode="after")
     def normalize_legacy_approval_mode(self) -> ModelConfig:
@@ -214,7 +246,7 @@ class ModelConfig(BaseModel):
         return self
 
 
-class OutputConfig(BaseModel):
+class OutputConfig(StrictConfigModel):
     """Output configuration."""
     traces_dir: Path = Field(default=Path("./output"))
     sandbox_dir: Path = Field(default=Path("./sandbox"))
@@ -222,7 +254,7 @@ class OutputConfig(BaseModel):
     pretty_name: str = "Agentic Training Traces"
 
 
-class PublishConfig(BaseModel):
+class PublishConfig(StrictConfigModel):
     """Publishing configuration."""
     repo_id: str | None = None
     hf_token: str | None = None
@@ -241,7 +273,7 @@ class PublishConfig(BaseModel):
         return normalized
 
 
-class PromptInput(BaseModel):
+class PromptInput(StrictConfigModel):
     """Structured prompt input row."""
     image: str | None = None
     github_repo: str | None = None
@@ -311,7 +343,7 @@ class PromptInput(BaseModel):
         return [self.prompt, *self.follow_up_prompts]
 
 
-class Config(BaseModel):
+class Config(StrictConfigModel):
     """Main configuration."""
     agent: AgentConfig = Field(default_factory=AgentConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
@@ -322,9 +354,12 @@ class Config(BaseModel):
     output: OutputConfig = Field(default_factory=OutputConfig)
     publish: PublishConfig = Field(default_factory=PublishConfig)
     max_concurrency: int = Field(default=1, ge=1)
-    timeout_seconds: int = 600
+    timeout_seconds: int = Field(default=600, gt=0)
     openai_api_key: str | None = None
     developer_instructions: str | None = None
+    capture_harness_context: HarnessContextCaptureConfig = Field(
+        default_factory=HarnessContextCaptureConfig
+    )
 
     @field_validator("prompts_file")
     @classmethod
@@ -638,13 +673,7 @@ class Config(BaseModel):
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError(f"{source} has an empty or missing 'prompt' value")
         try:
-            return PromptInput(
-                image=normalized_row.get("image"),
-                github_repo=normalized_row.get("github_repo"),
-                system=normalized_row.get("system"),
-                prompt=prompt,
-                follow_up_prompts=normalized_row.get("follow_up_prompts"),
-            )
+            return PromptInput.model_validate(normalized_row)
         except ValueError as exc:
             raise ValueError(f"Invalid {source}: {exc}") from exc
 

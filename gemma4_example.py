@@ -1,15 +1,45 @@
 # -*- coding: utf-8 -*-
 import os
+
+# Gemma 4's fused-loss path has had silent zero-gradient failures with
+# response-only labels. Prefer the correctness path unless the caller has
+# explicitly validated and enabled the fused implementation.
+os.environ.setdefault("UNSLOTH_RETURN_LOGITS", "1")
+
 from unsloth import FastModel
 from trl import SFTConfig, SFTTrainer
 from teich import mask_data, prepare_data
 
 MAX_SEQ_LEN = 16384
 MODEL_NAME = os.environ.get("MODEL_NAME", "google/gemma-4-26B-A4B-it")
+MODEL_REVISION = os.environ.get("MODEL_REVISION", "main")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "outputs/gemma-tool-sft")
 HUB_REPO_ID = os.environ.get("HUB_REPO_ID") or ""
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-CHAT_TEMPLATE_PATH = os.environ.get("CHAT_TEMPLATE_PATH") or "gemma-template.jinja"
+CHAT_TEMPLATE_PATH = os.environ.get("CHAT_TEMPLATE_PATH")
+AGENT_REASONING_POLICY = os.environ.get("AGENT_REASONING_POLICY", "keep").strip().lower()
+CHAT_REASONING_POLICY = os.environ.get("CHAT_REASONING_POLICY", "strip").strip().lower()
+for policy_name, policy in {
+    "AGENT_REASONING_POLICY": AGENT_REASONING_POLICY,
+    "CHAT_REASONING_POLICY": CHAT_REASONING_POLICY,
+}.items():
+    if policy not in {"keep", "strip"}:
+        raise ValueError(f"{policy_name} must be keep or strip")
+_thinking_mode = os.environ.get("GEMMA4_THINKING_MODE")
+_legacy_thinking = os.environ.get("GEMMA4_ENABLE_THINKING")
+if _thinking_mode is None and _legacy_thinking is not None:
+    _thinking_mode = (
+        "nonthinking"
+        if _legacy_thinking.strip().lower() in {"0", "false", "no"}
+        else "thinking"
+    )
+GEMMA4_THINKING_MODE = (_thinking_mode or "auto").strip().lower().replace("-", "")
+if GEMMA4_THINKING_MODE not in {"auto", "thinking", "nonthinking"}:
+    raise ValueError("GEMMA4_THINKING_MODE must be auto, thinking, or nonthinking")
+CHAT_TEMPLATE_KWARGS = {
+    "thinking": {"enable_thinking": True},
+    "nonthinking": {"enable_thinking": False},
+}.get(GEMMA4_THINKING_MODE)
 
 model, tokenizer = FastModel.from_pretrained(
     model_name=MODEL_NAME,
@@ -17,8 +47,12 @@ model, tokenizer = FastModel.from_pretrained(
     load_in_4bit=False,
     load_in_8bit=False,
     full_finetuning=False,
+    revision=MODEL_REVISION,
+    token=HF_TOKEN or None,
 )
 
+# By default, retain the template shipped by the selected live model revision.
+# CHAT_TEMPLATE_PATH is an explicit escape hatch for controlled experiments.
 if CHAT_TEMPLATE_PATH:
     with open(CHAT_TEMPLATE_PATH, "r", encoding="utf-8") as f:
         custom_chat_template = f.read()
@@ -40,31 +74,51 @@ model = FastModel.get_peft_model(
     random_state = 3407,
 )
 
-train_dataset = prepare_data(
+train_dataset, prep_report = prepare_data(
     {
         "max_examples": 30,
         "agent": {
             "source": "armand0e/ag-datagen-v2-test",
             "percentage": 80,
+            # Keep structured reasoning. In auto mode, Teich renders these as
+            # thinking rows and preserves reasoning across multi-turn history.
+            "reasoning_policy": AGENT_REASONING_POLICY,
         },
         "chat": {
             "source": "armand0e/DeepSeek-v4-Flash-Chat",
             "percentage": 20,
+            # Make this a true direct-instruction source even if an upstream
+            # row happens to contain reasoning fields. This differs from only
+            # masking reasoning loss, which would leave it in causal context.
+            "reasoning_policy": CHAT_REASONING_POLICY,
         },
     },
     tokenizer,
     split="train",
     hf_token=HF_TOKEN,
-    chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True},
+    # Auto mode classifies every Gemma 4 row independently. Reasoning-bearing
+    # rows enable thinking and preserve history; direct rows use the exact
+    # non-thinking inference prefix of the loaded live template.
+    chat_template_kwargs=CHAT_TEMPLATE_KWARGS,
     max_length=MAX_SEQ_LEN,
-    drop_oversized_examples=False,
+    oversized_policy="trim_followups",
     tokenize=True,
     strict=True,
+    return_report=True,
+)
+
+print(
+    "Prepared Gemma 4 modes:",
+    prep_report.gemma4_modes,
+    "| stripped reasoning rows:",
+    prep_report.reasoning_stripped_rows,
+    "| max tokens:",
+    prep_report.max_token_length,
 )
 
 trainer = SFTTrainer(
     model=model,
-    tokenizer=tokenizer,
+    processing_class=tokenizer,
     train_dataset=train_dataset,
     eval_dataset=None,
     args=SFTConfig(
@@ -97,6 +151,10 @@ trainer = mask_data(
     train_on_final_answers=True,
     train_on_tools=True,
 )
+
+# Teich keeps exactly one <turn|> target for each completed Gemma model turn
+# that has an enabled reasoning, answer, or tool-call target. Do not append a
+# terminator to dataset content manually.
 
 print(trainer.train_dataset.preview())
 

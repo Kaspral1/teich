@@ -36,15 +36,24 @@ agent:
   # Teich passes it into each container and withholds ANTHROPIC_API_KEY (an API
   # key silently wins over subscription auth inside Claude Code and would bill
   # the API). Usage counts against your plan's rate limits, not API credits,
-  # and the token is safe at any max_concurrency.
-  # fallback_model forwards as --fallback-model (a model or list, tried in
-  # order on overload); always_thinking writes alwaysThinkingEnabled into the
-  # container's ~/.claude/settings.json; max_thinking_tokens sets
-  # MAX_THINKING_TOKENS in the container (0 disables thinking where allowed).
+  # Teich spaces subscription request starts by 45 seconds by default to avoid
+  # hammering plan rate limits. This includes follow-ups and retries, is shared
+  # across concurrent workers, and is ignored for API-key/custom-base-URL runs.
+  # fallback_model is a model or list Teich switches to across interactive
+  # batch retries (Claude's own --fallback-model is print-mode-only). Studio
+  # starts with the configured primary model. Batch generation uses a real
+  # interactive PTY, and
+  # always_thinking/show_thinking_summaries default to true so readable summaries
+  # can reach Claude's native trace. Set either false to opt out. They write
+  # alwaysThinkingEnabled/showThinkingSummaries into ~/.claude/settings.json.
+  # max_thinking_tokens sets MAX_THINKING_TOKENS in the container (0 disables
+  # thinking where allowed).
   # claude:
   #   oauth_token: null               # prefer CLAUDE_CODE_OAUTH_TOKEN in the env
+  #   subscription_request_delay_seconds: 45  # 0 disables subscription pacing
   #   fallback_model: [sonnet, haiku]
   #   always_thinking: true
+  #   show_thinking_summaries: true
   #   max_thinking_tokens: null
 
   # Trace each agent session to Langfuse (https://langfuse.com). Works for Codex
@@ -85,6 +94,13 @@ model:
   # reasoning summaries in traces (Codex's default can emit empty summaries).
   # Leave null to use Codex's default.
   reasoning_summary: null
+
+  # Optional explicit Codex capability toggle, forwarded as
+  # model_supports_reasoning_summaries. Set true together with
+  # reasoning_summary: detailed when gathering the richest readable summaries,
+  # especially for custom provider/model IDs Codex cannot identify. This never
+  # decrypts or exposes the provider's hidden raw chain-of-thought.
+  reasoning_summaries_enabled: null
 
   # Optional Codex service tier. Set to "fast" to enable Codex fast mode: it
   # runs ~1.5x faster at a higher credit rate and requires ChatGPT subscription
@@ -194,3 +210,13 @@ openai_api_key: null
 #     call or edit, briefly explain what you're doing and why; after a command or
 #     test runs, state what you concluded before the next step.
 developer_instructions: null
+
+# Codex/Claude Code only. Simulate one request against Teich's local fake
+# provider before generation and append the client-visible harness instructions
+# and tool schemas to each raw trace. This never contacts the real provider and
+# never stores authentication headers or user messages. The converter exposes
+# the captured instructions as a top-level `system` column.
+capture_harness_context:
+  enabled: false
+  required: true
+  timeout_seconds: 45

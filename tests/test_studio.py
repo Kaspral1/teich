@@ -16,10 +16,17 @@ from fastapi.testclient import TestClient
 from teich.cli import _configure_studio_event_loop_policy
 from teich.config import Config
 from teich.extract import CURSOR_EXTRACTION_NOTICE
-from teich.runner import ClaudeCodeRunner, SessionProgressUpdate
+from teich.runner import ChatRunner, ClaudeCodeRunner, SessionProgressUpdate
 from teich.studio.events import summarize_chat_row, summarize_event, summarize_trace_events
+from teich.studio.extraction import ExtractionJob, ExtractionManager
 from teich.studio.generation import RUNNER_CLASSES, GenerationJob
-from teich.studio.interactive import InteractiveSession
+from teich.studio.interactive import (
+    SUBPROCESS_CREATE_NO_WINDOW,
+    EventLog,
+    InteractiveSession,
+    SessionManager,
+    TerminalBridge,
+)
 from teich.studio.project import ProjectState
 from teich.studio import server as server_module
 from teich.studio.server import (
@@ -66,6 +73,31 @@ def test_write_config_rejects_invalid(tmp_path):
     state.ensure_initialized()
     with pytest.raises(Exception):
         state.write_config_data({"max_concurrency": 0})
+
+
+def test_event_log_retains_a_bounded_absolute_sequence():
+    log = EventLog(max_events=3)
+    for index in range(5):
+        log.append({"kind": "test", "value": index})
+
+    assert [event["seq"] for event in log.snapshot()] == [2, 3, 4]
+    assert [event["value"] for event in log.wait_for(0, timeout=0)] == [2, 3, 4]
+    assert [event["value"] for event in log.wait_for(4, timeout=0)] == [4]
+
+
+def test_session_manager_prunes_old_completed_history():
+    manager = SessionManager()
+    manager._sessions = {
+        str(index): SimpleNamespace(status="saved")
+        for index in range(55)
+    }
+
+    with manager._lock:
+        manager._prune_locked()
+
+    assert len(manager._sessions) == 49
+    assert "0" not in manager._sessions
+    assert "54" in manager._sessions
 
 
 def test_prompts_round_trip(tmp_path):
@@ -538,6 +570,7 @@ def test_dataset_upload_endpoint_generates_readme_and_uploads_with_env_token(cli
         folder_path=str(output_dir),
         repo_type="dataset",
         private=False,
+        allow_patterns=["*.jsonl", "**/*.jsonl", "*.metadata.json", "**/*.metadata.json"],
         ignore_patterns=["partials/**", "failures/**", "README.md", "tools.json"],
     )
     mock_api.upload_folder.assert_called_once_with(
@@ -682,6 +715,63 @@ def test_dataset_row_update_replaces_structured_jsonl_line(client):
     assert rows[1] == updated
 
 
+def test_dataset_row_delete_removes_metadata_with_final_structured_row(client):
+    output_dir = client.project_dir / "output"
+    output_dir.mkdir()
+    trace = output_dir / "row.jsonl"
+    trace.write_text(
+        json.dumps({"prompt": "remove me", "response": "removed"}) + "\n",
+        encoding="utf-8",
+    )
+    metadata = trace.with_suffix(".metadata.json")
+    metadata.write_text(json.dumps({"session_id": "row"}), encoding="utf-8")
+
+    response = client.delete("/api/dataset-preview/rows/0")
+
+    assert response.status_code == 200
+    assert response.json()["mode"] == "line"
+    assert not trace.exists()
+    assert not metadata.exists()
+
+
+def test_dataset_row_edits_preserve_rows_beyond_previous_read_limit(client):
+    output_dir = client.project_dir / "output"
+    output_dir.mkdir()
+    trace = output_dir / "large-rows.jsonl"
+    original_rows = [
+        {
+            "prompt": f"prompt {index}",
+            "response": f"response {index}",
+        }
+        for index in range(5_002)
+    ]
+    trace.write_text(
+        "\n".join(json.dumps(row) for row in original_rows) + "\n",
+        encoding="utf-8",
+    )
+    updated = {
+        "prompt": "updated prompt",
+        "response": "updated response",
+        "metadata": {"source_file": "large-rows.jsonl", "source_line": 1},
+    }
+
+    update_response = client.put("/api/dataset-preview/rows/0", json={"row": updated})
+
+    assert update_response.status_code == 200
+    rows_after_update = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    assert len(rows_after_update) == 5_002
+    assert rows_after_update[0] == updated
+    assert rows_after_update[-1] == original_rows[-1]
+
+    delete_response = client.delete("/api/dataset-preview/rows/0")
+
+    assert delete_response.status_code == 200
+    rows_after_delete = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    assert len(rows_after_delete) == 5_001
+    assert rows_after_delete[0] == original_rows[1]
+    assert rows_after_delete[-1] == original_rows[-1]
+
+
 def test_dataset_row_edit_and_delete_refuse_malformed_backing_jsonl(client):
     output_dir = client.project_dir / "output"
     output_dir.mkdir()
@@ -800,16 +890,67 @@ def test_extract_endpoint_can_skip_anonymization(client):
     assert "raw@company.ai" in (client.project_dir / "raw-staged" / "raw.jsonl").read_text(encoding="utf-8")
 
 
+def test_rejected_extract_does_not_mutate_output_config(client):
+    before = client.get("/api/config").json()["config"]["output"]["traces_dir"]
+    client.app.state.extraction._current = SimpleNamespace(status="running", join=lambda: None)
+
+    response = client.post(
+        "/api/extract",
+        json={"provider": "codex", "output": "rejected-output", "sessions_dirs": []},
+    )
+
+    assert response.status_code == 409
+    after = client.get("/api/config").json()["config"]["output"]["traces_dir"]
+    assert after == before
+
+
+def test_extraction_shutdown_waits_for_active_worker(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+    shutdown_finished = threading.Event()
+
+    def blocked_run(job):
+        job.status = "running"
+        started.set()
+        release.wait(timeout=5)
+        job.status = "completed"
+
+    manager = ExtractionManager()
+    with patch.object(ExtractionJob, "_run", blocked_run):
+        manager.start("codex", output_dir=tmp_path)
+        assert started.wait(timeout=1)
+        thread = threading.Thread(
+            target=lambda: (manager.shutdown(), shutdown_finished.set()),
+            daemon=True,
+        )
+        thread.start()
+        assert not shutdown_finished.wait(timeout=0.05)
+        release.set()
+        assert shutdown_finished.wait(timeout=1)
+        thread.join(timeout=1)
+
+
 def test_extract_endpoint_warns_cursor_may_take_a_while(client):
     source = client.project_dir / "state.vscdb"
     source.write_text("", encoding="utf-8")
 
-    def fake_extract(provider, *, output_dir, sources=None, model_filter=None, clear_destination=False, progress=None, anonymize=False):
+    def fake_extract(
+        provider,
+        *,
+        output_dir,
+        sources=None,
+        model_filter=None,
+        clear_destination=False,
+        progress=None,
+        anonymize=False,
+        anonymize_progress=None,
+    ):
         assert provider == "cursor"
         assert sources == [source]
         assert model_filter is None
         assert clear_destination is True
         assert progress is not None
+        assert anonymize_progress is not None
         progress({"kind": "extract_progress", "text": "Scanning Cursor database..."})
         output_dir.mkdir(parents=True, exist_ok=True)
         trace = output_dir / "cursor-session.jsonl"
@@ -853,6 +994,38 @@ def test_extract_endpoint_warns_cursor_may_take_a_while(client):
     )
 
 
+def test_extract_endpoint_streams_anonymization_file_progress(client):
+    sessions_dir = client.project_dir / ".codex" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    for index in range(9):
+        (sessions_dir / f"trace-{index}.jsonl").write_text(
+            json.dumps({"message": f"alice{index}@example.com"}) + "\n",
+            encoding="utf-8",
+        )
+
+    response = client.post(
+        "/api/extract",
+        json={
+            "provider": "codex",
+            "output": "staged-progress",
+            "sessions_dirs": [str(sessions_dir)],
+        },
+    )
+
+    assert response.status_code == 200
+    job = _wait_for_extract_job(client)
+    assert job["status"] == "completed"
+    events = client.app.state.extraction.current().events.snapshot()
+    progress_events = [
+        event
+        for event in events
+        if event.get("kind") == "extract_progress" and event.get("phase") == "anonymize"
+    ]
+    assert progress_events
+    assert progress_events[-1]["files_done"] == 9
+    assert progress_events[-1]["files_total"] == 9
+
+
 def test_extract_sources_rejects_unknown_provider(client):
     response = client.get("/api/extract/sources", params={"provider": "unknown"})
 
@@ -889,7 +1062,46 @@ def test_chat_session_discard_rejected_while_turn_running(tmp_path):
     assert session.status == "running"
 
 
-def test_claude_terminal_forwards_effort_and_fallback_model(tmp_path):
+def test_interactive_multiturn_chat_row_omits_single_turn_compatibility_columns(tmp_path):
+    config = Config(
+        agent={"provider": "chat"},
+        model={"model": "test/model"},
+        api={"provider": "openai", "base_url": "https://api.openai.com/v1"},
+        output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"},
+    )
+    session = InteractiveSession(config)
+    session.turn_prompts = ["Build it", "Now test it"]
+    session._chat_messages = [
+        {"role": "user", "content": "Build it", "thinking": None},
+        {"role": "assistant", "content": "Built", "thinking": "plan"},
+        {"role": "user", "content": "Now test it", "thinking": None},
+        {"role": "assistant", "content": "Tested", "thinking": "verify"},
+    ]
+    session._chat_usages = []
+    session._chat_model = "test/model"
+    session._runner = ChatRunner(config)
+
+    row = session._chat_training_row()
+
+    assert {"prompt", "thinking", "response"}.isdisjoint(row)
+    assert row["follow_up_prompts"] == ["Now test it"]
+    assert row["responses"] == ["Built", "Tested"]
+
+
+def test_windows_terminal_bridge_suppresses_host_console():
+    process = MagicMock()
+    process.poll.return_value = None
+    with patch("teich.studio.interactive.os.name", "nt"), patch(
+        "teich.studio.interactive.subprocess.Popen",
+        return_value=process,
+    ) as mock_popen, patch("teich.studio.interactive.threading.Thread") as mock_thread:
+        TerminalBridge().start(["docker", "exec"])
+
+    assert mock_popen.call_args.kwargs["creationflags"] == SUBPROCESS_CREATE_NO_WINDOW
+    mock_thread.return_value.start.assert_called_once()
+
+
+def test_claude_terminal_forwards_effort_but_omits_print_only_fallback_flag(tmp_path):
     config = Config(
         agent={"provider": "claude-code", "claude": {"fallback_model": ["sonnet", "haiku"]}},
         model={"model": "claude-opus-4-8", "reasoning_effort": "high"},
@@ -909,9 +1121,49 @@ def test_claude_terminal_forwards_effort_and_fallback_model(tmp_path):
         "bypassPermissions",
         "--effort",
         "high",
-        "--fallback-model",
-        "sonnet,haiku",
     ]
+
+
+def test_claude_studio_seeds_default_thinking_summary_settings(tmp_path):
+    config = Config(
+        agent={"provider": "claude-code"},
+        model={"model": "claude-opus-4-8"},
+        output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"},
+    )
+    session = InteractiveSession(config)
+    with patch.object(ClaudeCodeRunner, "_ensure_image"):
+        runner = ClaudeCodeRunner(config)
+    session._runner = runner
+    workspace_root = tmp_path / "workspace-root"
+    workspace = workspace_root / "workspace"
+    claude_home = tmp_path / "claude-home"
+    workspace.mkdir(parents=True)
+    claude_home.mkdir()
+
+    with patch.object(
+        runner,
+        "_prepare_workspace",
+        return_value=(workspace_root, workspace),
+    ), patch.object(
+        runner,
+        "_build_external_persistent_container_command",
+        return_value=["docker", "run"],
+    ), patch.object(
+        runner,
+        "_start_container",
+    ), patch(
+        "teich.studio.interactive.tempfile_mkdtemp",
+        return_value=str(claude_home),
+    ):
+        session._prepare_environment()
+
+    settings = json.loads(
+        (claude_home / "settings.json").read_text(encoding="utf-8")
+    )
+    assert settings == {
+        "alwaysThinkingEnabled": True,
+        "showThinkingSummaries": True,
+    }
 
 
 def test_generation_stop_prevents_later_prompt_starts(tmp_path, monkeypatch):
@@ -1033,6 +1285,43 @@ def test_terminal_task_cleanup_propagates_unexpected_errors():
         assert pending_task.cancelled()
 
     asyncio.run(run())
+
+
+def test_terminal_output_buffer_coalesces_without_losing_or_reordering_chunks():
+    async def run() -> None:
+        buffer = server_module._TerminalOutputBuffer(lambda: "scrollback", max_pending_chars=100)
+        chunks = ["before\x1b[", "31mred", "\x1b[0mafter"]
+        for chunk in chunks:
+            buffer.enqueue(chunk)
+
+        text, reset = await buffer.get()
+        assert text == "".join(chunks)
+        assert reset is False
+
+    asyncio.run(run())
+
+
+def test_terminal_output_buffer_replays_scrollback_when_pending_output_exceeds_limit():
+    async def run() -> None:
+        buffer = server_module._TerminalOutputBuffer(
+            lambda: "complete bounded scrollback",
+            max_pending_chars=8,
+        )
+        buffer.enqueue("12345")
+        buffer.enqueue("67890")
+
+        text, reset = await buffer.get()
+        assert text == "complete bounded scrollback"
+        assert reset is True
+
+    asyncio.run(run())
+
+
+def test_terminal_client_resets_before_replaying_coalesced_scrollback():
+    source = (server_module.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert "if (message.reset) term.reset();" in source
+    assert source.index("if (message.reset) term.reset();") < source.index("term.write(message.data);")
 
 
 def test_terminal_wait_keeps_socket_open_until_session_ready(monkeypatch):

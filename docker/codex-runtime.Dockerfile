@@ -1,9 +1,8 @@
 # syntax=docker/dockerfile:1
 FROM node:26.4.0-slim
 
-# Install system dependencies with cache mount and minimal packages
-# Removed: build-essential (only needed for compiling, not runtime)
-# Added: --no-install-recommends to skip extra packages
+# Install runtime dependencies plus the compiler headers needed when Hermes or
+# a user-installed Python package has no prebuilt wheel.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
@@ -11,6 +10,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     git \
     curl \
     ca-certificates \
+    util-linux \
     sudo \
     python3 \
     python3-dev \

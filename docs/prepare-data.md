@@ -48,7 +48,17 @@ print(prep_report.max_token_length)
 print(prep_report.oversized_rows[:3])
 ```
 
-`PrepareReport` includes dropped rows, oversized rows, trimmed rows, token lengths, max token length, kept-row ids, and returned row count.
+`PrepareReport` includes dropped rows, oversized rows, trimmed rows, token lengths,
+max token length, kept-row ids, and returned row count. With a live Gemma 4
+template it also reports per-row mode counts in `gemma4_modes` and migrated
+leading `<|think|>` markers in `gemma4_legacy_triggers_normalized`. When
+`reasoning_policy="strip"` is used, it reports affected rows and messages in
+`reasoning_stripped_rows` and `reasoning_stripped_messages`.
+
+Gemma 4 defaults to per-row auto mode when `enable_thinking` is omitted:
+reasoning-bearing rows enable thinking and history preservation, while direct
+rows use the loaded model's non-thinking protocol. See [Live Gemma 4 Models](training.md#live-gemma-4-models)
+for explicit overrides and validation rules.
 
 Original columns are removed after formatting unless `preserve_columns=True` or an explicit list is passed. The default provenance set is `source`, `metadata`, `raw_index`, and `source_key`.
 
@@ -57,7 +67,10 @@ Original columns are removed after formatting unless `preserve_columns=True` or 
 When `max_length` is set, use one of:
 
 - `oversized_policy="drop"`: drop oversized rows
-- `oversized_policy="trim_followups"`: for multi-turn rows, remove the final user follow-up and everything after it before dropping the whole row
+- `oversized_policy="trim_followups"`: for multi-turn rows, keep the longest
+  complete conversation prefix that fits. Teich searches the possible
+  follow-up boundaries logarithmically, avoiding a full rerender and
+  retokenization for every removed turn.
 - `oversized_policy="error"`: raise instead of filtering
 
 The older `drop_oversized_examples` and `trim_oversized_followups` flags still work as compatibility aliases, but `oversized_policy` is the preferred API.
@@ -78,6 +91,7 @@ train_dataset = prepare_data(
         "instruct-chat": {
             "source": "TeichAI/polaris-alpha-1000x",
             "percentage": 20,
+            "reasoning_policy": "strip",
             "chat_template_kwargs": {"enable_thinking": False, "preserve_thinking": False},
         },
     },
@@ -93,7 +107,8 @@ train_dataset = prepare_data(
 
 If one source cannot fill its share after filtering or context-window drops, Teich scales the total row count down instead of silently changing the realized mix.
 
-Global `chat_template_kwargs` are the default for every source. A source-level `chat_template_kwargs` mapping overrides those keys for that dataset only.
+Global `chat_template_kwargs` and `reasoning_policy` values are the defaults for
+every source. Source-level values override them for that dataset only.
 
 You can also pass a simple list of sources:
 

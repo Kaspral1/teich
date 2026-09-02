@@ -6,6 +6,7 @@ import json
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -25,7 +26,7 @@ from .dataset_preview import build_dataset_preview, dataset_row_context, delete_
 from .events import summarize_chat_row, summarize_trace_events
 from .extraction import ExtractionManager
 from .generation import GenerationManager
-from .interactive import EventLog, SessionManager
+from .interactive import SCROLLBACK_LIMIT, EventLog, SessionManager
 from .project import ProjectState, validate_chat_api_compatibility
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -118,6 +119,34 @@ TERMINAL_STARTUP_NOTICE_SECONDS = 15.0
 EXTRACT_PROVIDERS = {"claude", "codex", "cursor", "hermes", "pi"}
 UPLOAD_IGNORE_PATTERNS = ["partials/**", "failures/**"]
 UPLOAD_METADATA_PATTERNS = ["README.md", "tools.json"]
+UPLOAD_DATA_PATTERNS = ["*.jsonl", "**/*.jsonl", "*.metadata.json", "**/*.metadata.json"]
+
+
+class _TerminalOutputBuffer:
+    """Coalesce terminal chunks and replay scrollback instead of dropping bytes."""
+
+    def __init__(
+        self,
+        scrollback: Callable[[], str],
+        *,
+        max_pending_chars: int = SCROLLBACK_LIMIT,
+    ) -> None:
+        self._scrollback = scrollback
+        self._max_pending_chars = max(1, max_pending_chars)
+        self._queue: asyncio.Queue[tuple[str, bool]] = asyncio.Queue(maxsize=1)
+
+    def enqueue(self, text: str) -> None:
+        reset = False
+        if self._queue.full():
+            pending, reset = self._queue.get_nowait()
+            text = pending + text
+        if len(text) > self._max_pending_chars:
+            text = self._scrollback()
+            reset = True
+        self._queue.put_nowait((text, reset))
+
+    async def get(self) -> tuple[str, bool]:
+        return await self._queue.get()
 
 
 def _normalize_extract_provider(provider: str) -> ExtractProvider:
@@ -241,7 +270,7 @@ def _sse(log: EventLog, after: int) -> StreamingResponse:
             if events:
                 for event in events:
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                index += len(events)
+                index = int(events[-1]["seq"]) + 1
                 idle_cycles = 0
             else:
                 if log.closed:
@@ -331,6 +360,7 @@ def _upload_dataset_folder(
             folder_path=str(folder_path),
             repo_type="dataset",
             private=private,
+            allow_patterns=UPLOAD_DATA_PATTERNS,
             ignore_patterns=list(dict.fromkeys([*ignore_patterns, *UPLOAD_METADATA_PATTERNS])),
         )
     else:
@@ -339,6 +369,7 @@ def _upload_dataset_folder(
             repo_id=repo_id,
             repo_type="dataset",
             commit_message="Upload teich dataset output",
+            allow_patterns=[*UPLOAD_DATA_PATTERNS, *UPLOAD_METADATA_PATTERNS],
             ignore_patterns=ignore_patterns,
         )
     return str(repo_url)
@@ -519,10 +550,10 @@ def create_app(project_dir: Path) -> FastAPI:
         ]
         model_filter = (payload.model or "").strip() or None
         config_output = str(output_dir) if Path(output_value).expanduser().is_absolute() else output_value
-        try:
+
+        def persist_output_config() -> None:
             state.write_config_data({"output": {"traces_dir": config_output}})
-        except Exception:
-            pass
+
         try:
             job = extraction.start(
                 provider,
@@ -530,9 +561,12 @@ def create_app(project_dir: Path) -> FastAPI:
                 source_paths=source_paths,
                 model_filter=model_filter,
                 skip_anonymize=payload.skip_anonymize,
+                before_start=persist_output_config,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         return job.to_dict()
 
     @app.get("/api/extract")
@@ -635,10 +669,13 @@ def create_app(project_dir: Path) -> FastAPI:
             return
         await websocket.accept()
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[str] = asyncio.Queue()
+        output_buffer = _TerminalOutputBuffer(session.terminal.scrollback)
+
+        def enqueue_output(text: str) -> None:
+            output_buffer.enqueue(text)
 
         def on_output(text: str) -> None:
-            loop.call_soon_threadsafe(queue.put_nowait, text)
+            loop.call_soon_threadsafe(enqueue_output, text)
 
         await _wait_for_terminal_session_ready(websocket, session)
         if session.status == "error":
@@ -658,8 +695,11 @@ def create_app(project_dir: Path) -> FastAPI:
 
             async def pump_output() -> None:
                 while True:
-                    text = await queue.get()
-                    await websocket.send_json({"type": "stdout", "data": text})
+                    text, reset = await output_buffer.get()
+                    message: dict[str, Any] = {"type": "stdout", "data": text}
+                    if reset:
+                        message["reset"] = True
+                    await websocket.send_json(message)
 
             async def pump_input() -> None:
                 while True:
@@ -738,8 +778,10 @@ def create_app(project_dir: Path) -> FastAPI:
 
     def _dataset_root(path: str | None = None) -> tuple[Path, str | None]:
         data = state.read_config_data()
-        output = data.get("output") if isinstance(data.get("output"), dict) else {}
-        publish = data.get("publish") if isinstance(data.get("publish"), dict) else {}
+        raw_output = data.get("output")
+        output = raw_output if isinstance(raw_output, dict) else {}
+        raw_publish = data.get("publish")
+        publish = raw_publish if isinstance(raw_publish, dict) else {}
         root_value = (path or "").strip() or str(output.get("traces_dir") or "./output")
         root = state.resolve_path(Path(root_value).expanduser())
         repo_id = publish.get("repo_id") if isinstance(publish.get("repo_id"), str) else None

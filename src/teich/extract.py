@@ -15,7 +15,7 @@ import sqlite3
 from tempfile import TemporaryDirectory
 from typing import Any, Literal
 
-from .anonymize import AnonymizeFileReport, AnonymizeProgress, TraceAnonymizer, anonymize_file
+from .anonymize import AnonymizeFileReport, AnonymizeProgress, TraceAnonymizer, anonymize_file, anonymize_files
 from .tool_schema import CURSOR_BUILTIN_TOOLS
 
 ExtractProvider = Literal["claude", "codex", "cursor", "hermes", "pi"]
@@ -59,14 +59,21 @@ class _InlineAnonymizer:
         for key, count in counts.items():
             self.totals[key] = self.totals.get(key, 0) + count
 
-    def _record(self, report: AnonymizeFileReport) -> None:
+    def _record(self, report: AnonymizeFileReport, total: int | None = None) -> None:
         self._add(report.replacements)
         self.files_done += 1
         if self.progress is not None:
-            self.progress(report, self.files_done, None)
+            self.progress(report, self.files_done, total)
 
     def copy_file(self, source: Path, destination: Path) -> None:
         self._record(anonymize_file(source, destination))
+
+    def copy_files(self, sources: list[Path], destinations: list[Path]) -> None:
+        anonymize_files(
+            sources,
+            destinations,
+            progress=lambda report, _done, total: self._record(report, total),
+        )
 
     def anonymize_events(self, events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
         anonymizer = TraceAnonymizer()
@@ -136,18 +143,98 @@ def extract_local_sessions(
     progress: ProgressCallback | None = None,
     anonymize: bool = False,
     anonymize_progress: AnonymizeProgress | None = None,
+    _excluded_source_roots: Iterable[Path] | None = None,
 ) -> ExtractResult:
     """Extract local sessions for provider into output_dir."""
     source_candidates = list(sources) if sources is not None else default_session_sources(provider, home)
     resolved_sources = _existing_unique_paths(source_candidates)
     destination_dir = output_dir
-    destination_dir.mkdir(parents=True, exist_ok=True)
+    resolved_destination = destination_dir.expanduser().resolve()
+    excluded_source_roots = [resolved_destination]
+    excluded_source_roots.extend(
+        path.expanduser().resolve() for path in (_excluded_source_roots or [])
+    )
+    for source in resolved_sources:
+        resolved_source = source.expanduser().resolve()
+        try:
+            resolved_source.relative_to(resolved_destination)
+        except ValueError:
+            pass
+        else:
+            raise ValueError(
+                f"Refusing extraction to {destination_dir}: it contains extraction source {source}. "
+                "Choose an output directory outside the source tree."
+            )
     if clear_destination:
-        _clear_extract_destination(destination_dir)
+        if destination_dir.is_symlink():
+            raise ValueError(
+                f"Refusing to refresh symlinked output directory {destination_dir}; choose a real directory."
+            )
+        if destination_dir.exists() and not destination_dir.is_dir():
+            raise ValueError(f"Extraction output must be a directory: {destination_dir}")
+        destination_parent = destination_dir.expanduser().resolve().parent
+        destination_parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix=".teich-extract-", dir=destination_parent) as staging_dir:
+            staging_root = Path(staging_dir)
+            if destination_dir.is_dir():
+                shutil.copytree(destination_dir, staging_root, dirs_exist_ok=True, symlinks=True)
+                _clear_extract_destination(staging_root)
+            staged = extract_local_sessions(
+                provider,
+                output_dir=staging_root,
+                sources=resolved_sources,
+                model_filter=model_filter,
+                clear_destination=False,
+                progress=progress,
+                anonymize=anonymize,
+                anonymize_progress=anonymize_progress,
+                _excluded_source_roots=excluded_source_roots,
+            )
+            if not staged.copied_files:
+                return ExtractResult(
+                    provider=provider,
+                    destination_dir=destination_dir,
+                    copied_files=[],
+                    source_paths=resolved_sources,
+                    anonymize_totals=staged.anonymize_totals,
+                )
+            copied_files = [
+                destination_dir / staged_file.relative_to(staging_root)
+                for staged_file in staged.copied_files
+            ]
+            backup = destination_parent / f".{destination_dir.name}.teich-backup"
+            if backup.exists():
+                raise RuntimeError(
+                    f"Cannot refresh {destination_dir}: stale transaction backup exists at {backup}."
+                )
+            had_destination = destination_dir.exists()
+            if had_destination:
+                destination_dir.replace(backup)
+            try:
+                staging_root.replace(destination_dir)
+            except BaseException:
+                if had_destination and backup.exists() and not destination_dir.exists():
+                    backup.replace(destination_dir)
+                raise
+            if backup.exists():
+                shutil.rmtree(backup, ignore_errors=True)
+            return ExtractResult(
+                provider=provider,
+                destination_dir=destination_dir,
+                copied_files=copied_files,
+                source_paths=resolved_sources,
+                anonymize_totals=staged.anonymize_totals,
+            )
+
+    destination_dir.mkdir(parents=True, exist_ok=True)
     anonymizer = _InlineAnonymizer(anonymize_progress) if anonymize else None
     if provider == "hermes":
         copied_files = _extract_hermes_state_dbs(
-            resolved_sources, destination_dir, model_filter=model_filter, anonymizer=anonymizer
+            resolved_sources,
+            destination_dir,
+            model_filter=model_filter,
+            anonymizer=anonymizer,
+            excluded_source_roots=excluded_source_roots,
         )
     elif provider == "cursor":
         copied_files = _extract_cursor_databases(
@@ -156,6 +243,7 @@ def extract_local_sessions(
             model_filter=model_filter,
             progress=progress,
             anonymizer=anonymizer,
+            excluded_source_roots=excluded_source_roots,
         )
     else:
         copied_files = _extract_jsonl_session_files(
@@ -164,6 +252,7 @@ def extract_local_sessions(
             destination_dir,
             model_filter=model_filter,
             anonymizer=anonymizer,
+            excluded_source_roots=excluded_source_roots,
         )
     if anonymizer is not None and copied_files:
         anonymizer.anonymize_remaining_files(destination_dir, copied_files)
@@ -334,12 +423,17 @@ def _extract_cursor_databases(
     model_filter: str | None = None,
     progress: ProgressCallback | None = None,
     anonymizer: _InlineAnonymizer | None = None,
+    excluded_source_roots: list[Path] | None = None,
 ) -> list[Path]:
     indexed_rows: list[tuple[int, dict[str, Any]]] = []
     row_index = 0
     seen: set[Path] = set()
     for source in sources:
-        state_dbs = _cursor_state_dbs(source)
+        state_dbs = [
+            path
+            for path in _cursor_state_dbs(source)
+            if not _path_is_within_any(path, excluded_source_roots)
+        ]
         _emit_progress(
             progress,
             "extract_progress",
@@ -374,7 +468,11 @@ def _extract_cursor_databases(
         rows = [row for row in rows if trace_matches_model([row], model_filter)]
     if not rows:
         return _extract_cursor_project_files(
-            sources, destination_dir, model_filter=model_filter, anonymizer=anonymizer
+            sources,
+            destination_dir,
+            model_filter=model_filter,
+            anonymizer=anonymizer,
+            excluded_source_roots=excluded_source_roots,
         )
     copied: list[Path] = []
     for row_index, row in enumerate(rows, start=1):
@@ -390,10 +488,13 @@ def _extract_cursor_project_files(
     *,
     model_filter: str | None = None,
     anonymizer: _InlineAnonymizer | None = None,
+    excluded_source_roots: list[Path] | None = None,
 ) -> list[Path]:
     copied: list[Path] = []
     for source in sources:
         for transcript in _cursor_project_transcript_files(source):
+            if _path_is_within_any(transcript, excluded_source_roots):
+                continue
             events = _read_jsonl_dict_events(transcript)
             if events is None:
                 continue
@@ -521,14 +622,61 @@ def _extract_jsonl_session_files(
     *,
     model_filter: str | None = None,
     anonymizer: _InlineAnonymizer | None = None,
+    excluded_source_roots: list[Path] | None = None,
 ) -> list[Path]:
+    if anonymizer is not None and model_filter is None:
+        source_files = [
+            path
+            for source in sources
+            for path in _jsonl_files(source)
+            if not _path_is_within_any(path, excluded_source_roots)
+        ]
+        destinations = _planned_unique_destinations(
+            destination_dir,
+            [path.name for path in source_files],
+        )
+        anonymizer.copy_files(source_files, destinations)
+        return destinations
+
     copied: list[Path] = []
     for source in sources:
         for path in _jsonl_files(source):
+            if _path_is_within_any(path, excluded_source_roots):
+                continue
             destination = _unique_destination(destination_dir, path.name)
             if _copy_provider_jsonl(provider, path, destination, model_filter=model_filter, anonymizer=anonymizer):
                 copied.append(destination)
     return copied
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.expanduser().resolve().relative_to(root.expanduser().resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _path_is_within_any(path: Path, roots: Iterable[Path] | None) -> bool:
+    return any(_path_is_within(path, root) for root in roots or [])
+
+
+def _planned_unique_destinations(destination_dir: Path, file_names: list[str]) -> list[Path]:
+    """Reserve collision-free destination names before parallel file writes."""
+    reserved: set[str] = set()
+    destinations: list[Path] = []
+    for file_name in file_names:
+        original = destination_dir / file_name
+        candidate = original
+        stem = original.stem
+        suffix = original.suffix
+        counter = 1
+        while candidate.exists() or candidate.name.casefold() in reserved:
+            candidate = original.with_name(f"{stem}_{counter}{suffix}")
+            counter += 1
+        reserved.add(candidate.name.casefold())
+        destinations.append(candidate)
+    return destinations
 
 
 def _copy_provider_jsonl(
@@ -539,18 +687,13 @@ def _copy_provider_jsonl(
     model_filter: str | None = None,
     anonymizer: _InlineAnonymizer | None = None,
 ) -> bool:
-    events = _read_jsonl_dict_events(source)
-    if events is None:
-        if model_filter:
+    # Without a model filter, parsing the complete trace here is redundant:
+    # anonymize_file will stream and parse it immediately afterward. Large
+    # extracted histories otherwise pay for two full JSON passes per file.
+    if model_filter:
+        events = _read_jsonl_dict_events(source)
+        if events is None or not trace_matches_model(events, model_filter):
             return False
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if anonymizer is not None:
-            anonymizer.copy_file(source, destination)
-        else:
-            shutil.copy2(source, destination)
-        return True
-    if model_filter and not trace_matches_model(events, model_filter):
-        return False
     destination.parent.mkdir(parents=True, exist_ok=True)
     if anonymizer is not None:
         anonymizer.copy_file(source, destination)
@@ -632,7 +775,8 @@ def _jsonl_file_name(prefix: str, identifier: Any, row_index: int) -> str:
 
 
 def _cursor_session_file_name(row: dict[str, Any], row_index: int) -> str:
-    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    raw_metadata = row.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     identifier = (
         metadata.get("cursor_composer_id")
         or metadata.get("cursor_key")
@@ -651,7 +795,8 @@ def _hermes_session_file_name(row: dict[str, Any], row_index: int) -> str:
 
 
 def _cursor_row_to_transcript_events(row: dict[str, Any], row_index: int) -> list[dict[str, Any]]:
-    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    raw_metadata = row.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     session_id = (
         metadata.get("cursor_composer_id")
         or metadata.get("cursor_key")
@@ -674,7 +819,8 @@ def _cursor_row_to_transcript_events(row: dict[str, Any], row_index: int) -> lis
     tools = row.get("tools")
     if isinstance(tools, list) and tools:
         events.append({"type": "cursor_available_tools", "tools": tools})
-    messages = row.get("messages") if isinstance(row.get("messages"), list) else []
+    raw_messages = row.get("messages")
+    messages = raw_messages if isinstance(raw_messages, list) else []
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -913,8 +1059,11 @@ def _sanitize_cursor_row(row: dict[str, Any]) -> dict[str, Any] | None:
     messages = row.get("messages")
     if not isinstance(messages, list):
         return None
-    clean_messages = [_cursor_clean_message(message) for message in messages]
-    clean_messages = [message for message in clean_messages if message is not None]
+    clean_messages: list[dict[str, Any]] = []
+    for message in messages:
+        clean_message = _cursor_clean_message(message)
+        if clean_message is not None:
+            clean_messages.append(clean_message)
     clean_messages = _cursor_drop_adjacent_duplicate_messages(clean_messages)
     if not any(_cursor_message_is_user_prompt(message) for message in clean_messages):
         fallback_prompt = _cursor_fallback_prompt(row)
@@ -930,19 +1079,22 @@ def _sanitize_cursor_row(row: dict[str, Any]) -> dict[str, Any] | None:
 
     clean_row = dict(row)
     clean_row["messages"] = clean_messages
+    raw_metadata = row.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     clean_row["prompt"] = _cursor_prompt(
         clean_messages,
-        str((row.get("metadata") or {}).get("cursor_key") or ""),
+        str(metadata.get("cursor_key") or ""),
         explicit_prompt=row.get("prompt") if isinstance(row.get("prompt"), str) else None,
     )
     clean_row["response"] = _cursor_response(clean_messages)
+    row_tools = row.get("tools")
     merged_tools = _cursor_merge_tools(
         _cursor_builtin_tools(),
-        row.get("tools") if isinstance(row.get("tools"), list) else [],
+        row_tools if isinstance(row_tools, list) else [],
         _cursor_tools_from_messages(clean_messages),
     )
     clean_row["tools"] = merged_tools
-    metadata = dict(row.get("metadata")) if isinstance(row.get("metadata"), dict) else {}
+    metadata = dict(metadata)
     metadata["cursor_message_count"] = len(clean_messages)
     clean_row["metadata"] = metadata
     return clean_row
@@ -1545,22 +1697,26 @@ def _cursor_merge_json_schema(existing: Any, incoming: dict[str, Any]) -> dict[s
     incoming_type = incoming.get("type")
     if existing_type == incoming_type:
         if existing_type == "object":
-            properties = dict(existing.get("properties")) if isinstance(existing.get("properties"), dict) else {}
+            raw_properties = existing.get("properties")
+            properties = dict(raw_properties) if isinstance(raw_properties, dict) else {}
             incoming_properties = incoming.get("properties")
             if isinstance(incoming_properties, dict):
                 for key, value in incoming_properties.items():
-                    properties[key] = _cursor_merge_json_schema(properties.get(key), value)
-            merged = {"type": "object"}
+                    if isinstance(value, dict):
+                        properties[key] = _cursor_merge_json_schema(properties.get(key), value)
+            merged: dict[str, Any] = {"type": "object"}
             if properties:
                 merged["properties"] = dict(sorted(properties.items()))
+            raw_existing_required = existing.get("required")
             existing_required = (
-                {item for item in existing.get("required") if isinstance(item, str)}
-                if isinstance(existing.get("required"), list)
+                {item for item in raw_existing_required if isinstance(item, str)}
+                if isinstance(raw_existing_required, list)
                 else None
             )
+            raw_incoming_required = incoming.get("required")
             incoming_required = (
-                {item for item in incoming.get("required") if isinstance(item, str)}
-                if isinstance(incoming.get("required"), list)
+                {item for item in raw_incoming_required if isinstance(item, str)}
+                if isinstance(raw_incoming_required, list)
                 else None
             )
             if existing_required is None:
@@ -2181,10 +2337,14 @@ def _extract_hermes_state_dbs(
     *,
     model_filter: str | None = None,
     anonymizer: _InlineAnonymizer | None = None,
+    excluded_source_roots: list[Path] | None = None,
 ) -> list[Path]:
     copied: list[Path] = []
     for source in sources:
         state_dbs = [source] if source.is_file() else sorted(source.rglob("state.db"))
+        state_dbs = [
+            path for path in state_dbs if not _path_is_within_any(path, excluded_source_roots)
+        ]
         for state_db in state_dbs:
             rows = _hermes_state_db_session_rows(state_db, model_filter=model_filter)
             copied.extend(

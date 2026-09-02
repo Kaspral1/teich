@@ -7,12 +7,15 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from ..config import Config
 from ..extract import CURSOR_EXTRACTION_NOTICE, ExtractProvider, extract_local_sessions
 from ..trace_readme import extraction_readme_tags, write_traces_readme
 from .interactive import EventLog
+
+JOB_HISTORY_LIMIT = 20
 
 
 def _extract_dataset_config(
@@ -63,9 +66,16 @@ class ExtractionJob:
         self.detected_sources: list[str] = []
         self.anonymize_totals: dict[str, int] | None = None
         self._lock = threading.RLock()
+        self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        threading.Thread(target=self._run, name=f"studio-extract-{self.id[:8]}", daemon=True).start()
+        self._thread = threading.Thread(target=self._run, name=f"studio-extract-{self.id[:8]}", daemon=True)
+        self._thread.start()
+
+    def join(self) -> None:
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
 
     def _emit_status(self, status: str, message: str | None = None) -> None:
         with self._lock:
@@ -89,13 +99,34 @@ class ExtractionJob:
                 self.events.append({"kind": "extract_warning", "text": CURSOR_EXTRACTION_NOTICE})
             last_progress_at = 0.0
 
-            def emit_progress(event: dict[str, Any]) -> None:
+            def emit_progress(event: dict[str, Any], *, force: bool = False) -> None:
                 nonlocal last_progress_at
                 now = time.monotonic()
-                if now - last_progress_at < 2.0:
+                if not force and now - last_progress_at < 2.0:
                     return
                 last_progress_at = now
                 self.events.append(event)
+
+            def emit_anonymize_progress(report, done: int, total: int | None) -> None:
+                counts = report.replacements
+                total_text = str(total) if total is not None else "?"
+                emit_progress(
+                    {
+                        "kind": "extract_progress",
+                        "text": (
+                            f"Anonymized {done}/{total_text} files · "
+                            f"{counts.get('api_key', 0)} credential hits, "
+                            f"{counts.get('email', 0)} email hits, "
+                            f"{counts.get('username', 0)} usernames in {report.path.name}"
+                        ),
+                        "phase": "anonymize",
+                        "files_done": done,
+                        "files_total": total,
+                        "file": report.path.name,
+                        "replacements": counts,
+                    },
+                    force=total is not None and done >= total,
+                )
 
             if not self.skip_anonymize:
                 self._emit_status("running", "Extracting and anonymizing traces...")
@@ -107,6 +138,7 @@ class ExtractionJob:
                 clear_destination=True,
                 progress=emit_progress,
                 anonymize=not self.skip_anonymize,
+                anonymize_progress=emit_anonymize_progress,
             )
             self.detected_sources = [str(path) for path in result.source_paths]
             self.result_files = [path.name for path in result.copied_files]
@@ -145,9 +177,9 @@ class ExtractionJob:
                         "kind": "extract_anonymize",
                         "text": (
                             "Scrambled "
-                            f"{self.anonymize_totals.get('api_key', 0)} API keys, "
-                            f"{self.anonymize_totals.get('email', 0)} emails, and "
-                            f"{self.anonymize_totals.get('username', 0)} usernames."
+                            f"{self.anonymize_totals.get('api_key', 0)} credential-like value occurrences, "
+                            f"{self.anonymize_totals.get('email', 0)} email occurrences, and "
+                            f"{self.anonymize_totals.get('username', 0)} username references."
                         ),
                         "totals": self.anonymize_totals,
                     }
@@ -212,10 +244,14 @@ class ExtractionManager:
         source_paths: list[Path] | None = None,
         model_filter: str | None = None,
         skip_anonymize: bool = False,
+        before_start: Callable[[], None] | None = None,
     ) -> ExtractionJob:
         with self._lock:
             if self._current is not None and self._current.status in {"starting", "running"}:
                 raise RuntimeError("An extraction run is already in progress")
+            if before_start is not None:
+                before_start()
+            self._prune_locked()
             job = ExtractionJob(
                 provider,
                 output_dir=output_dir,
@@ -227,6 +263,14 @@ class ExtractionManager:
             self._current = job
         job.start()
         return job
+
+    def _prune_locked(self) -> None:
+        overflow = len(self._jobs) - JOB_HISTORY_LIMIT + 1
+        if overflow <= 0:
+            return
+        completed = [job_id for job_id, job in self._jobs.items() if job.status not in {"starting", "running"}]
+        for job_id in completed[:overflow]:
+            self._jobs.pop(job_id, None)
 
     def current(self) -> ExtractionJob | None:
         with self._lock:
@@ -240,7 +284,10 @@ class ExtractionManager:
         return job
 
     def shutdown(self) -> None:
-        pass
+        with self._lock:
+            job = self._current
+        if job is not None and job.status in {"starting", "running"}:
+            job.join()
 
 
 def _jsonl_row_count(paths: list[Path]) -> int:

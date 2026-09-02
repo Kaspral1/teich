@@ -22,6 +22,7 @@ import pytest
 
 import teich.runner as runner_module
 from teich.config import APIConfig, Config, MCPConfig, ModelConfig, PromptInput
+from teich.harness_capture import HarnessContextCapture
 from teich.runner import (
     ChatRunner,
     ClaudeCodeRunner,
@@ -42,15 +43,52 @@ def _free_tcp_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _wait_for_tcp_port(port: int, timeout: float = 5.0) -> None:
+def _wait_for_tcp_port(
+    port: int,
+    timeout: float = 5.0,
+    *,
+    process: subprocess.Popen[str] | None = None,
+) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise RuntimeError(
+                f"process exited with code {process.returncode} before port {port} opened"
+                f"\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            )
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.1):
                 return
         except OSError:
                 time.sleep(0.05)
     raise TimeoutError(f"port {port} did not open")
+
+
+def test_windows_owned_process_cleanup_kills_entire_tree():
+    process = MagicMock()
+    process.pid = 1234
+    process.poll.return_value = None
+
+    with patch.object(runner_module.subprocess, "run") as mock_run:
+        runner_module._terminate_process_tree(process, windows=True)
+
+    mock_run.assert_called_once_with(
+        ["taskkill", "/PID", "1234", "/T", "/F"],
+        capture_output=True,
+        check=False,
+        **runner_module.TEXT_SUBPROCESS_KWARGS,
+    )
+    process.terminate.assert_not_called()
+    process.wait.assert_called_once_with(timeout=5)
+
+
+def test_subprocess_creation_flags_are_platform_safe():
+    assert runner_module.SUBPROCESS_CREATE_NO_WINDOW == getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if os.name == "nt":
+        assert runner_module.TEXT_SUBPROCESS_KWARGS["creationflags"] == runner_module.SUBPROCESS_CREATE_NO_WINDOW
+    else:
+        assert "creationflags" not in runner_module.TEXT_SUBPROCESS_KWARGS
 
 
 def _filesystem_preserves_chmod(tmp_path: Path) -> bool:
@@ -259,6 +297,12 @@ def test_tracked_container_cleans_up_when_start_fails():
     assert "teich-broken-start" not in runner._active_containers
 
 
+def test_start_container_reports_docker_control_timeout():
+    with patch("teich.runner.subprocess.run", side_effect=subprocess.TimeoutExpired("docker", 30)):
+        with pytest.raises(RuntimeError, match="did not start the runtime container"):
+            DockerRuntimeRunner._start_container(["docker", "run"])
+
+
 def test_copy_workspace_snapshot_ignores_dangling_symlinks(tmp_path: Path):
     workspace = tmp_path / "workspace"
     destination = tmp_path / "snapshot"
@@ -365,6 +409,35 @@ def test_codex_config_omits_reasoning_summary_when_unset(tmp_path: Path):
     runner._write_codex_config(codex_home)
     content = (codex_home / "config.toml").read_text(encoding="utf-8")
     assert "model_reasoning_summary" not in content
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_codex_config_writes_reasoning_summaries_capability(
+    tmp_path: Path, enabled: bool
+):
+    """The explicit toggle reaches Codex's model capability override."""
+    config = Config(
+        model=ModelConfig(
+            model="gpt-5.5",
+            reasoning_summaries_enabled=enabled,
+        )
+    )
+    with patch.object(CodexRunner, "_ensure_image"):
+        runner = CodexRunner(config)
+    codex_home = tmp_path / ".codex"
+    runner._write_codex_config(codex_home)
+    content = (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert f"model_supports_reasoning_summaries = {str(enabled).lower()}" in content
+
+
+def test_codex_config_omits_reasoning_summaries_capability_when_unset(tmp_path: Path):
+    config = Config(model=ModelConfig(model="gpt-5.5"))
+    with patch.object(CodexRunner, "_ensure_image"):
+        runner = CodexRunner(config)
+    codex_home = tmp_path / ".codex"
+    runner._write_codex_config(codex_home)
+    content = (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert "model_supports_reasoning_summaries" not in content
 
 
 def _codex_host_auth_config(tmp_path: Path) -> tuple[Config, Path]:
@@ -842,7 +915,7 @@ def test_external_runner_chmods_workspace_before_snapshot():
     assert "chmod -R a+rwX /home/codex/.hermes /workspace" in command
 
 
-def test_claude_code_runner_uses_stream_json_and_prompt_file(tmp_path: Path, monkeypatch):
+def test_claude_code_runner_uses_interactive_pty_and_prompt_file(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("TEICH_CLAUDE_OAUTH_TOKEN", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     long_prompt = "x" * 40000
@@ -859,17 +932,23 @@ def test_claude_code_runner_uses_stream_json_and_prompt_file(tmp_path: Path, mon
         _write_fake_claude_native_session(command, prompt=long_prompt)
         return '{"type":"result","result":"done"}\n', ""
 
-    with patch.object(runner, "_run_native_process_with_progress", side_effect=fake_run) as mock_run, \
+    with patch.object(runner, "_wait_for_subscription_request_slot") as mock_wait, \
+         patch.object(runner, "_run_native_process_with_progress", side_effect=fake_run) as mock_run, \
          patch.object(runner, "_copy_workspace_snapshot"):
         trace_path = runner.run_session(long_prompt, "claude-session")
 
+    mock_wait.assert_called_once()
     command = mock_run.call_args.args[0]
     command_text = " ".join(command)
     assert long_prompt not in command
     assert "claude" in command_text
-    assert "--output-format stream-json" in command_text
+    assert command[:3] == ["docker", "run", "-i"]
+    assert "script -qfec" in command_text
+    assert "--ax-screen-reader" in command_text
+    assert " -p " not in f" {command_text} "
+    assert "--output-format" not in command_text
     assert "--permission-mode bypassPermissions" in command_text
-    assert "< /workspace/.teich-prompt.txt" in command_text
+    assert "$(cat /workspace/.teich-prompt.txt)" in command_text
     assert "chmod -R a+rwX /home/codex/.claude" in command_text
     assert "ANTHROPIC_API_KEY=sk-ant-test" in command
     rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
@@ -926,8 +1005,6 @@ def test_claude_openrouter_proxy_strips_decoded_compression_headers(tmp_path: Pa
     if shutil.which("node") is None:
         pytest.skip("node is required for the proxy smoke test")
 
-    upstream_port = _free_tcp_port()
-    proxy_port = _free_tcp_port()
     response_payload = b'{"ok":true}\n'
     seen: dict[str, object] = {}
 
@@ -950,7 +1027,11 @@ def test_claude_openrouter_proxy_strips_decoded_compression_headers(tmp_path: Pa
         def log_message(self, format: str, *args: object) -> None:
             return
 
-    server = ThreadingHTTPServer(("127.0.0.1", upstream_port), Handler)
+    # Bind the upstream before selecting the proxy port so the two ephemeral
+    # allocations cannot resolve to the same released port under CI load.
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    upstream_port = int(server.server_address[1])
+    proxy_port = _free_tcp_port()
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     proxy_script = tmp_path / "claude_openrouter_proxy.js"
@@ -968,7 +1049,7 @@ def test_claude_openrouter_proxy_strips_decoded_compression_headers(tmp_path: Pa
         text=True,
     )
     try:
-        _wait_for_tcp_port(proxy_port)
+        _wait_for_tcp_port(proxy_port, process=process)
         request = Request(
             f"http://127.0.0.1:{proxy_port}/v1/messages?beta=true",
             data=json.dumps(
@@ -1038,8 +1119,6 @@ def test_claude_openrouter_proxy_handles_requests_concurrently(tmp_path: Path):
     if shutil.which("node") is None:
         pytest.skip("node is required for the proxy smoke test")
 
-    upstream_port = _free_tcp_port()
-    proxy_port = _free_tcp_port()
     request_count = 5
     response_delay = 0.35
     stats = {"inflight": 0, "max_inflight": 0, "requests": 0}
@@ -1069,7 +1148,12 @@ def test_claude_openrouter_proxy_handles_requests_concurrently(tmp_path: Path):
         def log_message(self, format: str, *args: object) -> None:
             return
 
-    server = ThreadingHTTPServer(("127.0.0.1", upstream_port), Handler)
+    # Keep the upstream port reserved while selecting the proxy port. Calling
+    # _free_tcp_port twice can return the same released port and make Node exit
+    # with EADDRINUSE before the readiness probe observes it.
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    upstream_port = int(server.server_address[1])
+    proxy_port = _free_tcp_port()
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     proxy_script = tmp_path / "claude_openrouter_proxy.js"
@@ -1098,7 +1182,7 @@ def test_claude_openrouter_proxy_handles_requests_concurrently(tmp_path: Path):
             return response.read()
 
     try:
-        _wait_for_tcp_port(proxy_port)
+        _wait_for_tcp_port(proxy_port, process=process)
         started = time.perf_counter()
         with concurrent.futures.ThreadPoolExecutor(max_workers=request_count) as executor:
             bodies = list(executor.map(send_request, range(request_count)))
@@ -1196,6 +1280,87 @@ def test_claude_code_native_process_emits_live_trace_progress(tmp_path: Path):
     trace_updates = [update for update in updates if update.trace_path == native_trace]
     assert trace_updates
     assert any(update.details == "Claude trace: live.jsonl" for update in trace_updates)
+
+
+def test_claude_code_native_process_exits_interactive_pty_after_completed_trace(tmp_path: Path):
+    config = Config(
+        agent={"provider": "claude-code"},
+        api=APIConfig(provider="anthropic", api_key="none"),
+        model=ModelConfig(model="claude-opus-5"),
+        output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"},
+        timeout_seconds=5,
+    )
+    with patch.object(ClaudeCodeRunner, "_ensure_image"):
+        runner = ClaudeCodeRunner(config)
+
+    home_dir = tmp_path / "claude-home"
+    native_trace = home_dir / "projects" / "-workspace" / "interactive.jsonl"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import pathlib,sys,time;"
+            "p=pathlib.Path(sys.argv[1]);"
+            "p.parent.mkdir(parents=True,exist_ok=True);"
+            "p.write_text('{}\\n',encoding='utf-8');"
+            "received=sys.stdin.read(6);"
+            "print('received='+received.replace(chr(13),'<CR>'),flush=True)"
+        ),
+        str(native_trace),
+    ]
+    started_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+    with patch.object(runner, "_native_interactive_turns_complete", return_value=True):
+        stdout, stderr = runner._run_native_process_with_progress(
+            command,
+            None,
+            session_id="claude-interactive",
+            home_dir=home_dir,
+            existing_sessions=set(),
+            started_at=started_at,
+            progress_callback=None,
+            progress_base=None,
+            expected_turns=["Build app"],
+        )
+
+    assert "received=/exit" in stdout
+    assert stderr == ""
+
+
+def test_claude_code_native_process_preserves_persistent_container_on_error(tmp_path: Path):
+    config = Config(
+        agent={"provider": "claude-code"},
+        api=APIConfig(provider="anthropic", api_key="none"),
+        model=ModelConfig(model="claude-opus-5"),
+        output={"traces_dir": tmp_path / "output", "sandbox_dir": tmp_path / "sandbox"},
+        timeout_seconds=5,
+    )
+    with patch.object(ClaudeCodeRunner, "_ensure_image"):
+        runner = ClaudeCodeRunner(config)
+
+    home_dir = tmp_path / "claude-home"
+    started_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    with patch.object(runner, "_terminate_process") as mock_terminate:
+        with pytest.raises(subprocess.CalledProcessError):
+            runner._run_native_process_with_progress(
+                [sys.executable, "-c", "raise SystemExit(1)"],
+                "teich-claude-persistent",
+                session_id="claude-interactive",
+                home_dir=home_dir,
+                existing_sessions=set(),
+                started_at=started_at,
+                progress_callback=None,
+                progress_base=None,
+                remove_container_on_error=False,
+            )
+
+    terminated_process = mock_terminate.call_args.args[0]
+    assert terminated_process.poll() == 1
+    mock_terminate.assert_called_once_with(
+        terminated_process,
+        "teich-claude-persistent",
+        remove_container=False,
+    )
 
 
 def test_claude_code_runner_uses_proxy_for_custom_non_claude_model(tmp_path: Path):
@@ -1318,7 +1483,7 @@ def test_claude_code_run_session_salvages_complete_trace_after_nonzero_exit(tmp_
 
 def test_claude_code_run_session_retries_provider_error_trace_before_exporting(tmp_path: Path):
     config = Config(
-        agent={"provider": "claude-code"},
+        agent={"provider": "claude-code", "claude": {"fallback_model": ["sonnet"]}},
         api=APIConfig(provider="anthropic", api_key="sk-ant-test"),
         model=ModelConfig(model="claude-sonnet-4-6", approval_policy="never"),
         output={
@@ -1401,7 +1566,9 @@ def test_claude_code_run_session_retries_provider_error_trace_before_exporting(t
     assert result == tmp_path / "output" / "claude-retry.jsonl"
     assert mock_run.call_count == 2
     assert "--continue" not in " ".join(commands[0])
+    assert "--model claude-sonnet-4-6" in " ".join(commands[0])
     assert "--resume claude-retry" in " ".join(commands[1])
+    assert "--model sonnet" in " ".join(commands[1])
     assert "--continue" not in " ".join(commands[1])
     assert not list((tmp_path / "failures").glob("*.jsonl"))
 
@@ -1608,6 +1775,10 @@ def test_claude_code_runner_uses_resume_for_followups(tmp_path: Path):
 
     mock_start.assert_called_once()
     assert mock_run.call_count == 2
+    assert all(
+        call.kwargs["remove_container_on_error"] is False
+        for call in mock_run.call_args_list
+    )
     first_command = " ".join(mock_run.call_args_list[0].args[0])
     second_command = " ".join(mock_run.call_args_list[1].args[0])
     assert "--continue" not in first_command
@@ -1736,18 +1907,79 @@ def _claude_runner(tmp_path: Path, **config_kwargs: object) -> ClaudeCodeRunner:
         return ClaudeCodeRunner(Config(**config_kwargs))
 
 
+def test_claude_subscription_auth_spaces_request_starts(tmp_path: Path):
+    runner = _claude_runner(
+        tmp_path,
+        agent={
+            "provider": "claude-code",
+            "claude": {
+                "oauth_token": "sk-ant-oat01-test",
+                "subscription_request_delay_seconds": 45,
+            },
+        },
+    )
+    clock = [100.0]
+    sleeps: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    with patch("teich.runner.time.monotonic", side_effect=lambda: clock[0]), \
+         patch("teich.runner.time.sleep", side_effect=fake_sleep):
+        assert runner._wait_for_subscription_request_slot() == 0
+        clock[0] += 10
+        assert runner._wait_for_subscription_request_slot() == 35
+
+    assert sleeps == [35]
+    assert runner._last_subscription_request_at == 145
+
+
+def test_claude_api_auth_does_not_apply_subscription_delay(tmp_path: Path):
+    runner = _claude_runner(
+        tmp_path,
+        agent={
+            "provider": "claude-code",
+            "claude": {"subscription_request_delay_seconds": 45},
+        },
+        api={
+            "provider": "anthropic",
+            "api_key": "sk-ant-test",
+            "base_url": "https://api.anthropic.com",
+        },
+    )
+
+    with patch("teich.runner.time.sleep") as mock_sleep:
+        assert runner._wait_for_subscription_request_slot() == 0
+
+    mock_sleep.assert_not_called()
+    assert runner._last_subscription_request_at is None
 def test_claude_forwards_reasoning_effort_as_effort_flag(tmp_path: Path):
     runner = _claude_runner(tmp_path, model={"model": "claude-opus-4-8", "reasoning_effort": "xhigh"})
     assert "--effort xhigh" in runner._build_shell_command()
 
 
-def test_claude_forwards_fallback_model_chain(tmp_path: Path):
+def test_claude_uses_fallback_model_chain_for_interactive_retries(tmp_path: Path):
+    runner = _claude_runner(
+        tmp_path,
+        agent={
+            "provider": "claude-code",
+            "claude": {"fallback_model": ["claude-opus-4-8", "sonnet", "haiku", "sonnet"]},
+        },
+        model={"model": "claude-opus-4-8"},
+    )
+    assert runner._claude_retry_models() == [None, "sonnet", "haiku"]
+    assert "--fallback-model" not in runner._build_shell_command()
+
+
+def test_claude_custom_proxy_does_not_switch_fixed_target_model_on_retry(tmp_path: Path):
     runner = _claude_runner(
         tmp_path,
         agent={"provider": "claude-code", "claude": {"fallback_model": ["sonnet", "haiku"]}},
-        model={"model": "claude-opus-4-8"},
+        api={"provider": "openai", "api_key": "none", "base_url": "https://example.test/v1"},
+        model={"model": "custom-opus"},
     )
-    assert "--fallback-model sonnet,haiku" in runner._build_shell_command()
+    assert runner._claude_retry_models() == [None]
 
 
 def test_claude_omits_effort_and_fallback_flags_when_unset(tmp_path: Path):
@@ -1760,7 +1992,13 @@ def test_claude_omits_effort_and_fallback_flags_when_unset(tmp_path: Path):
 def test_claude_prepare_agent_home_writes_always_thinking(tmp_path: Path):
     runner = _claude_runner(
         tmp_path,
-        agent={"provider": "claude-code", "claude": {"always_thinking": True}},
+        agent={
+            "provider": "claude-code",
+            "claude": {
+                "always_thinking": True,
+                "show_thinking_summaries": None,
+            },
+        },
         model={"model": "claude-opus-4-8"},
     )
     home_dir = tmp_path / "home"
@@ -1770,12 +2008,37 @@ def test_claude_prepare_agent_home_writes_always_thinking(tmp_path: Path):
     assert settings == {"alwaysThinkingEnabled": True}
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_claude_prepare_agent_home_writes_thinking_summaries(
+    tmp_path: Path, enabled: bool
+):
+    runner = _claude_runner(
+        tmp_path,
+        agent={
+            "provider": "claude-code",
+            "claude": {
+                "always_thinking": None,
+                "show_thinking_summaries": enabled,
+            },
+        },
+        model={"model": "claude-opus-4-8"},
+    )
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    runner._prepare_agent_home(home_dir)
+    settings = json.loads((home_dir / "settings.json").read_text(encoding="utf-8"))
+    assert settings == {"showThinkingSummaries": enabled}
+
+
 def test_claude_prepare_agent_home_merges_thinking_with_langfuse_hooks(tmp_path: Path):
     runner = _claude_runner(
         tmp_path,
         agent={
             "provider": "claude-code",
-            "claude": {"always_thinking": False},
+            "claude": {
+                "always_thinking": False,
+                "show_thinking_summaries": True,
+            },
             "langfuse": {
                 "enabled": True,
                 "public_key": "pk-lf-x",
@@ -1790,16 +2053,64 @@ def test_claude_prepare_agent_home_merges_thinking_with_langfuse_hooks(tmp_path:
     runner._prepare_agent_home(home_dir)
     settings = json.loads((home_dir / "settings.json").read_text(encoding="utf-8"))
     assert settings["alwaysThinkingEnabled"] is False
+    assert settings["showThinkingSummaries"] is True
     assert "Stop" in settings["hooks"]
     assert "SessionEnd" in settings["hooks"]
 
 
-def test_claude_prepare_agent_home_writes_no_settings_by_default(tmp_path: Path):
+def test_claude_prepare_agent_home_enables_interactive_thinking_capture_by_default(
+    tmp_path: Path,
+):
     runner = _claude_runner(tmp_path, model={"model": "claude-opus-4-8"})
     home_dir = tmp_path / "home"
     home_dir.mkdir()
     runner._prepare_agent_home(home_dir)
-    assert not (home_dir / "settings.json").exists()
+    settings = json.loads((home_dir / "settings.json").read_text(encoding="utf-8"))
+    assert settings == {
+        "alwaysThinkingEnabled": True,
+        "showThinkingSummaries": True,
+    }
+    state = json.loads((home_dir / "teich-claude-state.json").read_text(encoding="utf-8"))
+    assert state["hasCompletedOnboarding"] is True
+    assert state["bypassPermissionsModeAccepted"] is True
+    assert state["projects"]["/workspace"]["hasTrustDialogAccepted"] is True
+
+
+def test_claude_docker_command_mounts_seeded_global_state(tmp_path: Path):
+    runner = _claude_runner(tmp_path)
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    runner._prepare_agent_home(home_dir)
+
+    command = runner._build_external_docker_base_command(
+        tmp_path / "workspace", home_dir, "teich-claude-state"
+    )
+
+    assert f"{home_dir / 'teich-claude-state.json'}:/home/codex/.claude.json" in command
+
+
+def test_required_harness_capture_retries_after_failure(tmp_path: Path):
+    config = Config(
+        capture_harness_context={"enabled": True, "required": True},
+        output={"traces_dir": tmp_path / "output"},
+    )
+    with patch.object(CodexRunner, "_ensure_image"):
+        runner = CodexRunner(config)
+    capture = HarnessContextCapture.from_request(
+        harness="codex",
+        harness_version="test",
+        wire_api="openai-responses",
+        request={"model": "test", "instructions": "Captured system", "tools": []},
+    )
+    with patch.object(
+        runner,
+        "capture_harness_context",
+        side_effect=[RuntimeError("first attempt"), capture],
+    ) as mocked:
+        with pytest.raises(RuntimeError, match="first attempt"):
+            runner._ensure_harness_context_capture()
+        assert runner._ensure_harness_context_capture() == capture
+    assert mocked.call_count == 2
 
 
 def test_claude_max_thinking_tokens_env_in_docker_command(tmp_path: Path):
@@ -2333,14 +2644,22 @@ def test_run_process_removes_named_container_on_failure():
             )
 
     mock_popen.assert_called_once()
-    process.terminate.assert_called_once()
-    mock_run.assert_called_with(
+    if os.name == "nt":
+        process.terminate.assert_not_called()
+        mock_run.assert_any_call(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+            check=False,
+            **runner_module.TEXT_SUBPROCESS_KWARGS,
+        )
+    else:
+        process.terminate.assert_called_once()
+    mock_run.assert_any_call(
         ["docker", "rm", "-f", "teich-codex-test"],
         capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
         check=False,
+        timeout=runner_module.DOCKER_CLEANUP_TIMEOUT_SECONDS,
+        **runner_module.TEXT_SUBPROCESS_KWARGS,
     )
 
 
@@ -4668,6 +4987,35 @@ def test_chat_runner_normalizes_openrouter_chat_completion_reasoning_usage():
     }
 
 
+def test_chat_runner_does_not_double_count_reasoning_when_total_is_missing():
+    usage = ChatRunner._normalize_usage(
+        {
+            "prompt_tokens": 263,
+            "completion_tokens": 80,
+            "completion_tokens_details": {"reasoning_tokens": 67},
+        }
+    )
+
+    assert usage == {
+        "input": 263,
+        "output": 80,
+        "reasoning": 67,
+        "totalTokens": 343,
+    }
+
+
+def test_chat_runner_ignores_malformed_token_detail_objects():
+    usage = ChatRunner._normalize_usage(
+        {
+            "input_tokens": 4,
+            "output_tokens": 3,
+            "output_tokens_details": ["not", "an", "object"],
+        }
+    )
+
+    assert usage == {"input": 4, "output": 3, "reasoning": 0, "totalTokens": 7}
+
+
 def test_chat_runner_uses_prompt_level_system_prompt(tmp_path: Path):
     config = Config(
         agent={"provider": "chat"},
@@ -4856,13 +5204,12 @@ def test_chat_runner_supports_follow_up_prompts_as_multiturn_rows(tmp_path: Path
         )
 
     row = json.loads(result.read_text(encoding="utf-8").strip())
-    assert row["prompt"] == "Build a todo app"
     assert row["follow_up_prompts"] == ["Now add tests"]
     assert row["responses"] == ["Initial answer", "Follow-up answer"]
-    assert row["response"] == "Follow-up answer"
-    assert row["thinking"] == "Need to revise."
+    assert {"prompt", "thinking", "response"}.isdisjoint(row)
     assert row["usage"]["totalTokens"] == 20
     assert [message["role"] for message in row["messages"]] == ["user", "assistant", "user", "assistant"]
+    assert row["messages"][-1]["thinking"] == "Need to revise."
 
     second_request = mock_urlopen.call_args_list[1].args[0]
     second_body = json.loads(second_request.data.decode("utf-8"))
@@ -5272,7 +5619,10 @@ def test_resume_treats_prompt_level_system_as_part_of_chat_completion_key(tmp_pa
 
     pending = pending_prompt_inputs_for_resume(prompt_inputs, output_dir)
 
-    assert pending == []
+    assert [(item.system, item.prompt) for item in pending] == [
+        (None, "Hello"),
+        ("Be thorough.", "Hello"),
+    ]
 
 
 def test_resume_matches_completed_agent_trace_when_configured_prompt_has_system(tmp_path: Path):
@@ -5293,7 +5643,7 @@ def test_resume_matches_completed_agent_trace_when_configured_prompt_has_system(
 
     pending = pending_prompt_inputs_for_resume(prompt_inputs, output_dir)
 
-    assert pending == []
+    assert pending == prompt_inputs
 
 
 def test_resume_detects_completed_chat_follow_up_prompt_sets(tmp_path: Path):
@@ -5623,11 +5973,9 @@ def test_chat_runner_resume_regenerates_incomplete_follow_up_row(tmp_path: Path)
     assert len(rows) == 2
     assert rows[0]["response"] == "Built"
     row = rows[1]
-    assert row["prompt"] == "Build app"
     assert row["follow_up_prompts"] == ["Add tests", "Polish"]
     assert row["responses"] == ["Rebuilt", "Tests added", "Polished"]
-    assert row["response"] == "Polished"
-    assert row["thinking"] == "replanned\n\nchecked"
+    assert {"prompt", "thinking", "response"}.isdisjoint(row)
     assert row["usage"] == {"input": 6, "output": 10, "reasoning": 0, "totalTokens": 16}
     assert [message["role"] for message in row["messages"]] == [
         "user",
@@ -5698,6 +6046,7 @@ def test_chat_runner_resume_regenerates_existing_partial_follow_up_row(tmp_path:
     assert rows[0]["follow_up_prompts"] == ["Add tests"]
     assert rows[1]["follow_up_prompts"] == ["Add tests", "Polish"]
     assert rows[1]["responses"] == ["Rebuilt", "Retested", "Polished"]
+    assert {"prompt", "thinking", "response"}.isdisjoint(rows[1])
     assert [call[0] for call in calls] == ["Build app", "Add tests", "Polish"]
     assert calls[0][1] == []
     assert calls[1][1][-2:] == [
@@ -5800,6 +6149,65 @@ def test_chat_run_all_times_out_hung_worker_without_waiting_forever(tmp_path: Pa
             assert time.monotonic() - start < 3
     finally:
         release.set()
+
+
+def test_chat_run_all_does_not_write_a_response_after_returning_timeout(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini"),
+        api=APIConfig(provider="openai", api_key="sk-test", wire_api="responses"),
+        prompts=["hung"],
+        output={"traces_dir": tmp_path / "output"},
+        timeout_seconds=1,
+    )
+    runner = ChatRunner(config)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def blocked_conversation(prompt_input):
+        started.set()
+        release.wait(timeout=5)
+        finished.set()
+        return {
+            "prompt": prompt_input.prompt,
+            "response": "late response",
+            "messages": [
+                {"role": "user", "content": prompt_input.prompt},
+                {"role": "assistant", "content": "late response"},
+            ],
+        }
+
+    destination = tmp_path / "output" / "chat.jsonl"
+    try:
+        with patch.object(runner, "_request_chat_conversation", side_effect=blocked_conversation):
+            with pytest.raises(RuntimeError, match="timed out"):
+                runner.run_all(max_concurrency=1)
+            assert started.is_set()
+            release.set()
+            assert finished.wait(timeout=2)
+    finally:
+        release.set()
+
+    assert not destination.exists()
+
+
+def test_chat_runner_stop_signal_cancels_registered_batches(tmp_path: Path):
+    config = Config(
+        agent={"provider": "chat"},
+        model=ModelConfig(model="gpt-4.1-mini"),
+        api=APIConfig(provider="openai", api_key="sk-test", wire_api="responses"),
+        output={"traces_dir": tmp_path / "output"},
+    )
+    runner = ChatRunner(config)
+    cancel_event = threading.Event()
+    runner._register_chat_cancel_event(cancel_event)
+    try:
+        runner._terminate_active_processes()
+    finally:
+        runner._unregister_chat_cancel_event()
+
+    assert cancel_event.is_set()
 
 
 def test_chat_run_all_propagates_keyboard_interrupt_without_waiting_for_workers(tmp_path: Path):
@@ -6266,7 +6674,7 @@ def test_pi_runner_appends_prompt_level_system_metadata_at_end(tmp_path: Path):
     ]
     trace_file.write_text("\n".join(native_lines) + "\n", encoding="utf-8")
 
-    runner._append_pi_system_prompt_metadata(
+    runner._append_prompt_system_metadata(
         trace_file,
         PromptInput(prompt="Hello", system="Use the prompt-level system."),
     )
@@ -6365,7 +6773,7 @@ def test_pi_runner_does_not_duplicate_prompt_level_system_metadata(tmp_path: Pat
     )
     before = trace_file.read_text(encoding="utf-8")
 
-    runner._append_pi_system_prompt_metadata(
+    runner._append_prompt_system_metadata(
         trace_file,
         PromptInput(prompt="Hello", system="Use the prompt-level system."),
     )

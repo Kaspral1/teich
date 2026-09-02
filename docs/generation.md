@@ -81,7 +81,7 @@ teich extract codex --model gpt-5-codex --out codex-data
 
 `--model` filters by provider model metadata, not by arbitrary prompt text. This keeps traces that actually ran with matching model identifiers such as `claude-fable-5` and excludes traces that only mention the model name in conversation text.
 
-After extraction, Teich automatically scrubs API keys, emails, and home-directory usernames while preserving embedded media payloads for conversation context. It then prints the replacement counts and asks whether to upload to Hugging Face. If you need a raw, unchanged local export, pass `--no-anon` or `--no-anonymize`:
+After extraction, Teich automatically scrubs API keys, emails, contextual PII, home-directory usernames, and embedded media payloads. Redacted media remains decoder-valid, with the MIME type normalized when a fallback image, audio, or video format is required. Teich then prints the replacement counts and asks whether to upload to Hugging Face. If you need a raw, unchanged local export, pass `--no-anon` or `--no-anonymize`:
 
 ```bash
 teich extract codex --sessions-dir /path/to/.codex --out raw-codex-data --no-anon
@@ -97,7 +97,7 @@ To turn raw or extracted traces into standalone OpenAI-style JSONL rows that do 
 teich convert data --out teich-training.jsonl
 ```
 
-The output file is newline-delimited JSON with `prompt`, `messages`, `tools`, and `metadata` fields. Use this when another trainer already knows how to consume standalone OpenAI-style message rows. Use `prepare_data()` and `mask_data()` when you want Teich to render a specific tokenizer chat template and create exact response-only labels.
+The output file is newline-delimited JSON with `prompt`, `messages`, `tools`, `metadata`, and an optional captured `system` field. Use this when another trainer already knows how to consume standalone OpenAI-style message rows. Use `prepare_data()` and `mask_data()` when you want Teich to render a specific tokenizer chat template and create exact response-only labels.
 
 ## Browser UI
 
@@ -164,6 +164,29 @@ Generated-run dataset tags are generated from provider and model. Extraction dat
 - `chat`: `conversational`, model, `distillation`, `teich`
 
 If `publish.hf_token` is omitted, Teich also accepts `HF_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, or `TEICH_HF_TOKEN`.
+
+### Capture harness context without provider traffic
+
+Codex and Claude Code add substantial client-side instructions and tool schemas before a request reaches the model. Teich can capture that client-visible context with one preflight request to a local fake provider:
+
+```yaml
+capture_harness_context:
+  enabled: true
+  required: true
+  timeout_seconds: 45
+```
+
+The preflight uses the same installed harness, model, reasoning settings, developer instructions, MCP configuration, permission mode, and an empty isolated workspace. It supports Codex's Responses wire protocol and Claude Code's Anthropic Messages protocol. It sends dummy credentials only to a random authenticated local endpoint, does not contact the real provider, and does not consume API or subscription quota. Authentication headers, user messages, and arbitrary request metadata are never retained.
+
+Teich appends the normalized capture and its deterministic hash to every raw trace. `teich convert` exposes captured instructions as a top-level `system` field and adds request-visible tool declarations that were missing from the native trace without replacing trace-native schemas. Per-session context such as repository instructions, skills, hooks, MCP state, and recaps remains in the converted `messages` where the native trace recorded it.
+
+To inspect a capture without running a generation batch:
+
+```bash
+teich capture-context -c config.yaml -o harness-context.json
+```
+
+This captures only what the harness sends over the client-provider boundary. It cannot recover provider-side instructions, server-added policy, or hidden raw chain-of-thought that never reaches the client.
 
 ## Outputs
 
@@ -248,9 +271,12 @@ model:
   model: gpt-5.5
   reasoning_effort: xhigh     # depth of reasoning
   reasoning_summary: detailed # how much of it is summarized into the trace
+  reasoning_summaries_enabled: true # force-enable the capability when needed
 ```
 
-Teich writes `model_reasoning_summary = "detailed"` into `config.toml`. Values are `auto | concise | detailed | none` (free-form passthrough); leave unset to use Codex's default. Note this controls the *summary* of the reasoning, not the raw chain-of-thought — Codex/OpenAI never return the full raw CoT in plaintext.
+Teich writes `model_reasoning_summary = "detailed"` and, when the explicit toggle is set, `model_supports_reasoning_summaries = true` into `config.toml`. Summary values are `auto | concise | detailed | none` (free-form passthrough); leave either setting unset to use Codex's model catalog/default. The capability toggle is most useful for custom provider/model IDs that Codex cannot identify. These settings control the readable *summary* of the reasoning, not the raw chain-of-thought — Codex/OpenAI never return the full raw CoT in plaintext.
+
+A complete runnable example is in [`examples/config.codex-reasoning.yaml`](../examples/config.codex-reasoning.yaml).
 
 ### Developer instructions / CoT narration (all agents)
 
@@ -316,6 +342,11 @@ Compared to Codex host auth this is much simpler, by design:
 
 - **No broker, no rotation.** The setup-token credential is a durable token, so containers can share it at any `max_concurrency`, and it does not disturb your interactive host login (no re-login needed afterward).
 - **Billing goes to the plan.** Usage counts against your subscription's rate-limit windows (5-hour/weekly), not pay-per-token API credits. Hitting the plan limit behaves like hitting it interactively.
+- **Subscription requests are paced by default.** Teich spaces Claude request
+  starts 45 seconds apart across the whole runner, including follow-up turns,
+  Teich retries, and concurrent workers. Set
+  `agent.claude.subscription_request_delay_seconds: 0` to disable it or choose
+  a different interval. API-key and custom-base-URL runs ignore this setting.
 - **Works from any host.** The token is just an env var — no credentials file to find (macOS keeps the interactive login in the Keychain, which containers can't read anyway).
 - **No custom base URL.** Subscription auth talks to the first-party Anthropic API. An explicit `api.base_url` (which includes the OpenRouter proxy path) keeps the API/proxy path: an ambient env token is ignored there (with a notice), and configuring `agent.claude.oauth_token` together with `api.base_url` is rejected.
 
@@ -325,8 +356,10 @@ Compared to Codex host auth this is much simpler, by design:
 agent:
   provider: claude-code
   claude:
-    fallback_model: [sonnet, haiku]  # --fallback-model chain, tried in order on overload
+    subscription_request_delay_seconds: 45  # subscription auth only; 0 disables pacing
+    fallback_model: [sonnet, haiku]  # models Teich tries across batch retries
     always_thinking: true            # alwaysThinkingEnabled in the container's settings.json
+    show_thinking_summaries: true    # showThinkingSummaries requests readable summaries
     max_thinking_tokens: 31999       # MAX_THINKING_TOKENS env; 0 disables thinking where allowed
 
 model:
@@ -338,12 +371,16 @@ How each setting reaches Claude Code:
 
 | Setting | Mechanism |
 |---------|-----------|
+| `agent.claude.subscription_request_delay_seconds` | Minimum interval between subscription-auth request starts across the runner; ignored for API-key/custom-base-URL runs |
 | `model.reasoning_effort` | `--effort` CLI flag (shared field: Codex forwards it as `model_reasoning_effort`, Pi normalizes it) |
-| `agent.claude.fallback_model` | `--fallback-model` CLI flag; a list is joined to Claude Code's comma-separated form, and Claude Code keeps up to 3 models after dedup |
+| `agent.claude.fallback_model` | Batch mode switches `--model` across Teich retries, up to 3 deduplicated fallbacks; Claude's native `--fallback-model` is print-mode-only and is not sent to the interactive runner or Studio |
 | `agent.claude.always_thinking` | `alwaysThinkingEnabled` in the seeded `~/.claude/settings.json` (merged with the Langfuse hooks when tracing is on) |
+| `agent.claude.show_thinking_summaries` | `showThinkingSummaries` in the seeded settings; asks Claude Code for readable summaries instead of only opaque/redacted thinking where supported |
 | `agent.claude.max_thinking_tokens` | `MAX_THINKING_TOKENS` container env var |
 
-All four are optional free-form passthroughs; leave them unset to use Claude Code's defaults. Note that models with adaptive reasoning treat effort as the primary control and thinking budgets as advisory.
+Batch generation and Studio both seed these settings into their Claude homes. Batch generation launches the normal interactive CLI inside a real PTY, watches the native transcript until every requested turn is complete, and then exits cleanly; this avoids the readable-summary suppression in Claude Code's non-interactive `-p` mode. `always_thinking` and `show_thinking_summaries` default to `true`; set either to `false` to opt out. The other model/thinking settings are optional passthroughs. Subscription pacing defaults to 45 seconds. Models with adaptive reasoning treat effort as the primary control and ignore nonzero fixed thinking budgets. Anthropic can still return `redacted_thinking` for safety reasons; Teich preserves that native block but cannot decrypt it.
+
+A complete runnable example is in [`examples/config.claude-code-thinking.yaml`](../examples/config.claude-code-thinking.yaml).
 
 ### `hermes`
 
@@ -373,7 +410,11 @@ api:
   wire_api: responses
 ```
 
-A generated line contains `messages`, `prompt`, optional `thinking`, final `response`, and `model`. With follow-ups, the same row includes alternating `user` and `assistant` messages, `follow_up_prompts`, per-turn `responses`, and final `response`.
+A single-turn generated line contains `messages`, `prompt`, optional `thinking`,
+`response`, and `model`. With follow-ups, `messages` is the authoritative
+conversation and contains alternating `user` and `assistant` turns; the row
+also includes `follow_up_prompts`, per-turn `responses`, and `model`, but omits
+the single-turn `prompt`, `thinking`, and `response` convenience columns.
 
 ## Local Providers
 

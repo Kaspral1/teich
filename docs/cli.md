@@ -87,7 +87,7 @@ Convert raw or extracted traces into standalone OpenAI-style training JSONL:
 teich convert data --out teich-training.jsonl
 ```
 
-Each output line contains `prompt`, `messages`, `tools`, and `metadata`. Use this when your training stack can consume standalone OpenAI-style message rows without importing Teich. Use `prepare_data()` and `mask_data()` when you want tokenizer-specific rendering and exact response-only labels.
+Each output line contains `prompt`, `messages`, `tools`, `metadata`, and an optional captured `system` field. Use this when your training stack can consume standalone OpenAI-style message rows without importing Teich. Use `prepare_data()` and `mask_data()` when you want tokenizer-specific rendering and exact response-only labels.
 
 ## Anonymize
 
@@ -98,7 +98,7 @@ teich anonymize output --output output_anonymized
 teich anonymize data --in-place
 ```
 
-Anonymization replaces API keys, email addresses, and home-directory usernames with deterministic dummy values while preserving embedded base64 media payloads. It is a best-effort pass; review data before publishing.
+Anonymization replaces known credential formats, high-confidence secret assignments, personal email addresses, contextual PII, home-directory usernames, and embedded base64 media with deterministic dummy values. Media replacements are tiny decoder-valid payloads; unsupported subtypes are relabeled to the actual image, audio, or video placeholder format so multimodal loaders do not receive false MIME declarations. Reserved example-domain addresses, known public bot addresses, provider thinking signatures, placeholders, and common public IDs are preserved to avoid corrupting training data. User, assistant, reasoning, and structured tool content all pass through the same high-confidence privacy scanner. Reported totals are replacement occurrences rather than estimates of unique secrets. It is a best-effort pass; review data before publishing.
 
 ## Studio
 

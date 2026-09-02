@@ -1,10 +1,14 @@
+import base64
 import json
 import os
 import sqlite3
 from pathlib import Path
+import subprocess
+import sys
 import re
 from unittest.mock import MagicMock, patch
 
+import pytest
 from typer.testing import CliRunner
 
 from teich import anonymize as anonymize_module
@@ -599,7 +603,10 @@ def test_extract_codex_from_explicit_sessions_dir(tmp_path: Path):
     assert extracted.exists()
     assert (output_dir / "README.md").exists()
     assert "Extracted 1 codex trace" in result.output
-    assert "Automatically scrambled 0 API keys, 0 email addresses, and 0 username references" in result.output
+    assert (
+        "Automatically scrambled 0 credential-like value occurrences, "
+        "0 email address occurrences, and 0 username references"
+    ) in result.output
     assert "Data was written to" in result.output
 
 
@@ -1145,7 +1152,7 @@ def test_extract_defaults_to_data_folder_and_anonymizes_before_prompt(tmp_path: 
                             "content": [
                                 {
                                     "type": "input_text",
-                                    "text": f"hello from /home/alice/project alice@example.com {original_key}",
+                                    "text": f"hello from /home/alice/project alice@company.io {original_key}",
                                 }
                             ],
                         },
@@ -1164,7 +1171,10 @@ def test_extract_defaults_to_data_folder_and_anonymizes_before_prompt(tmp_path: 
 
     assert result.exit_code == 0
     assert "Extracted 1 codex trace" in result.output
-    assert "Automatically scrambled 1 API keys, 1 email addresses, and 1 username references" in result.output
+    assert (
+        "Automatically scrambled 1 credential-like value occurrences, "
+        "1 email address occurrences, and 1 username references"
+    ) in result.output
     assert "Data was written to data" in result.output
     assert "Would you like to upload to Hugging Face?" in result.output
     assert "/home/user1/project" in text
@@ -1172,7 +1182,7 @@ def test_extract_defaults_to_data_folder_and_anonymizes_before_prompt(tmp_path: 
     assert "redacted_api_key_" in text
     assert "sk-or-v1-" not in text
     assert original_key not in text
-    assert "alice@example.com" not in text
+    assert "alice@company.io" not in text
 
 
 def test_extract_no_anon_skips_automatic_anonymization(tmp_path: Path):
@@ -1192,7 +1202,7 @@ def test_extract_no_anon_skips_automatic_anonymization(tmp_path: Path):
                             "content": [
                                 {
                                     "type": "input_text",
-                                    "text": f"hello from /home/alice/project alice@example.com {original_key}",
+                                    "text": f"hello from /home/alice/project alice@company.io {original_key}",
                                 }
                             ],
                         },
@@ -1216,7 +1226,7 @@ def test_extract_no_anon_skips_automatic_anonymization(tmp_path: Path):
     assert "Skipped anonymization because --no-anon was passed" in result.output
     assert "Automatically scrambled" not in result.output
     assert "/home/alice/project" in text
-    assert "alice@example.com" in text
+    assert "alice@company.io" in text
     assert original_key in text
 
 
@@ -1229,7 +1239,7 @@ def test_extract_inline_anonymization_scrubs_traces_and_leftover_text(tmp_path: 
             json.dumps(
                 {
                     "type": "message",
-                    "text": f"/home/alice/project alice@example.com {original_key}",
+                    "text": f"/home/alice/project alice@company.io {original_key}",
                 }
             )
             + "\n",
@@ -1239,9 +1249,9 @@ def test_extract_inline_anonymization_scrubs_traces_and_leftover_text(tmp_path: 
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     stale_text = output_dir / "notes.txt"
-    stale_text.write_text(f"alice@example.com {original_key}\n", encoding="utf-8")
+    stale_text.write_text(f"alice@company.io {original_key}\n", encoding="utf-8")
     stale_binary = output_dir / "archive.bin"
-    stale_binary.write_bytes(b"alice@example.com sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456")
+    stale_binary.write_bytes(b"alice@company.io sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456")
     progress_updates: list[tuple[str, int, int | None, dict[str, int]]] = []
 
     result = extract_local_sessions(
@@ -1263,7 +1273,7 @@ def test_extract_inline_anonymization_scrubs_traces_and_leftover_text(tmp_path: 
         "notes.txt",
     ]
     assert [update[1] for update in progress_updates] == [1, 2, 3, 4]
-    assert all(update[2] is None for update in progress_updates)
+    assert [update[2] for update in progress_updates] == [2, 2, None, None]
     assert {
         key: sum(update[3].get(key, 0) for update in progress_updates)
         for key in ("email", "username", "api_key")
@@ -1275,7 +1285,7 @@ def test_extract_inline_anonymization_scrubs_traces_and_leftover_text(tmp_path: 
         assert original_key not in text
     assert "redacted-user1@example.com" in stale_text.read_text(encoding="utf-8")
     assert original_key not in stale_text.read_text(encoding="utf-8")
-    assert stale_binary.read_bytes() == b"alice@example.com sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"
+    assert stale_binary.read_bytes() == b"alice@company.io sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"
 
 
 def test_extract_does_not_scrub_leftovers_when_no_trace_was_copied(tmp_path: Path):
@@ -1284,7 +1294,7 @@ def test_extract_does_not_scrub_leftovers_when_no_trace_was_copied(tmp_path: Pat
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     stale_text = output_dir / "notes.txt"
-    stale_text.write_text("alice@example.com\n", encoding="utf-8")
+    stale_text.write_text("alice@company.io\n", encoding="utf-8")
 
     result = extract_local_sessions(
         "codex",
@@ -1295,7 +1305,7 @@ def test_extract_does_not_scrub_leftovers_when_no_trace_was_copied(tmp_path: Pat
     )
 
     assert result.copied_files == []
-    assert stale_text.read_text(encoding="utf-8") == "alice@example.com\n"
+    assert stale_text.read_text(encoding="utf-8") == "alice@company.io\n"
 
 
 def test_extract_model_filter_for_codex_claude_cursor_pi_and_hermes(tmp_path: Path):
@@ -1440,7 +1450,7 @@ def test_extract_claude_preserves_raw_order_and_only_anonymizes_inline(tmp_path:
     raw_lines = [
         (
             '{"type":"last-prompt","sessionId":"claude-session",'
-            f'"lastPrompt":"Email alice@example.com key {secret_key} path /home/alice/project"}}\n'
+            f'"lastPrompt":"Email alice@company.io key {secret_key} path /home/alice/project"}}\n'
         ),
         '{ "type": "mode", "mode": "normal", "sessionId": "claude-session" }\n',
         '{"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"claude-session"}\n',
@@ -1477,7 +1487,10 @@ def test_extract_claude_preserves_raw_order_and_only_anonymizes_inline(tmp_path:
     )
 
     assert result.exit_code == 0, result.output
-    assert "Automatically scrambled 1 API keys, 1 email addresses, and 1 username references" in result.output
+    assert (
+        "Automatically scrambled 1 credential-like value occurrences, "
+        "1 email address occurrences, and 1 username references"
+    ) in result.output
     extracted_file = output_dir / "session.jsonl"
     extracted_lines = extracted_file.read_text(encoding="utf-8").splitlines(keepends=True)
     assert [json.loads(line)["type"] for line in extracted_lines] == [
@@ -1491,7 +1504,7 @@ def test_extract_claude_preserves_raw_order_and_only_anonymizes_inline(tmp_path:
         "permission-mode",
     ]
     assert extracted_lines[1:] == raw_lines[1:]
-    assert "alice@example.com" not in extracted_lines[0]
+    assert "alice@company.io" not in extracted_lines[0]
     assert secret_key not in extracted_lines[0]
     assert "/home/alice" not in extracted_lines[0]
     assert "redacted-user1@example.com" in extracted_lines[0]
@@ -1539,12 +1552,103 @@ def test_extract_refreshes_flat_output_before_writing(tmp_path: Path):
     )
 
     assert result.exit_code == 0
-    assert "Automatically scrambled 0 API keys, 0 email addresses, and 0 username references" in result.output
+    assert (
+        "Automatically scrambled 0 credential-like value occurrences, "
+        "0 email address occurrences, and 0 username references"
+    ) in result.output
     assert not stale_file.exists()
     assert not stale_legacy_file.exists()
     assert not stale_legacy_file.parent.exists()
     assert (output_dir / "fable.jsonl").exists()
     assert len(list(output_dir.glob("*.jsonl"))) == 1
+
+
+def test_extract_refresh_preserves_existing_output_when_no_session_matches(tmp_path: Path):
+    sessions_dir = tmp_path / "codex"
+    sessions_dir.mkdir()
+    (sessions_dir / "other-model.jsonl").write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "other", "model": "other-model"}}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "data"
+    output_dir.mkdir()
+    previous = output_dir / "previous.jsonl"
+    previous_text = json.dumps({"prompt": "keep", "response": "me"}) + "\n"
+    previous.write_text(previous_text, encoding="utf-8")
+
+    result = extract_local_sessions(
+        "codex",
+        output_dir=output_dir,
+        sources=[sessions_dir],
+        model_filter="missing-model",
+        clear_destination=True,
+    )
+
+    assert result.copied_files == []
+    assert previous.read_text(encoding="utf-8") == previous_text
+
+
+def test_extract_refresh_refuses_output_that_contains_its_source(tmp_path: Path):
+    source = tmp_path / "data" / "sessions"
+    source.mkdir(parents=True)
+    trace = source / "session.jsonl"
+    trace.write_text(json.dumps({"type": "session_meta", "payload": {"id": "keep"}}) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="contains extraction source"):
+        extract_local_sessions(
+            "codex",
+            output_dir=tmp_path / "data",
+            sources=[source],
+            clear_destination=True,
+        )
+
+    assert trace.exists()
+
+
+def test_extract_refresh_skips_existing_output_inside_source(tmp_path: Path):
+    source = tmp_path / "sessions"
+    source.mkdir()
+    trace = source / "session.jsonl"
+    trace.write_text(json.dumps({"type": "session_meta", "payload": {"id": "keep"}}) + "\n", encoding="utf-8")
+    output_dir = source / "export"
+    output_dir.mkdir()
+    previous = output_dir / "previous.jsonl"
+    previous.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "previous"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    result = extract_local_sessions(
+        "codex",
+        output_dir=output_dir,
+        sources=[source],
+        clear_destination=True,
+    )
+
+    assert [path.name for path in result.copied_files] == ["session.jsonl"]
+    assert trace.exists()
+    assert not previous.exists()
+    assert (output_dir / "session.jsonl").exists()
+
+
+def test_extract_skips_existing_output_files_when_output_is_inside_source(tmp_path: Path):
+    source = tmp_path / "sessions"
+    source.mkdir()
+    trace = source / "session.jsonl"
+    trace.write_text(json.dumps({"type": "session_meta", "payload": {"id": "source"}}) + "\n", encoding="utf-8")
+    output_dir = source / "export"
+    output_dir.mkdir()
+    previous = output_dir / "previous.jsonl"
+    previous.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "previous"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    result = extract_local_sessions("codex", output_dir=output_dir, sources=[source])
+
+    assert [path.name for path in result.copied_files] == ["session.jsonl"]
+    assert previous.exists()
+    assert (output_dir / "session.jsonl").exists()
 
 
 def test_extract_can_upload_staged_anonymized_output_to_huggingface(tmp_path: Path):
@@ -1591,6 +1695,7 @@ def test_extract_can_upload_staged_anonymized_output_to_huggingface(tmp_path: Pa
         folder_path=str(output_dir),
         repo_type="dataset",
         private=False,
+        allow_patterns=["*.jsonl", "**/*.jsonl", "*.metadata.json", "**/*.metadata.json"],
         ignore_patterns=["partials/**", "failures/**", "README.md", "tools.json"],
     )
     mock_api.upload_folder.assert_called_once_with(
@@ -1691,8 +1796,8 @@ def test_anonymize_replaces_emails_keys_and_home_usernames_consistently(tmp_path
                 "windows_path": "C:\\Users\\alice\\Documents\\repo",
                 "encoded_project_path": "projects/-home-alice-Documents-repo/session.jsonl\n-home-alice",
                 "listing": "drwxrwxr-x 2 alice alice 4096 Jun 11 18:40 -home-alice",
-                "email": "alice@example.com",
-                "message": f"email alice@example.com key {original_key}",
+                "email": "alice@company.io",
+                "message": f"email alice@company.io key {original_key}",
             }
         )
         + "\n",
@@ -1716,9 +1821,9 @@ def test_anonymize_replaces_emails_keys_and_home_usernames_consistently(tmp_path
     assert "redacted_api_key_" in text
     assert "sk-or-v1-" not in text
     assert original_key not in text
-    assert "email=2" in result.output
-    assert "username=7" in result.output
-    assert "api_key=1" in result.output
+    assert "email_occurrences=2" in result.output
+    assert "username_references=7" in result.output
+    assert "credential_occurrences=1" in result.output
 
 
 def test_anonymize_parallel_worker_count_caps_windows(monkeypatch):
@@ -1728,31 +1833,65 @@ def test_anonymize_parallel_worker_count_caps_windows(monkeypatch):
     assert anonymize_module._process_worker_count(100) == 61
 
 
-def test_anonymize_path_progress_preserves_parallel_report_order(tmp_path: Path):
+def test_anonymize_large_batch_uses_process_workers(tmp_path: Path):
+    sources = []
+    for index in range(8):
+        source = tmp_path / f"large-{index}.jsonl"
+        source.write_bytes(b"x" * (128 * 1024))
+        sources.append(source)
+
+    assert anonymize_module._use_process_workers(sources, workers=8) is True
+
+
+def test_anonymize_path_small_batch_avoids_process_startup_and_reports_progress(tmp_path: Path):
     input_dir = tmp_path / "input"
     input_dir.mkdir()
     for index in reversed(range(9)):
         (input_dir / f"trace-{index}.jsonl").write_text(
-            json.dumps({"message": f"user{index}@example.com"}) + "\n",
+            json.dumps({"message": f"user{index}@company.io"}) + "\n",
             encoding="utf-8",
         )
     updates = []
 
-    report = anonymize_module.anonymize_path(
-        input_dir,
-        tmp_path / "output",
-        progress=lambda file_report, done, total: updates.append((file_report, done, total)),
-    )
+    with patch.object(
+        anonymize_module,
+        "ProcessPoolExecutor",
+        side_effect=AssertionError("tiny files should stay in-process"),
+    ):
+        report = anonymize_module.anonymize_path(
+            input_dir,
+            tmp_path / "output",
+            progress=lambda file_report, done, total: updates.append((file_report, done, total)),
+        )
 
-    assert [update[0].path.name for update in updates] == [f"trace-{index}.jsonl" for index in range(9)]
+    assert {update[0].path.name for update in updates} == {f"trace-{index}.jsonl" for index in range(9)}
     assert [update[1] for update in updates] == list(range(1, 10))
     assert [update[2] for update in updates] == [9] * 9
+    assert [item.path.name for item in report.files] == [f"trace-{index}.jsonl" for index in range(9)]
     assert sum(update[0].replacements.get("email", 0) for update in updates) == report.totals["email"] == 9
+
+
+def test_extract_without_model_filter_does_not_parse_each_jsonl_before_anonymizing(tmp_path: Path):
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    source = sessions_dir / "trace.jsonl"
+    source.write_text(json.dumps({"message": "alice@company.io"}) + "\n", encoding="utf-8")
+
+    with patch("teich.extract._read_jsonl_dict_events", side_effect=AssertionError("redundant parse")):
+        result = extract_local_sessions(
+            "codex",
+            output_dir=tmp_path / "output",
+            sources=[sessions_dir],
+            anonymize=True,
+        )
+
+    assert result.count == 1
+    assert "alice@company.io" not in result.copied_files[0].read_text(encoding="utf-8")
 
 
 def test_anonymize_cli_updates_tqdm_progress(tmp_path: Path):
     source = tmp_path / "trace.jsonl"
-    source.write_text(json.dumps({"message": "alice@example.com"}) + "\n", encoding="utf-8")
+    source.write_text(json.dumps({"message": "alice@company.io"}) + "\n", encoding="utf-8")
     bar = MagicMock()
     bar.n = 0
 
@@ -1765,7 +1904,7 @@ def test_anonymize_cli_updates_tqdm_progress(tmp_path: Path):
     assert bar.total == 1
     bar.update.assert_called_once_with(1)
     bar.set_postfix.assert_called_once_with(
-        keys=0,
+        credentials=0,
         emails=1,
         users=0,
         file="trace.jsonl",
@@ -1779,7 +1918,7 @@ def test_anonymize_jsonl_preserves_valid_json_after_escaped_path_replacements(tm
     original_key = "sk-abcdefghijklmnopqrstuvwxyz1234567890"
     row = {
         "path": r"C:\Users\alice\Documents\repo",
-        "message": f"Email alice@example.com and use {original_key}",
+        "message": f"Email alice@company.io and use {original_key}",
     }
     (input_dir / "trace.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
     output_dir = tmp_path / "anonymized"
@@ -1893,8 +2032,7 @@ def test_anonymize_generalizes_to_synthetic_secret_and_reference_matrix(tmp_path
     assert "PROJECT_SECRET=redacted_" in text
     assert "process.env.PROJECT_SECRET" in text
     assert "sk-Mmu5OJR5NQoTJOGj6z6cHPraZ35yuZfK" not in text
-    assert image_data in text
-    assert "redacted_base64" not in text
+    assert image_data not in text
     assert "@src/main.ts" in text
     assert "@docs/*.md" in text
     assert "@scope/package" in text
@@ -2011,14 +2149,14 @@ def test_anonymize_scrubs_supabase_database_and_structured_secret_surfaces(tmp_p
     assert "supportsLocalAgentJwt" in text
     assert "abcdefghijklmnopqrstuvwxyz1234567890" in text
     assert "maxTokens" in text
-    assert "api_key=" in result.output
+    assert "credential_occurrences=" in result.output
 
 
 def test_anonymize_keeps_secret_replacements_consistent_per_trace(tmp_path: Path):
     input_dir = tmp_path / "output"
     input_dir.mkdir()
     key = "sk-proj-abcdefghijklmnopqrstuvwxyzABCDEFGHIJK"
-    email = "operator@example.net"
+    email = "operator@company.net"
     (input_dir / "trace.jsonl").write_text(
         json.dumps(
             {
@@ -2085,10 +2223,10 @@ def test_anonymize_scrubs_env_style_keys_without_scrubbing_tokenizer_terms(tmp_p
     assert "AutoTokenizer.from_pretrained" in text
     assert "PROCEDURAL_WARMUP_TOKENS" in text
     assert "adapter.supportsLocalAgentJwt" in text
-    assert "api_key=3" in result.output
+    assert "credential_occurrences=3" in result.output
 
 
-def test_anonymize_preserves_base64_media_payloads_without_touching_metadata(tmp_path: Path):
+def test_anonymize_redacts_base64_media_payloads_without_touching_metadata(tmp_path: Path):
     input_dir = tmp_path / "output"
     input_dir.mkdir()
     image_data = "aGVsbG8=" * 40
@@ -2119,9 +2257,51 @@ def test_anonymize_preserves_base64_media_payloads_without_touching_metadata(tmp
     source = row["content"][0]["source"]
     assert source["type"] == "base64"
     assert source["media_type"] == "image/png"
-    assert source["data"] == image_data
-    assert image_data in json.dumps(row)
-    assert "image_data" not in result.output
+    assert source["data"] != image_data
+    assert image_data not in json.dumps(row)
+    assert base64.b64decode(source["data"]).startswith(b"\x89PNG\r\n\x1a\n")
+
+
+@pytest.mark.parametrize(
+    ("declared_type", "replacement_type", "signature"),
+    [
+        ("image/jpeg", "image/jpeg", b"\xff\xd8\xff"),
+        ("image/avif", "image/png", b"\x89PNG\r\n\x1a\n"),
+        ("audio/mpeg", "audio/wav", b"RIFF"),
+        ("video/mp4", "video/webm", b"\x1aE\xdf\xa3"),
+    ],
+)
+def test_anonymize_media_placeholder_matches_output_mime_type(
+    declared_type: str,
+    replacement_type: str,
+    signature: bytes,
+):
+    anonymizer = anonymize_module.TraceAnonymizer()
+    original_data = base64.b64encode(b"private media bytes" * 32).decode("ascii")
+
+    redacted = anonymizer.anonymize_value(
+        {
+            "type": "base64",
+            "media_type": declared_type,
+            "data": original_data,
+        }
+    )
+
+    assert redacted["media_type"] == replacement_type
+    assert base64.b64decode(redacted["data"]).startswith(signature)
+    assert redacted["data"] != original_data
+
+
+def test_anonymize_name_matcher_preserves_lowercase_code_and_yaml_values():
+    anonymizer = anonymize_module.TraceAnonymizer()
+    text = "name: npm install\nname: Run tests\nmy name is Jane Doe"
+
+    redacted = anonymizer.anonymize_text(text)
+
+    assert "name: npm install" in redacted
+    assert "name: Run tests" in redacted
+    assert "Jane Doe" not in redacted
+    assert "my name is redacted_pii_" in redacted
 
 
 def test_anonymize_does_not_treat_systemd_units_as_emails(tmp_path: Path):
@@ -2140,7 +2320,9 @@ def test_anonymize_does_not_treat_systemd_units_as_emails(tmp_path: Path):
                         "package source ssh://user3@example.com/user/repo",
                         "Keep repo@feature.module and package@v1.2.3 as code references",
                         "Keep user@example.test because it is a reserved test-domain reference",
-                        "contact 'lane@example.com' for help",
+                        "Keep alice@example.com because example.com is reserved for documentation",
+                        "Keep public attribution noreply@anthropic.com unchanged",
+                        "contact 'lane@company.io' for help",
                     ]
                 )
             }
@@ -2164,9 +2346,230 @@ def test_anonymize_does_not_treat_systemd_units_as_emails(tmp_path: Path):
     assert "repo@feature.module" in text
     assert "package@v1.2.3" in text
     assert "user@example.test" in text
-    assert "lane@example.com" not in text
+    assert "alice@example.com" in text
+    assert "noreply@anthropic.com" in text
+    assert "lane@company.io" not in text
     assert "redacted-user1@example.com" in text
-    assert "email=1" in result.output
+    assert "email_occurrences=1" in result.output
+
+
+def test_anonymize_ignores_provider_signatures_placeholders_and_public_ids():
+    signature = "EuYKh92mT4Vn3cLq8Jx1Ra5Wd7Pf0Gs6Hb2Nk9Zm4Ct8"
+    uuid_value = "3cea45c2-8808-4203-a720-374cce2a3123"
+    tool_call_id = "toolu_01Pq7mR4nT9xK2vL8cW5zH3b"
+    value = {
+        "signature": signature,
+        "sig": signature,
+        "token": "!=",
+        "token_id": uuid_value,
+        "idempotency_key": uuid_value,
+        "tool_key": tool_call_id,
+        "credential_version": "v2",
+        "password_changed_at": "2026-08-03T00:00:00Z",
+        "api_key": "<your-api-key>",
+        "api_key_env": "OPENAI_API_KEY",
+        "api_key_placeholder": "abcdefghijklmnopqrstuvwxyz012345",
+        "containsSecret": "abcdefghijklmnopqrstuvwxyz012345",
+        "require_api_key": "abcdefghijklmnopqrstuvwxyz012345",
+    }
+
+    anonymizer = anonymize_module.TraceAnonymizer()
+
+    assert anonymizer.anonymize_value(value) == value
+    repeated_provider_context = [
+        {"type": "thinking", "signature": signature, "attribution": "noreply@anthropic.com"}
+        for _ in range(250)
+    ]
+    assert anonymizer.anonymize_value(repeated_provider_context) == repeated_provider_context
+    assert anonymizer.counts["api_key"] == 0
+    assert anonymizer.counts["email"] == 0
+
+
+def test_anonymize_keeps_high_confidence_credentials_and_signed_query_values():
+    api_key = "sk-proj-abcdefghijklmnopqrstuvwxyzABCDEFGHIJK"
+    auth_token = "gJ7mQ2vR9xK4nT8cW5zH3bP6sL1dF0aE"
+    signature = "EuYKh92mT4Vn3cLq8Jx1Ra5Wd7Pf0Gs6Hb2Nk9Zm4Ct8"
+    value = {
+        "api_key": api_key,
+        "auth_token": auth_token,
+        "url": f"https://example.invalid/callback?sig={signature}&page=1",
+    }
+
+    anonymizer = anonymize_module.TraceAnonymizer()
+    redacted = anonymizer.anonymize_value(value)
+
+    assert api_key not in json.dumps(redacted)
+    assert auth_token not in json.dumps(redacted)
+    assert signature not in json.dumps(redacted)
+    assert redacted["api_key"].startswith("redacted_secret_")
+    assert redacted["auth_token"].startswith("redacted_secret_")
+    assert "sig=redacted_secret_" in redacted["url"]
+    assert anonymizer.counts["api_key"] == 3
+
+
+def test_anonymize_scans_assistant_authored_examples_and_tool_inputs():
+    sample_key = "sk-proj-abcdefghijklmnopqrstuvwxyzABCDEFGHIJK"
+    sample_jwt = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkphbmUifQ."
+        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+    )
+    tool_secret = "gsk_abcdefghijklmnopqrstuvwxyz123456"
+    value = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": (
+                    f'api_key = "{sample_key}"\n'
+                    f'jwt = "{sample_jwt}"\n'
+                    'password = "correct-horse-battery-staple"\n'
+                    "Contact developer@company.com"
+                ),
+                "reasoning_content": "Use qa@acme.com in the documentation example.",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "deploy",
+                            "arguments": {"api_key": tool_secret},
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+
+    anonymizer = anonymize_module.TraceAnonymizer()
+    redacted = anonymizer.anonymize_value(value)
+    assistant = redacted["messages"][0]
+
+    assert sample_key not in assistant["content"]
+    assert sample_jwt not in assistant["content"]
+    assert "correct-horse-battery-staple" not in assistant["content"]
+    assert "developer@company.com" not in assistant["content"]
+    assert "qa@acme.com" not in assistant["reasoning_content"]
+    assert tool_secret not in json.dumps(assistant["tool_calls"])
+    assert "redacted_secret_" in json.dumps(assistant["tool_calls"])
+    assert anonymizer.counts == {"email": 2, "username": 0, "api_key": 4, "pii": 0, "media": 0}
+
+
+def test_anonymize_scrubs_high_confidence_personal_identifiers():
+    value = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": (
+                    "My name is Jane Example. Phone: (212) 555-0198. "
+                    "Address: 123 Example Street, New York, NY 10001. "
+                    "SSN 123-45-6789. IP address: 192.0.2.45."
+                ),
+            }
+        ]
+    }
+
+    anonymizer = anonymize_module.TraceAnonymizer()
+    redacted = anonymizer.anonymize_value(value)
+    text = redacted["messages"][0]["content"]
+
+    for private_value in (
+        "Jane Example",
+        "(212) 555-0198",
+        "123 Example Street",
+        "123-45-6789",
+        "192.0.2.45",
+    ):
+        assert private_value not in text
+    assert text.count("redacted_pii_") == 5
+    assert anonymizer.counts["pii"] == 5
+
+    structured = anonymizer.anonymize_value(
+        {
+            "full_name": "Sam Private",
+            "phone_number": "212-555-0114",
+            "street_address": "99 Private Road",
+            "ip_address": "198.51.100.7",
+        }
+    )
+    assert all(str(value).startswith("redacted_pii_") for value in structured.values())
+    assert anonymizer.counts["pii"] == 9
+
+
+def test_anonymize_generic_secret_scan_is_bounded_on_long_hyphenated_ids():
+    script = """
+from teich.anonymize import TraceAnonymizer
+
+identifier_run = "segment-" * 20_000 + "tail"
+secret = "abcdefghijklmnopqrstuvwxyz012345"
+text = f"token metadata: {identifier_run}\\nservice_api_token={secret}"
+anonymizer = TraceAnonymizer()
+redacted = anonymizer.anonymize_text(text)
+assert identifier_run in redacted
+assert secret not in redacted
+assert "redacted_" in redacted
+assert anonymizer.counts["api_key"] == 1
+"""
+    env = os.environ.copy()
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (source_root, env.get("PYTHONPATH"))))
+
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+
+
+def test_anonymize_quoted_assignment_scan_is_bounded_on_unclosed_backslashes():
+    script = r'''
+from teich.anonymize import TraceAnonymizer
+
+text = 'password: "' + '\\' * 80
+anonymizer = TraceAnonymizer()
+assert anonymizer.anonymize_text(text) == text
+assert anonymizer.counts["api_key"] == 0
+'''
+    env = os.environ.copy()
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (source_root, env.get("PYTHONPATH"))))
+
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+
+
+def test_anonymize_generic_secret_handles_escaped_json_and_ignores_non_secret_assignments():
+    secret = "abcdefghijklmnopqrstuvwxyz012345"
+    text = (
+        rf'\"service-api-token\":\"{secret}\"' + "\n"
+        + rf'\"tool-call-id\":\"{secret}\"'
+    )
+
+    anonymizer = anonymize_module.TraceAnonymizer()
+    redacted = anonymizer.anonymize_text(text)
+
+    assert secret not in redacted.splitlines()[0]
+    assert secret in redacted.splitlines()[1]
+    assert anonymizer.counts["api_key"] == 1
+
+
+def test_anonymize_generic_secret_preserves_redacted_values_across_passes():
+    text = "service_api_token=redacted_secret_abcdefghijklmnop"
+
+    anonymizer = anonymize_module.TraceAnonymizer()
+    redacted = anonymizer.anonymize_text(text)
+
+    assert redacted == text
+    assert anonymizer.counts["api_key"] == 0
 
 
 def test_pool_upload_is_reserved_until_backend_exists(tmp_path: Path):

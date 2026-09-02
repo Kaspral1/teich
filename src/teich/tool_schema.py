@@ -4,7 +4,9 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import queue
 import subprocess
+import threading
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -1281,13 +1283,17 @@ def _validate_argument_schema(
         options = schema.get(combinator)
         if not isinstance(options, list):
             continue
-        option_errors = [
+        option_errors: list[list[str]] = [
             _validate_argument_schema(value, option, path=path)
             for option in options
             if isinstance(option, dict)
         ]
         if option_errors and not any(not branch_errors for branch_errors in option_errors):
-            errors.extend(min(option_errors, key=len))
+            shortest_errors = option_errors[0]
+            for branch_errors in option_errors[1:]:
+                if len(branch_errors) < len(shortest_errors):
+                    shortest_errors = branch_errors
+            errors.extend(shortest_errors)
     required = schema.get("required")
     required_names = {name for name in required if isinstance(name, str)} if isinstance(required, list) else set()
     if isinstance(required, list):
@@ -1365,12 +1371,15 @@ def validate_tool_calls(
             if not isinstance(function, dict):
                 errors.append(f"{row_prefix}message {message_index} tool_call {tool_call_index}: missing function object")
                 continue
-            name = function.get("name")
-            if not isinstance(name, str) or not name:
+            function_name = function.get("name")
+            if not isinstance(function_name, str) or not function_name:
                 errors.append(f"{row_prefix}message {message_index} tool_call {tool_call_index}: missing function name")
                 continue
-            if name not in tool_schemas:
-                errors.append(f"{row_prefix}message {message_index} tool_call {tool_call_index}: undeclared tool {name!r}")
+            if function_name not in tool_schemas:
+                errors.append(
+                    f"{row_prefix}message {message_index} tool_call {tool_call_index}: "
+                    f"undeclared tool {function_name!r}"
+                )
                 continue
             arguments = _parse_tool_call_arguments(function.get("arguments"))
             if not isinstance(arguments, dict):
@@ -1378,7 +1387,11 @@ def validate_tool_calls(
                 continue
             errors.extend(
                 f"{row_prefix}message {message_index} tool_call {tool_call_index} {error}"
-                for error in _validate_argument_schema(arguments, tool_schemas[name], path=name)
+                for error in _validate_argument_schema(
+                    arguments,
+                    tool_schemas[function_name],
+                    path=function_name,
+                )
             )
     return ToolCallValidationReport(ok=not errors, errors=errors)
 
@@ -1416,13 +1429,51 @@ def _raise_json_rpc_error(response: dict[str, Any], server_name: str) -> None:
         raise RuntimeError(f"MCP server '{server_name}' returned JSON-RPC error: {json.dumps(error, ensure_ascii=False)}")
 
 
-def _stdio_mcp_request(process: subprocess.Popen[str], request: dict[str, Any], server_name: str) -> dict[str, Any]:
+def _stdio_readline_with_timeout(
+    process: subprocess.Popen[str],
+    server_name: str,
+    timeout_sec: int | float,
+) -> str:
+    stdout = process.stdout
+    if stdout is None:
+        raise RuntimeError(f"MCP server '{server_name}' did not expose stdout.")
+    result: queue.Queue[str | BaseException] = queue.Queue(maxsize=1)
+
+    def read_line() -> None:
+        try:
+            result.put(stdout.readline())
+        except BaseException as exc:
+            result.put(exc)
+
+    threading.Thread(
+        target=read_line,
+        name=f"teich-mcp-{server_name}-stdout",
+        daemon=True,
+    ).start()
+    try:
+        line = result.get(timeout=timeout_sec)
+    except queue.Empty as exc:
+        raise RuntimeError(
+            f"MCP server '{server_name}' did not respond within {timeout_sec:g} seconds."
+        ) from exc
+    if isinstance(line, BaseException):
+        raise RuntimeError(f"MCP server '{server_name}' stdout read failed: {line}") from line
+    return line
+
+
+def _stdio_mcp_request(
+    process: subprocess.Popen[str],
+    request: dict[str, Any],
+    server_name: str,
+    *,
+    timeout_sec: int | float = 30,
+) -> dict[str, Any]:
     if process.stdin is None or process.stdout is None:
         raise RuntimeError(f"MCP server '{server_name}' did not expose stdio streams.")
     process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
     process.stdin.flush()
     while True:
-        line = process.stdout.readline()
+        line = _stdio_readline_with_timeout(process, server_name, timeout_sec)
         if not line:
             raise RuntimeError(f"MCP server '{server_name}' closed stdout before responding.")
         response = json.loads(line)
@@ -1477,14 +1528,21 @@ def _snapshot_stdio_mcp_tools(mcp: MCPConfig) -> list[dict[str, Any]]:
                 },
             ),
             mcp.name,
+            timeout_sec=mcp.startup_timeout_sec or 30,
         )
         _stdio_mcp_notify(process, "notifications/initialized")
         tools: list[dict[str, Any]] = []
         cursor: str | None = None
+        seen_cursors: set[str] = set()
         request_id = 2
         while True:
             params = {"cursor": cursor} if cursor else None
-            response = _stdio_mcp_request(process, _json_rpc_request(request_id, "tools/list", params), mcp.name)
+            response = _stdio_mcp_request(
+                process,
+                _json_rpc_request(request_id, "tools/list", params),
+                mcp.name,
+                timeout_sec=mcp.tool_timeout_sec or mcp.startup_timeout_sec or 30,
+            )
             request_id += 1
             result = response.get("result")
             if not isinstance(result, dict):
@@ -1499,6 +1557,9 @@ def _snapshot_stdio_mcp_tools(mcp: MCPConfig) -> list[dict[str, Any]]:
             next_cursor = result.get("nextCursor")
             if not isinstance(next_cursor, str) or not next_cursor:
                 return tools
+            if next_cursor in seen_cursors:
+                raise RuntimeError(f"MCP server '{mcp.name}' repeated tools/list cursor {next_cursor!r}.")
+            seen_cursors.add(next_cursor)
             cursor = next_cursor
     finally:
         process.terminate()
@@ -1523,7 +1584,12 @@ def _http_mcp_headers(mcp: MCPConfig) -> dict[str, str]:
     return headers
 
 
-def _http_mcp_request(mcp: MCPConfig, request: dict[str, Any]) -> dict[str, Any]:
+def _http_mcp_request(
+    mcp: MCPConfig,
+    request: dict[str, Any],
+    *,
+    timeout_sec: int | float | None = None,
+) -> dict[str, Any]:
     if not mcp.url:
         return {}
     http_request = Request(
@@ -1533,7 +1599,7 @@ def _http_mcp_request(mcp: MCPConfig, request: dict[str, Any]) -> dict[str, Any]
         method="POST",
     )
     try:
-        with urlopen(http_request, timeout=mcp.startup_timeout_sec or 30) as response:
+        with urlopen(http_request, timeout=timeout_sec or mcp.startup_timeout_sec or 30) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         details = exc.read().decode("utf-8", errors="replace")
@@ -1558,13 +1624,19 @@ def _snapshot_http_mcp_tools(mcp: MCPConfig) -> list[dict[str, Any]]:
                 "clientInfo": {"name": "teich", "version": "0.1.0"},
             },
         ),
+        timeout_sec=mcp.startup_timeout_sec or 30,
     )
     tools: list[dict[str, Any]] = []
     cursor: str | None = None
+    seen_cursors: set[str] = set()
     request_id = 2
     while True:
         params = {"cursor": cursor} if cursor else None
-        response = _http_mcp_request(mcp, _json_rpc_request(request_id, "tools/list", params))
+        response = _http_mcp_request(
+            mcp,
+            _json_rpc_request(request_id, "tools/list", params),
+            timeout_sec=mcp.tool_timeout_sec or mcp.startup_timeout_sec or 30,
+        )
         request_id += 1
         result = response.get("result")
         if not isinstance(result, dict):
@@ -1579,6 +1651,9 @@ def _snapshot_http_mcp_tools(mcp: MCPConfig) -> list[dict[str, Any]]:
         next_cursor = result.get("nextCursor")
         if not isinstance(next_cursor, str) or not next_cursor:
             return tools
+        if next_cursor in seen_cursors:
+            raise RuntimeError(f"MCP server '{mcp.name}' repeated tools/list cursor {next_cursor!r}.")
+        seen_cursors.add(next_cursor)
         cursor = next_cursor
 
 

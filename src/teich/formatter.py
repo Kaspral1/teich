@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from copy import deepcopy
 from dataclasses import dataclass, field
 import json
 import re
+import weakref
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -17,6 +19,8 @@ _GEMMA_TURN_START_PATTERN = re.compile(r"<\|turn>(model|user|system)\n")
 _GEMMA_ASSISTANT_TURN_PREFIX = "<|turn>model\n"
 _GEMMA_TURN_END = "<turn|>"
 _GEMMA_THOUGHT_PREFIX = "<|channel>thought\n"
+_GEMMA_THOUGHT_END = "<channel|>"
+_GEMMA_THINK_TRIGGER = "<|think|>"
 _GEMMA_TOOL_RESPONSE_START = "<|tool_response>"
 _GEMMA_TOOL_RESPONSE_END = "<tool_response|>"
 _TOOL_RESPONSE_DELIMITERS = (
@@ -61,6 +65,9 @@ _SPAN_KIND_SYSTEM = "system"
 _SPAN_KIND_DEVELOPER = "developer"
 _MARKER_PREFERRED_DICT_KEYS = ("text", "content", "value", "arguments", "name")
 _MARKER_STRUCTURAL_DICT_KEYS = {"type"}
+_TEICH_MARKER_PATTERN = re.compile(
+    r"\ue000AGD\d+[SE]\ue001|\\u[eE]000AGD\d+[SE]\\u[eE]001"
+)
 _TEICH_LABEL_PAD_TOKEN_ID = -100
 _TEICH_LABEL_PADDING_COLLATOR_NAMES = {
     "DataCollatorForLanguageModeling",
@@ -68,6 +75,8 @@ _TEICH_LABEL_PADDING_COLLATOR_NAMES = {
 }
 _OVERSIZED_POLICIES = {"drop", "trim_followups", "error"}
 _OVERSIZED_POLICY_KEEP = "keep"
+_REASONING_POLICIES = {"keep", "strip"}
+_GEMMA4_PREFIX_CACHE: weakref.WeakKeyDictionary[Any, dict[str, str]] = weakref.WeakKeyDictionary()
 
 
 @dataclass(slots=True)
@@ -90,6 +99,11 @@ class PrepareReport:
     dropped_rows: list[dict[str, Any]] = field(default_factory=list)
     oversized_rows: list[dict[str, Any]] = field(default_factory=list)
     trimmed_rows: list[dict[str, Any]] = field(default_factory=list)
+    gemma4_modes: dict[str, int] = field(default_factory=dict)
+    granite42_modes: dict[str, int] = field(default_factory=dict)
+    gemma4_legacy_triggers_normalized: int = 0
+    reasoning_stripped_rows: int = 0
+    reasoning_stripped_messages: int = 0
 
     def record_token_length(self, row_info: dict[str, Any], token_length: int) -> None:
         entry = {**row_info, "token_length": token_length}
@@ -145,6 +159,24 @@ class PrepareReport:
             }
         )
 
+    def record_gemma4_mode(self, mode: str | None, *, normalized_legacy_trigger: bool) -> None:
+        if mode is None:
+            return
+        self.gemma4_modes[mode] = self.gemma4_modes.get(mode, 0) + 1
+        if normalized_legacy_trigger:
+            self.gemma4_legacy_triggers_normalized += 1
+
+    def record_granite42_mode(self, mode: str | None) -> None:
+        if mode is None:
+            return
+        self.granite42_modes[mode] = self.granite42_modes.get(mode, 0) + 1
+
+    def record_stripped_reasoning(self, stripped_messages: int) -> None:
+        if stripped_messages <= 0:
+            return
+        self.reasoning_stripped_rows += 1
+        self.reasoning_stripped_messages += stripped_messages
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "total_rows": self.total_rows,
@@ -157,6 +189,11 @@ class PrepareReport:
             "dropped_rows": self.dropped_rows,
             "oversized_rows": self.oversized_rows,
             "trimmed_rows": self.trimmed_rows,
+            "gemma4_modes": self.gemma4_modes,
+            "granite42_modes": self.granite42_modes,
+            "gemma4_legacy_triggers_normalized": self.gemma4_legacy_triggers_normalized,
+            "reasoning_stripped_rows": self.reasoning_stripped_rows,
+            "reasoning_stripped_messages": self.reasoning_stripped_messages,
         }
 
 
@@ -166,6 +203,9 @@ class _RenderedRow:
     supervised_spans: list[dict[str, Any]]
     tokenized: tuple[list[int], list[int]] | None
     token_length: int | None
+    gemma4_mode: str | None = None
+    granite42_mode: str | None = None
+    normalized_legacy_trigger: bool = False
 
 
 @dataclass(slots=True)
@@ -202,6 +242,358 @@ def _validate_chat_template_kwargs(chat_template_kwargs: dict[str, Any] | None) 
         names = ", ".join(sorted(overlap))
         raise ValueError(f"chat_template_kwargs cannot override reserved apply_chat_template arguments: {names}")
     return kwargs
+
+
+def _validate_reasoning_policy(reasoning_policy: str) -> str:
+    if not isinstance(reasoning_policy, str) or reasoning_policy not in _REASONING_POLICIES:
+        choices = ", ".join(sorted(_REASONING_POLICIES))
+        raise ValueError(f"reasoning_policy must be one of: {choices}.")
+    return reasoning_policy
+
+
+def _apply_reasoning_policy(
+    messages: list[dict[str, Any]],
+    reasoning_policy: str,
+) -> tuple[list[dict[str, Any]], int]:
+    if reasoning_policy == "keep":
+        return messages, 0
+    stripped_messages = 0
+    resolved_messages = messages
+    for index, message in enumerate(messages):
+        if message.get("role") not in {"assistant", "model"} or not _message_reasoning(message):
+            continue
+        if resolved_messages is messages:
+            resolved_messages = list(messages)
+        updated = dict(message)
+        updated.pop("reasoning_content", None)
+        updated.pop("thinking", None)
+        updated.pop("reasoning", None)
+        resolved_messages[index] = updated
+        stripped_messages += 1
+    return resolved_messages, stripped_messages
+
+
+def _renderer_name(renderer: Any) -> str:
+    for candidate in (renderer, getattr(renderer, "tokenizer", None)):
+        name = getattr(candidate, "name_or_path", None)
+        if isinstance(name, str) and name:
+            return name.lower()
+    return ""
+
+
+def _is_gemma4_renderer(renderer: Any) -> bool:
+    if "gemma-4" in _renderer_name(renderer):
+        return True
+    template = getattr(renderer, "chat_template", None)
+    return (
+        isinstance(template, str)
+        and "<|turn>model" in template
+        and _GEMMA_THINK_TRIGGER in template
+    )
+
+
+def _is_granite42_renderer(renderer: Any) -> bool:
+    if "granite-4.2" in _renderer_name(renderer):
+        return True
+    template = getattr(renderer, "chat_template", None)
+    return (
+        isinstance(template, str)
+        and "truncate_history_thinking" in template
+        and "<think></think>" in template
+        and "<|im_start|>" in template
+        and "<|im_end|>" in template
+    )
+
+
+def _message_reasoning(message: dict[str, Any]) -> str:
+    for key in ("reasoning_content", "thinking", "reasoning"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _message_has_inline_thinking(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    if not isinstance(content, str):
+        return False
+    stripped = content.lstrip()
+    return stripped.startswith("<think>") and "</think>" in stripped
+
+
+def _message_text_contains(message: dict[str, Any], needle: str) -> bool:
+    content = message.get("content")
+    if isinstance(content, str):
+        return needle in content
+    if isinstance(content, list):
+        return any(
+            isinstance(part, dict)
+            and isinstance(part.get("text"), str)
+            and needle in part["text"]
+            for part in content
+        )
+    return False
+
+
+def _strip_leading_gemma4_trigger(message: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    content = message.get("content")
+    if isinstance(content, str):
+        stripped = content.lstrip()
+        if not stripped.startswith(_GEMMA_THINK_TRIGGER):
+            return message, False
+        updated = dict(message)
+        updated["content"] = stripped[len(_GEMMA_THINK_TRIGGER):].lstrip()
+        return updated, True
+    if not isinstance(content, list):
+        return message, False
+    updated_content = deepcopy(content)
+    for index, part in enumerate(updated_content):
+        if isinstance(part, str):
+            if not part.strip():
+                continue
+            stripped = part.lstrip()
+            if not stripped.startswith(_GEMMA_THINK_TRIGGER):
+                return message, False
+            updated_content[index] = stripped[len(_GEMMA_THINK_TRIGGER):].lstrip()
+            updated = dict(message)
+            updated["content"] = updated_content
+            return updated, True
+        if not isinstance(part, dict):
+            return message, False
+        text = part.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        stripped = text.lstrip()
+        if not stripped.startswith(_GEMMA_THINK_TRIGGER):
+            return message, False
+        updated_part = dict(part)
+        updated_part["text"] = stripped[len(_GEMMA_THINK_TRIGGER):].lstrip()
+        updated_content[index] = updated_part
+        updated = dict(message)
+        updated["content"] = updated_content
+        return updated, True
+    return message, False
+
+
+def _resolve_gemma4_thinking_contract(
+    renderer: Any,
+    messages: list[dict[str, Any]],
+    chat_template_kwargs: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any], str | None, bool]:
+    if not _is_gemma4_renderer(renderer):
+        return messages, chat_template_kwargs, None, False
+    resolved_messages = messages
+    normalized_legacy_trigger = False
+    for index, message in enumerate(messages):
+        if message.get("role") not in {"system", "developer"}:
+            continue
+        if not _message_text_contains(message, _GEMMA_THINK_TRIGGER):
+            continue
+        updated_message, stripped = _strip_leading_gemma4_trigger(message)
+        if not stripped or _message_text_contains(updated_message, _GEMMA_THINK_TRIGGER):
+            raise ValueError(
+                "Gemma 4 system/developer content contains <|think|> outside the supported leading "
+                "legacy position. Remove it and let Teich manage the thinking trigger."
+            )
+        if resolved_messages is messages:
+            resolved_messages = list(messages)
+        resolved_messages[index] = updated_message
+        normalized_legacy_trigger = True
+
+    reasoning_indexes = [
+        index
+        for index, message in enumerate(resolved_messages)
+        if message.get("role") in {"assistant", "model"} and _message_reasoning(message)
+    ]
+    resolved_kwargs = dict(chat_template_kwargs)
+    explicit_thinking = "enable_thinking" in resolved_kwargs
+    if explicit_thinking and not isinstance(resolved_kwargs["enable_thinking"], bool):
+        raise ValueError("Gemma 4 enable_thinking must be a boolean when provided.")
+    if "preserve_thinking" in resolved_kwargs and not isinstance(resolved_kwargs["preserve_thinking"], bool):
+        raise ValueError("Gemma 4 preserve_thinking must be a boolean when provided.")
+    thinking_enabled = (
+        resolved_kwargs["enable_thinking"]
+        if explicit_thinking
+        else bool(reasoning_indexes or normalized_legacy_trigger)
+    )
+    if explicit_thinking and not thinking_enabled and normalized_legacy_trigger:
+        raise ValueError(
+            "Gemma 4 enable_thinking=False conflicts with a leading <|think|> system trigger. "
+            "Remove the legacy trigger for non-thinking data or omit enable_thinking for auto mode."
+        )
+    if not thinking_enabled and reasoning_indexes:
+        raise ValueError(
+            "Gemma 4 thinking is disabled, but this row contains reasoning. Use "
+            "chat_template_kwargs={'enable_thinking': True, "
+            "'preserve_thinking': True}, omit enable_thinking for auto mode, "
+            "or remove reasoning for non-thinking data."
+        )
+    resolved_kwargs["enable_thinking"] = thinking_enabled
+    resolved_kwargs.setdefault("preserve_thinking", thinking_enabled)
+    if thinking_enabled and resolved_kwargs["preserve_thinking"] is not True:
+        last_assistant = max(
+            (
+                index
+                for index, message in enumerate(resolved_messages)
+                if message.get("role") in {"assistant", "model"}
+            ),
+            default=-1,
+        )
+        if any(index != last_assistant for index in reasoning_indexes):
+            raise ValueError(
+                "Gemma 4 preserve_thinking=False drops reasoning from earlier assistant turns. "
+                "Set preserve_thinking=True for multi-turn thinking SFT."
+            )
+    mode = "thinking" if thinking_enabled else "nonthinking"
+    return resolved_messages, resolved_kwargs, mode, normalized_legacy_trigger
+
+
+def _resolve_granite42_thinking_contract(
+    renderer: Any,
+    messages: list[dict[str, Any]],
+    chat_template_kwargs: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any], str | None]:
+    if not _is_granite42_renderer(renderer):
+        return messages, chat_template_kwargs, None
+
+    resolved_kwargs = dict(chat_template_kwargs)
+    for key in ("enable_thinking", "low_effort", "truncate_history_thinking"):
+        if key in resolved_kwargs and not isinstance(resolved_kwargs[key], bool):
+            raise ValueError(f"Granite 4.2 {key} must be a boolean when provided.")
+    reasoning_effort = resolved_kwargs.pop("reasoning_effort", None)
+    if reasoning_effort is not None:
+        if not isinstance(reasoning_effort, str):
+            raise ValueError("Granite 4.2 reasoning_effort must be a string when provided.")
+        # The live template currently accepts reasoning_effort="low" as an
+        # alias, but normalize it so rendering never depends on that optional
+        # compatibility branch. Match the live precedence when both keys exist.
+        resolved_kwargs["low_effort"] = reasoning_effort == "low"
+
+    reasoning_indexes = [
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") in {"assistant", "model"}
+        and (_message_reasoning(message) or _message_has_inline_thinking(message))
+    ]
+    low_effort = resolved_kwargs.get("low_effort", False) is True
+    explicit_thinking = "enable_thinking" in resolved_kwargs
+    thinking_enabled = (
+        resolved_kwargs["enable_thinking"]
+        if explicit_thinking
+        else bool(reasoning_indexes or low_effort)
+    )
+    if not thinking_enabled and reasoning_indexes:
+        raise ValueError(
+            "Granite 4.2 thinking is disabled, but this row contains reasoning. Use "
+            "chat_template_kwargs={'enable_thinking': True}, omit enable_thinking for auto mode, "
+            "or use reasoning_policy='strip' for direct-response training."
+        )
+    if low_effort and not thinking_enabled:
+        raise ValueError(
+            "Granite 4.2 low-effort reasoning requires enable_thinking=True. Remove the low-effort "
+            "setting for non-thinking training or enable thinking."
+        )
+
+    last_user_index = max(
+        (index for index, message in enumerate(messages) if message.get("role") == "user"),
+        default=-1,
+    )
+    has_historical_reasoning = any(index < last_user_index for index in reasoning_indexes)
+    if resolved_kwargs.get("truncate_history_thinking") is True and has_historical_reasoning:
+        raise ValueError(
+            "Granite 4.2 truncate_history_thinking=True would remove reasoning from earlier "
+            "assistant targets during multi-turn SFT. Set it to False or omit it so Teich preserves "
+            "the source reasoning."
+        )
+
+    resolved_kwargs["enable_thinking"] = thinking_enabled
+    # Granite's inference-oriented default strips historical thought. SFT renders
+    # every assistant message as a target, so preserve the source unless the user
+    # explicitly requests truncation for a row without historical reasoning.
+    resolved_kwargs.setdefault("truncate_history_thinking", False)
+    mode = "thinking" if thinking_enabled else "nonthinking"
+    if low_effort:
+        mode = "low_effort"
+    return messages, resolved_kwargs, mode
+
+
+def _gemma4_nonthinking_generation_suffix(
+    renderer: Any,
+    chat_template_kwargs: dict[str, Any],
+) -> str:
+    if not _is_gemma4_renderer(renderer) or chat_template_kwargs.get("enable_thinking", False) is True:
+        return ""
+    try:
+        serialized_kwargs = json.dumps(chat_template_kwargs, sort_keys=True, default=repr)
+    except TypeError:
+        serialized_kwargs = repr(chat_template_kwargs)
+    try:
+        renderer_cache = _GEMMA4_PREFIX_CACHE.setdefault(renderer, {})
+    except TypeError:
+        renderer_cache = {}
+    if serialized_kwargs in renderer_cache:
+        return renderer_cache[serialized_kwargs]
+    probe = [{"role": "user", "content": "__TEICH_GEMMA4_PROBE__"}]
+    base_kwargs = {"tokenize": False, "add_generation_prompt": False, **chat_template_kwargs}
+    prompt_kwargs = {"tokenize": False, "add_generation_prompt": True, **chat_template_kwargs}
+    try:
+        base = _apply_chat_template_with_gemma_fallback(renderer, probe, base_kwargs)
+        prompt = _apply_chat_template_with_gemma_fallback(renderer, probe, prompt_kwargs)
+    except Exception:
+        renderer_cache[serialized_kwargs] = ""
+        return ""
+    if not isinstance(base, str) or not isinstance(prompt, str) or not prompt.startswith(base):
+        renderer_cache[serialized_kwargs] = ""
+        return ""
+    generation_prefix = prompt[len(base):]
+    if not generation_prefix.startswith(_GEMMA_ASSISTANT_TURN_PREFIX):
+        renderer_cache[serialized_kwargs] = ""
+        return ""
+    suffix = generation_prefix[len(_GEMMA_ASSISTANT_TURN_PREFIX):]
+    if suffix == _GEMMA_THOUGHT_PREFIX + _GEMMA_THOUGHT_END:
+        renderer_cache[serialized_kwargs] = suffix
+        return suffix
+    renderer_cache[serialized_kwargs] = ""
+    return ""
+
+
+def _align_gemma4_nonthinking_training_text(
+    renderer: Any,
+    text: str,
+    chat_template_kwargs: dict[str, Any],
+) -> str:
+    suffix = _gemma4_nonthinking_generation_suffix(renderer, chat_template_kwargs)
+    if not suffix:
+        return text
+    parts: list[str] = []
+    cursor = 0
+    for match in _gemma_turn_matches(text):
+        if match.group(1) != "model":
+            continue
+        parts.append(text[cursor:match.end()])
+        if not text.startswith(_GEMMA_THOUGHT_PREFIX, match.end()):
+            parts.append(suffix)
+        cursor = match.end()
+    if not parts:
+        return text
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def _gemma_turn_matches(text: str) -> list[re.Match[str]]:
+    """Find rendered Gemma turn boundaries without scanning inside turn content."""
+    matches: list[re.Match[str]] = []
+    cursor = 0
+    while True:
+        match = _GEMMA_TURN_START_PATTERN.search(text, cursor)
+        if match is None:
+            break
+        matches.append(match)
+        turn_end = text.find(_GEMMA_TURN_END, match.end())
+        if turn_end < 0:
+            break
+        cursor = turn_end + len(_GEMMA_TURN_END)
+    return matches
 
 
 def _as_text_content_parts(content: Any) -> Any:
@@ -280,7 +672,7 @@ def _render_chat(
     rendered = _apply_chat_template_with_gemma_fallback(renderer, messages, render_kwargs)
     if not isinstance(rendered, str):
         raise TypeError("tokenizer.apply_chat_template(..., tokenize=False) must return a string")
-    return rendered
+    return _align_gemma4_nonthinking_training_text(renderer, rendered, chat_template_kwargs)
 
 
 def _normalize_tool_call_arguments_for_template(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -413,6 +805,76 @@ def _tokenize_trainer_text_with_offsets(
     return list(input_ids), list(attention_mask), normalized_offsets
 
 
+def _tokenize_trainer_text_batch_with_offsets(
+    text_tokenizer: Any,
+    texts: list[str],
+) -> list[tuple[list[int], list[int], list[tuple[int, int]]]] | None:
+    """Tokenize one map batch at once when the tokenizer supports batching."""
+    if not texts:
+        return []
+    call_variants = (
+        ((), {"text": texts, "add_special_tokens": False, "return_attention_mask": True, "return_offsets_mapping": True}),
+        ((texts,), {"add_special_tokens": False, "return_attention_mask": True, "return_offsets_mapping": True}),
+    )
+    encoded = None
+    for args, kwargs in call_variants:
+        try:
+            encoded = text_tokenizer(*args, **kwargs)
+            break
+        except TypeError:
+            continue
+        except (ValueError, NotImplementedError):
+            return None
+    if encoded is None:
+        return None
+    input_ids_batch = encoded.get("input_ids")
+    offsets_batch = encoded.get("offset_mapping")
+    if input_ids_batch is None or offsets_batch is None or len(input_ids_batch) != len(texts):
+        return None
+    if not input_ids_batch or not isinstance(input_ids_batch[0], (list, tuple)):
+        return None
+    if not offsets_batch or not isinstance(offsets_batch[0], (list, tuple)):
+        return None
+    attention_batch = encoded.get("attention_mask")
+    if attention_batch is None:
+        attention_batch = [[1] * len(input_ids) for input_ids in input_ids_batch]
+    if len(attention_batch) != len(texts) or len(offsets_batch) != len(texts):
+        return None
+    rows: list[tuple[list[int], list[int], list[tuple[int, int]]]] = []
+    for input_ids, attention_mask, offsets in zip(
+        input_ids_batch,
+        attention_batch,
+        offsets_batch,
+        strict=True,
+    ):
+        if hasattr(input_ids, "tolist"):
+            input_ids = input_ids.tolist()
+        if hasattr(attention_mask, "tolist"):
+            attention_mask = attention_mask.tolist()
+        if hasattr(offsets, "tolist"):
+            offsets = offsets.tolist()
+        if (
+            not isinstance(input_ids, (list, tuple))
+            or not isinstance(attention_mask, (list, tuple))
+            or not isinstance(offsets, (list, tuple))
+            or len(input_ids) != len(attention_mask)
+            or len(input_ids) != len(offsets)
+            or any(mask != 1 for mask in attention_mask)
+            or any(not isinstance(offset, (list, tuple)) or len(offset) != 2 for offset in offsets)
+        ):
+            # Padding or malformed per-row shapes can make a batch encoding
+            # disagree with the trainer's independently tokenized rows.
+            return None
+        rows.append(
+            (
+                list(input_ids),
+                list(attention_mask),
+                [tuple(offset) for offset in offsets],
+            )
+        )
+    return rows
+
+
 def _tokenize_trainer_text(text_tokenizer: Any, text: str) -> tuple[list[int], list[int]] | None:
     call_variants = (
         ((), {"text": text, "add_special_tokens": False, "return_attention_mask": True}),
@@ -499,7 +961,7 @@ def _find_delimited_spans(text: str, start_token: str, end_token: str) -> list[t
 
 
 def _gemma_like_supervised_spans(text: str) -> list[tuple[int, int]]:
-    turn_matches = list(_GEMMA_TURN_START_PATTERN.finditer(text))
+    turn_matches = _gemma_turn_matches(text)
     if not turn_matches:
         return []
     tool_response_spans = _tool_response_spans(text)
@@ -511,7 +973,10 @@ def _gemma_like_supervised_spans(text: str) -> list[tuple[int, int]]:
         block_end = turn_matches[index + 1].start() if index + 1 < len(turn_matches) else len(text)
         turn_end = text.find(_GEMMA_TURN_END, block_start, block_end)
         if turn_end >= 0:
-            block_end = turn_end
+            # The model emits <turn|> to terminate a completed response. Keep
+            # that token in the target so response-only SFT still teaches the
+            # live Gemma 4 stopping contract.
+            block_end = turn_end + len(_GEMMA_TURN_END)
         supervised_start = block_start + len(_GEMMA_ASSISTANT_TURN_PREFIX)
         if supervised_start < block_end:
             supervised_spans.append((supervised_start, block_end))
@@ -541,37 +1006,22 @@ def _tool_response_spans(text: str) -> list[tuple[int, int]]:
     return _merge_spans(spans)
 
 
-def _expand_span_to_containing_span(
+def _extend_span_to_following_assistant_end(
+    text: str,
     span: tuple[int, int],
-    candidate_spans: list[tuple[int, int]],
+    assistant_blocks: _AssistantBlockIndex | None = None,
 ) -> tuple[int, int]:
     start, end = span
-    containing_spans = [
-        (candidate_start, candidate_end)
-        for candidate_start, candidate_end in candidate_spans
-        if candidate_start <= start and end <= candidate_end
-    ]
-    if not containing_spans:
+    assistant_blocks = assistant_blocks or _AssistantBlockIndex.build(text)
+    following_end = assistant_blocks.following_end(end)
+    if following_end is None:
         return span
-    return min(containing_spans, key=lambda item: item[1] - item[0])
-
-
-def _extend_span_to_following_assistant_end(text: str, span: tuple[int, int]) -> tuple[int, int]:
-    start, end = span
-    candidates: list[tuple[int, str]] = []
-    for end_token in _ASSISTANT_BLOCK_END_TOKENS:
-        end_start = text.find(end_token, end)
-        if end_start >= 0:
-            candidates.append((end_start, end_token))
-    if not candidates:
-        return span
-    end_start, end_token = min(candidates, key=lambda item: item[0])
+    end_start, span_end = following_end
     if text[end:end_start].strip():
         return span
-    block = _assistant_block_bounds(text, start, end)
+    block = assistant_blocks.bounds(start, end)
     if block is None or end_start >= block[1]:
         return span
-    span_end = end_start + len(end_token)
     while span_end < len(text) and text[span_end] in "\r\n":
         span_end += 1
     return start, span_end
@@ -597,21 +1047,21 @@ def _prepend_marker(value: Any, marker: str) -> tuple[Any, bool]:
     if isinstance(value, str) and value:
         return marker + value, True
     if isinstance(value, list):
-        updated = list(value)
-        for index, item in enumerate(updated):
+        updated_list = list(value)
+        for index, item in enumerate(updated_list):
             new_item, changed = _prepend_marker(item, marker)
             if changed:
-                updated[index] = new_item
-                return updated, True
+                updated_list[index] = new_item
+                return updated_list, True
         return value, False
     if isinstance(value, dict):
-        updated = dict(value)
-        for key in _marker_dict_keys(updated):
-            item = updated[key]
+        updated_dict = dict(value)
+        for key in _marker_dict_keys(updated_dict):
+            item = updated_dict[key]
             new_item, changed = _prepend_marker(item, marker)
             if changed:
-                updated[key] = new_item
-                return updated, True
+                updated_dict[key] = new_item
+                return updated_dict, True
         return value, False
     return value, False
 
@@ -620,20 +1070,20 @@ def _append_marker(value: Any, marker: str) -> tuple[Any, bool]:
     if isinstance(value, str) and value:
         return value + marker, True
     if isinstance(value, list):
-        updated = list(value)
-        for index in range(len(updated) - 1, -1, -1):
-            new_item, changed = _append_marker(updated[index], marker)
+        updated_list = list(value)
+        for index in range(len(updated_list) - 1, -1, -1):
+            new_item, changed = _append_marker(updated_list[index], marker)
             if changed:
-                updated[index] = new_item
-                return updated, True
+                updated_list[index] = new_item
+                return updated_list, True
         return value, False
     if isinstance(value, dict):
-        updated = dict(value)
-        for key in _marker_append_dict_keys(updated):
-            new_item, changed = _append_marker(updated[key], marker)
+        updated_dict = dict(value)
+        for key in _marker_append_dict_keys(updated_dict):
+            new_item, changed = _append_marker(updated_dict[key], marker)
             if changed:
-                updated[key] = new_item
-                return updated, True
+                updated_dict[key] = new_item
+                return updated_dict, True
         return value, False
     return value, False
 
@@ -731,29 +1181,34 @@ def _strip_markers_and_collect_spans(text: str, markers: list[dict[str, str]]) -
     if not markers:
         return text, []
     marker_lookup: dict[str, tuple[str, int]] = {}
-    pattern_parts: list[str] = []
+    uses_teich_markers = True
     for index, marker in enumerate(markers):
         start_marker = marker["start_marker"]
         end_marker = marker["end_marker"]
+        if start_marker != f"\ue000AGD{index}S\ue001" or end_marker != f"\ue000AGD{index}E\ue001":
+            uses_teich_markers = False
         for marker_variant in _marker_text_variants(start_marker):
             marker_lookup[marker_variant] = ("start", index)
-            pattern_parts.append(re.escape(marker_variant))
         for marker_variant in _marker_text_variants(end_marker):
             marker_lookup[marker_variant] = ("end", index)
-            pattern_parts.append(re.escape(marker_variant))
-    pattern = re.compile("|".join(pattern_parts))
+    if uses_teich_markers:
+        pattern = _TEICH_MARKER_PATTERN
+    else:
+        pattern = re.compile("|".join(re.escape(marker_variant) for marker_variant in marker_lookup))
     cleaned_parts: list[str] = []
     active_starts: dict[int, list[int]] = {}
     spans: list[dict[str, Any]] = []
     cursor = 0
     cleaned_length = 0
     for match in pattern.finditer(text):
+        marker_info = marker_lookup.get(match.group(0))
+        if marker_info is None:
+            continue
         chunk = text[cursor:match.start()]
         if chunk:
             cleaned_parts.append(chunk)
             cleaned_length += len(chunk)
-        marker = match.group(0)
-        kind, index = marker_lookup[marker]
+        kind, index = marker_info
         if kind == "start":
             active_starts.setdefault(index, []).append(cleaned_length)
         else:
@@ -1030,7 +1485,19 @@ def _resolve_assistant_prompt_prefixes(
     probe_contexts = _assistant_prompt_probe_contexts(messages)
     if not probe_contexts:
         return ()
-    cache_key = f"{_serialize_tools_for_cache(tools)}::{','.join(probe_contexts)}"
+    try:
+        serialized_template_kwargs = json.dumps(
+            chat_template_kwargs,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=repr,
+        )
+    except TypeError:
+        serialized_template_kwargs = repr(chat_template_kwargs)
+    cache_key = (
+        f"{_serialize_tools_for_cache(tools)}::{serialized_template_kwargs}::"
+        f"{','.join(probe_contexts)}"
+    )
     prefixes = cache.get(cache_key)
     if prefixes is None:
         prefixes = _infer_assistant_prompt_prefixes(renderer, tools, chat_template_kwargs, probe_contexts)
@@ -1058,37 +1525,133 @@ def _assistant_block_bounds(text: str, start: int, end: int) -> tuple[int, int] 
     return block_start, block_end
 
 
+@dataclass(slots=True)
+class _AssistantBlockIndex:
+    text: str
+    start_thresholds: list[int]
+    start_prefix_maxima: list[int]
+    end_starts: list[int]
+    end_positions: list[int]
+
+    @classmethod
+    def build(cls, text: str) -> _AssistantBlockIndex:
+        start_events: list[tuple[int, int]] = []
+        for token in _ASSISTANT_BLOCK_START_TOKENS:
+            cursor = 0
+            while True:
+                token_start = text.find(token, cursor)
+                if token_start < 0:
+                    break
+                start_events.append((token_start + len(token), token_start))
+                cursor = token_start + len(token)
+        start_events.sort()
+        start_thresholds: list[int] = []
+        start_prefix_maxima: list[int] = []
+        max_start = -1
+        for threshold, token_start in start_events:
+            max_start = max(max_start, token_start)
+            start_thresholds.append(threshold)
+            start_prefix_maxima.append(max_start)
+
+        end_by_start: dict[int, int] = {}
+        for token in _ASSISTANT_BLOCK_END_TOKENS:
+            cursor = 0
+            while True:
+                token_start = text.find(token, cursor)
+                if token_start < 0:
+                    break
+                end_by_start.setdefault(token_start, token_start + len(token))
+                cursor = token_start + len(token)
+        ordered_ends = sorted(end_by_start.items())
+        return cls(
+            text=text,
+            start_thresholds=start_thresholds,
+            start_prefix_maxima=start_prefix_maxima,
+            end_starts=[start for start, _ in ordered_ends],
+            end_positions=[end for _, end in ordered_ends],
+        )
+
+    def bounds(self, start: int, end: int) -> tuple[int, int] | None:
+        start_index = bisect_right(self.start_thresholds, start) - 1
+        if start_index < 0:
+            return None
+        block_start = self.start_prefix_maxima[start_index]
+        end_index = bisect_left(self.end_starts, end)
+        if end_index >= len(self.end_starts):
+            return None
+        block_end = self.end_positions[end_index]
+        while block_end < len(self.text) and self.text[block_end] in "\r\n":
+            block_end += 1
+        return block_start, block_end
+
+    def following_end(self, position: int) -> tuple[int, int] | None:
+        end_index = bisect_left(self.end_starts, position)
+        if end_index >= len(self.end_starts):
+            return None
+        return self.end_starts[end_index], self.end_positions[end_index]
+
+
+@dataclass(slots=True)
+class _ContainingSpanIndex:
+    spans: list[tuple[int, int]]
+    starts: list[int]
+
+    @classmethod
+    def build(cls, spans: list[tuple[int, int]]) -> _ContainingSpanIndex:
+        merged = _merge_spans(spans)
+        return cls(merged, [start for start, _ in merged])
+
+    def containing(self, span: tuple[int, int]) -> tuple[int, int]:
+        start, end = span
+        index = bisect_right(self.starts, start) - 1
+        if index < 0:
+            return span
+        candidate_start, candidate_end = self.spans[index]
+        if candidate_start <= start and end <= candidate_end:
+            return candidate_start, candidate_end
+        return span
+
+
+def _expand_supervised_span(
+    text: str,
+    span: tuple[int, int],
+    assistant_prompt_prefixes: tuple[str, ...],
+    assistant_blocks: _AssistantBlockIndex,
+) -> tuple[int, int]:
+    start, end = span
+    assistant_block = assistant_blocks.bounds(start, end)
+    if assistant_block is None:
+        return span
+    block_start, block_end = assistant_block
+    if not assistant_prompt_prefixes:
+        return block_start, block_end
+    block_text = text[block_start:block_end]
+    matched_prefix = next((prefix for prefix in assistant_prompt_prefixes if block_text.startswith(prefix)), None)
+    fallback_prefix = next((prefix for prefix in _ASSISTANT_BLOCK_START_TOKENS if block_text.startswith(prefix)), None)
+    if matched_prefix is not None:
+        supervised_prefix_length = len(matched_prefix)
+        for reasoning_start_token in _REASONING_START_TOKENS:
+            if matched_prefix.endswith(reasoning_start_token):
+                supervised_prefix_length -= len(reasoning_start_token)
+                break
+        return block_start + supervised_prefix_length, block_end
+    if fallback_prefix is not None:
+        return block_start + len(fallback_prefix), block_end
+    return span
+
+
 def _expand_supervised_spans(
     text: str,
     supervised_spans: list[tuple[int, int]],
     assistant_prompt_prefixes: tuple[str, ...],
     train_on_reasoning: bool,
 ) -> list[tuple[int, int]]:
-    expanded_spans: list[tuple[int, int]] = []
-    for start, end in supervised_spans:
-        assistant_block = _assistant_block_bounds(text, start, end)
-        if assistant_block is None:
-            expanded_spans.append((start, end))
-            continue
-        block_start, block_end = assistant_block
-        if not assistant_prompt_prefixes:
-            expanded_spans.append((block_start, block_end))
-            continue
-        block_text = text[block_start:block_end]
-        matched_prefix = next((prefix for prefix in assistant_prompt_prefixes if block_text.startswith(prefix)), None)
-        fallback_prefix = next((prefix for prefix in _ASSISTANT_BLOCK_START_TOKENS if block_text.startswith(prefix)), None)
-        if matched_prefix is not None:
-            supervised_prefix_length = len(matched_prefix)
-            for reasoning_start_token in _REASONING_START_TOKENS:
-                if matched_prefix.endswith(reasoning_start_token):
-                    supervised_prefix_length -= len(reasoning_start_token)
-                    break
-            expanded_spans.append((block_start + supervised_prefix_length, block_end))
-            continue
-        if fallback_prefix is not None:
-            expanded_spans.append((block_start + len(fallback_prefix), block_end))
-            continue
-        expanded_spans.append((start, end))
+    del train_on_reasoning
+    assistant_blocks = _AssistantBlockIndex.build(text)
+    expanded_spans = [
+        _expand_supervised_span(text, span, assistant_prompt_prefixes, assistant_blocks)
+        for span in supervised_spans
+    ]
     return _merge_spans(expanded_spans)
 
 
@@ -1097,6 +1660,15 @@ def _expand_typed_spans(
     spans: list[dict[str, Any]],
     assistant_prompt_prefixes: tuple[str, ...],
 ) -> list[dict[str, Any]]:
+    span_kinds = {span.get("kind") for span in spans}
+    assistant_blocks = _AssistantBlockIndex.build(text)
+    reasoning_spans = _ContainingSpanIndex.build(_reasoning_spans(text)) if _SPAN_KIND_REASONING in span_kinds else None
+    tool_call_spans = _ContainingSpanIndex.build(_tool_call_spans(text)) if _SPAN_KIND_TOOL_CALL in span_kinds else None
+    tool_response_spans = (
+        _ContainingSpanIndex.build(_tool_response_spans(text))
+        if _SPAN_KIND_TOOL_RESPONSE in span_kinds
+        else None
+    )
     expanded_spans: list[dict[str, Any]] = []
     for span in spans:
         start = span["start"]
@@ -1104,31 +1676,29 @@ def _expand_typed_spans(
         kind = span.get("kind")
         expanded_start, expanded_end = start, end
         if kind in {_SPAN_KIND_REASONING, _SPAN_KIND_FINAL_ANSWER}:
-            expanded = _expand_supervised_spans(
+            expanded_start, expanded_end = _expand_supervised_span(
                 text,
-                [(start, end)],
-                assistant_prompt_prefixes,
-                train_on_reasoning=True,
-            )
-            if expanded:
-                expanded_start, expanded_end = expanded[0]
-            if (expanded_start, expanded_end) == (start, end):
-                if kind == _SPAN_KIND_REASONING:
-                    expanded_start, expanded_end = _expand_span_to_containing_span(
-                        (start, end),
-                        _reasoning_spans(text),
-                    )
-        elif kind == _SPAN_KIND_TOOL_CALL:
-            expanded_start, expanded_end = _expand_span_to_containing_span(
                 (start, end),
-                _tool_call_spans(text),
+                assistant_prompt_prefixes,
+                assistant_blocks,
             )
+            if (
+                kind == _SPAN_KIND_REASONING
+                and reasoning_spans is not None
+                and (expanded_start, expanded_end) == (start, end)
+            ):
+                expanded_start, expanded_end = reasoning_spans.containing((start, end))
+        elif kind == _SPAN_KIND_TOOL_CALL:
+            if tool_call_spans is not None:
+                expanded_start, expanded_end = tool_call_spans.containing((start, end))
             expanded_start, expanded_end = _extend_span_to_following_assistant_end(
                 text,
                 (expanded_start, expanded_end),
+                assistant_blocks,
             )
         elif kind == _SPAN_KIND_TOOL_RESPONSE:
-            expanded_start, expanded_end = _expand_span_to_containing_span((start, end), _tool_response_spans(text))
+            if tool_response_spans is not None:
+                expanded_start, expanded_end = tool_response_spans.containing((start, end))
         updated = dict(span)
         updated["start"] = expanded_start
         updated["end"] = expanded_end
@@ -1150,7 +1720,7 @@ def _span_kind_enabled(
     train_on_developer: bool,
     train_on_tool_responses: bool,
 ) -> bool:
-    if kind in (None, ""):
+    if not kind:
         return True
     return {
         _SPAN_KIND_REASONING: train_on_reasoning,
@@ -1220,7 +1790,37 @@ def _select_supervised_spans(
         selected = _subtract_spans(selected, _source_spans_for_kind(spans, _SPAN_KIND_SYSTEM))
     if not train_on_developer:
         selected = _subtract_spans(selected, _source_spans_for_kind(spans, _SPAN_KIND_DEVELOPER))
-    return _merge_spans(selected)
+    selected = _merge_spans(selected)
+
+    # A Gemma turn terminator is useful exactly when the same model turn still
+    # contains an enabled model-authored training target. Terminator-only spans
+    # are not final answers, so add the terminator from the rendered protocol
+    # instead of relying on degenerate final-answer metadata. Conversely, do
+    # not keep a row alive solely by labeling <turn|> after every assistant
+    # target was excluded.
+    orphaned_turn_ends: list[tuple[int, int]] = []
+    retained_turn_ends: list[tuple[int, int]] = []
+    model_selected = _subtract_spans(selected, _tool_response_spans(text))
+    turn_matches = _gemma_turn_matches(text)
+    for index, match in enumerate(turn_matches):
+        if match.group(1) != "model":
+            continue
+        block_end = turn_matches[index + 1].start() if index + 1 < len(turn_matches) else len(text)
+        turn_end = text.find(_GEMMA_TURN_END, match.end(), block_end)
+        if turn_end < 0:
+            continue
+        turn_end_span = (turn_end, turn_end + len(_GEMMA_TURN_END))
+        has_selected_content = any(
+            text[max(start, match.end()) : min(end, turn_end)].strip()
+            for start, end in model_selected
+            if start < turn_end and end > match.end()
+        )
+        if has_selected_content:
+            retained_turn_ends.append(turn_end_span)
+        elif not has_selected_content:
+            orphaned_turn_ends.append(turn_end_span)
+    selected = _merge_spans(selected + retained_turn_ends)
+    return _subtract_spans(selected, orphaned_turn_ends)
 
 
 def _labels_from_offsets(
@@ -1401,22 +2001,6 @@ def _supervised_text_and_spans(
         )
         if inferred_spans:
             return formatted_text, _span_dicts(inferred_spans)
-    gemma_spans = _gemma_like_supervised_spans(formatted_text)
-    if gemma_spans:
-        gemma_spans = _subtract_spans(gemma_spans, _tool_call_spans(formatted_text))
-        gemma_spans = _subtract_spans(gemma_spans, _tool_response_spans(formatted_text))
-        gemma_spans = _subtract_spans(gemma_spans, _reasoning_spans(formatted_text))
-        supervised_spans.extend(
-            {
-                "start": start,
-                "end": end,
-                "source_start": start,
-                "source_end": end,
-                "kind": _SPAN_KIND_FINAL_ANSWER,
-                "role": "assistant",
-            }
-            for start, end in gemma_spans
-        )
     assistant_prompt_prefixes = _resolve_assistant_prompt_prefixes(
         renderer,
         messages,
@@ -1440,7 +2024,7 @@ def _span_dicts(spans: list[tuple[int, int]] | list[dict[str, Any]]) -> list[dic
             end = item.get("end")
             if not isinstance(start, int) or not isinstance(end, int) or start >= end:
                 continue
-            span = {"start": start, "end": end}
+            span: dict[str, Any] = {"start": start, "end": end}
             source_start = item.get("source_start", start)
             source_end = item.get("source_end", end)
             if isinstance(source_start, int) and isinstance(source_end, int) and source_start < source_end:
@@ -1534,6 +2118,40 @@ def _drop_last_user_turn(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     if not any(message.get("role") == "user" for message in trimmed):
         return None
     return trimmed
+
+
+def _followup_trim_candidates(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Return the same prefixes as repeated _drop_last_user_turn, longest first."""
+    user_indexes: list[int] = []
+    last_assistant_before: list[int | None] = []
+    last_assistant: int | None = None
+    for index, message in enumerate(messages):
+        last_assistant_before.append(last_assistant)
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "user":
+            user_indexes.append(index)
+        elif role == "assistant":
+            last_assistant = index
+    if len(user_indexes) < 2:
+        return []
+
+    candidates: list[list[dict[str, Any]]] = []
+    seen_ends: set[int] = set()
+    for user_index in reversed(user_indexes[1:]):
+        assistant_index = last_assistant_before[user_index]
+        if assistant_index is None or assistant_index in seen_ends:
+            continue
+        candidate = messages[: assistant_index + 1]
+        if not any(
+            isinstance(message, dict) and message.get("role") == "user"
+            for message in candidate
+        ):
+            continue
+        seen_ends.add(assistant_index)
+        candidates.append(candidate)
+    return candidates
 
 
 def _tool_schema_names(tools: list[dict[str, Any]]) -> set[str]:
@@ -1647,6 +2265,7 @@ def _resolve_preserved_columns(
 ) -> list[str]:
     if preserve_columns is None or preserve_columns is False:
         return []
+    candidates: tuple[str, ...]
     if preserve_columns is True:
         candidates = DEFAULT_PROVENANCE_COLUMNS
     else:
@@ -1742,6 +2361,14 @@ def _render_training_row(
     assistant_prompt_prefix_cache: dict[str, tuple[str, ...]],
     strict: bool,
 ) -> _RenderedRow | None:
+    messages, template_kwargs, gemma4_mode, normalized_legacy_trigger = (
+        _resolve_gemma4_thinking_contract(renderer, messages, template_kwargs)
+    )
+    messages, template_kwargs, granite42_mode = _resolve_granite42_thinking_contract(
+        renderer,
+        messages,
+        template_kwargs,
+    )
     if teich_masking:
         text, supervised_spans = _supervised_text_and_spans(
             renderer,
@@ -1769,6 +2396,9 @@ def _render_training_row(
         supervised_spans=supervised_spans,
         tokenized=tokenized,
         token_length=token_length,
+        gemma4_mode=gemma4_mode,
+        granite42_mode=granite42_mode,
+        normalized_legacy_trigger=normalized_legacy_trigger,
     )
 
 
@@ -1781,6 +2411,7 @@ def row_fits_context(
     messages_column: str = "messages",
     tools_column: str = "tools",
     text_column: str = "text",
+    reasoning_policy: str = "keep",
     return_details: bool = False,
 ) -> bool | RowContextFit:
     if not isinstance(max_length, int) or max_length <= 0:
@@ -1803,8 +2434,19 @@ def row_fits_context(
     if not isinstance(tools, list):
         raise TypeError(f"Row has a non-list '{tools_column}' column.")
     messages = _normalize_tool_call_arguments_for_template(normalize_training_messages(messages))
+    messages, _ = _apply_reasoning_policy(messages, _validate_reasoning_policy(reasoning_policy))
     renderer = _resolve_chat_template_renderer(tokenizer, text_tokenizer)
     template_kwargs = _validate_chat_template_kwargs(chat_template_kwargs)
+    messages, template_kwargs, _, _ = _resolve_gemma4_thinking_contract(
+        renderer,
+        messages,
+        template_kwargs,
+    )
+    messages, template_kwargs, _ = _resolve_granite42_thinking_contract(
+        renderer,
+        messages,
+        template_kwargs,
+    )
     text = _render_chat(renderer, messages, tools, template_kwargs)
     token_length = _tokenized_length(text_tokenizer, text)
     result = RowContextFit(
@@ -1824,6 +2466,7 @@ def format_data(
     tools_column: str = "tools",
     text_column: str = "text",
     chat_template_kwargs: dict[str, Any] | None = None,
+    reasoning_policy: str = "keep",
     train_on_reasoning: bool | None = None,
     teich_masking: bool = True,
     max_length: int | None = None,
@@ -1855,6 +2498,7 @@ def format_data(
                         tools_column=tools_column,
                         text_column=text_column,
                         chat_template_kwargs=chat_template_kwargs,
+                        reasoning_policy=reasoning_policy,
                         train_on_reasoning=train_on_reasoning,
                         teich_masking=teich_masking,
                         max_length=max_length,
@@ -1878,6 +2522,7 @@ def format_data(
         raise TypeError("prepare_data expects a Dataset or a sequence of Dataset objects.")
 
     template_kwargs = _validate_chat_template_kwargs(chat_template_kwargs)
+    effective_reasoning_policy = _validate_reasoning_policy(reasoning_policy)
     text_tokenizer = _resolve_text_tokenizer(tokenizer)
     renderer = _resolve_chat_template_renderer(tokenizer, text_tokenizer)
     assistant_prompt_prefix_cache: dict[str, tuple[str, ...]] = {}
@@ -1936,6 +2581,12 @@ def format_data(
                     report.record_dropped_row(row_info, "empty_messages")
                 continue
             messages = _normalize_tool_call_arguments_for_template(messages)
+            messages, stripped_reasoning_messages = _apply_reasoning_policy(
+                messages,
+                effective_reasoning_policy,
+            )
+            if report is not None:
+                report.record_stripped_reasoning(stripped_reasoning_messages)
             tools = tools_batch[index] or []
             if not isinstance(tools, list):
                 raise TypeError(f"Row is missing a list-valued '{tools_column}' column")
@@ -2001,28 +2652,59 @@ def format_data(
                         report.record_dropped_row(row_info, "oversized", initial_token_length)
                     continue
                 if rendered.token_length > effective_max_length:
-                    while effective_oversized_policy == "trim_followups":
-                        trimmed_messages = _drop_last_user_turn(messages)
-                        if trimmed_messages is None:
-                            break
-                        messages = trimmed_messages
-                        did_trim = True
-                        rendered = _render_training_row(
-                            renderer=renderer,
-                            text_tokenizer=text_tokenizer,
-                            messages=messages,
-                            tools=tools,
-                            template_kwargs=template_kwargs,
-                            teich_masking=teich_masking,
-                            tokenize=tokenize,
-                            measure_token_length=measure_token_length,
-                            assistant_prompt_prefix_cache=assistant_prompt_prefix_cache,
-                            strict=strict,
-                        )
-                        if rendered is None:
-                            break
-                        if rendered.token_length is not None and rendered.token_length <= effective_max_length:
-                            break
+                    if effective_oversized_policy == "trim_followups":
+                        candidates = _followup_trim_candidates(messages)
+                        candidate_cache: dict[int, _RenderedRow | None] = {}
+
+                        def render_candidate(candidate_index: int) -> _RenderedRow | None:
+                            candidate_rendered = candidate_cache.get(candidate_index)
+                            if candidate_index not in candidate_cache:
+                                candidate_rendered = _render_training_row(
+                                    renderer=renderer,
+                                    text_tokenizer=text_tokenizer,
+                                    messages=candidates[candidate_index],
+                                    tools=tools,
+                                    template_kwargs=template_kwargs,
+                                    teich_masking=teich_masking,
+                                    tokenize=tokenize,
+                                    measure_token_length=measure_token_length,
+                                    assistant_prompt_prefix_cache=assistant_prompt_prefix_cache,
+                                    strict=strict,
+                                )
+                                candidate_cache[candidate_index] = candidate_rendered
+                            return candidate_rendered
+
+                        first_fitting_index: int | None = None
+                        low = 0
+                        high = len(candidates) - 1
+                        while low <= high:
+                            middle = (low + high) // 2
+                            candidate_rendered = render_candidate(middle)
+                            candidate_length = (
+                                candidate_rendered.token_length
+                                if candidate_rendered is not None
+                                else None
+                            )
+                            if candidate_length is not None and candidate_length <= effective_max_length:
+                                first_fitting_index = middle
+                                high = middle - 1
+                            else:
+                                low = middle + 1
+                        if first_fitting_index is not None:
+                            # Check the immediate boundary so tokenizer/template
+                            # edge effects cannot skip a longer fitting prefix.
+                            while first_fitting_index > 0:
+                                previous = render_candidate(first_fitting_index - 1)
+                                if (
+                                    previous is None
+                                    or previous.token_length is None
+                                    or previous.token_length > effective_max_length
+                                ):
+                                    break
+                                first_fitting_index -= 1
+                            messages = candidates[first_fitting_index]
+                            rendered = render_candidate(first_fitting_index)
+                            did_trim = True
                     if rendered is None or rendered.token_length is None or rendered.token_length > effective_max_length:
                         dropped_oversized_count += 1
                         if report is not None:
@@ -2055,6 +2737,11 @@ def format_data(
             )
             if report is not None:
                 report.record_kept_row(row_info, rendered.token_length)
+                report.record_gemma4_mode(
+                    rendered.gemma4_mode,
+                    normalized_legacy_trigger=rendered.normalized_legacy_trigger,
+                )
+                report.record_granite42_mode(rendered.granite42_mode)
         return output_batch
 
     formatted_data = dataset.map(
@@ -2096,12 +2783,14 @@ def _mask_tokenized_row(
     train_on_system: bool,
     train_on_developer: bool,
     train_on_tool_responses: bool,
+    encoded_with_offsets: tuple[list[int], list[int], list[tuple[int, int]]] | None = None,
 ) -> dict[str, Any] | None:
     input_ids = _extract_token_sequence(row.get("input_ids"))
     if input_ids is None:
         raise TypeError("Trainer dataset row is missing tokenized 'input_ids'.")
     text = row.get(text_column)
     span_metadata = _normalize_span_metadata(row.get(TEICH_SUPERVISED_SPANS_COLUMN))
+    labels: list[int] | None
     if isinstance(text, str) and span_metadata:
         supervised_spans = _select_supervised_spans(
             text,
@@ -2116,7 +2805,7 @@ def _mask_tokenized_row(
         )
         if not supervised_spans:
             return None
-        encoded = _tokenize_trainer_text_with_offsets(text_tokenizer, text)
+        encoded = encoded_with_offsets or _tokenize_trainer_text_with_offsets(text_tokenizer, text)
         if encoded is None:
             decoded_text, offsets = _token_text_and_offsets(text_tokenizer, input_ids)
             if decoded_text != text and not text.startswith(decoded_text):
@@ -2129,6 +2818,15 @@ def _mask_tokenized_row(
             full_input_ids, _, offsets = encoded
             full_labels = _labels_from_offsets(full_input_ids, offsets, supervised_spans)
             labels = _align_labels_to_input_ids(input_ids, full_input_ids, full_labels)
+            if labels is None and encoded_with_offsets is not None:
+                # Some tokenizer wrappers implicitly pad or otherwise alter
+                # batch calls even when padding was not requested. Retry this
+                # row independently before declaring the trainer data invalid.
+                encoded = _tokenize_trainer_text_with_offsets(text_tokenizer, text)
+                if encoded is not None:
+                    full_input_ids, _, offsets = encoded
+                    full_labels = _labels_from_offsets(full_input_ids, offsets, supervised_spans)
+                    labels = _align_labels_to_input_ids(input_ids, full_input_ids, full_labels)
             if labels is None:
                 raise ValueError("Trainer tokenized input_ids do not align with the original Teich-rendered text.")
     else:
@@ -2233,7 +2931,9 @@ class _TeichLabelPaddingCollator:
             features_without_labels.append(feature_without_labels)
         batch = self.base_collator(features_without_labels, *args, **kwargs)
         input_ids = batch.get("input_ids") if isinstance(batch, Mapping) else None
-        target_length = _sequence_length(input_ids) or max((len(row_labels) for row_labels in labels), default=0)
+        target_length = _sequence_length(input_ids)
+        if target_length is None:
+            target_length = max((len(row_labels) for row_labels in labels), default=0)
         padded_labels = _tensor_like_padded_labels(input_ids, labels, target_length, self.padding_side) if input_ids is not None else None
         batch["labels"] = padded_labels if padded_labels is not None else _list_padded_labels(labels, target_length, self.padding_side)
         return batch
@@ -2268,14 +2968,19 @@ def mask_data(
     train_on_tool_responses: bool = False,
     max_supervised_tokens: int | None = None,
     audit: bool = True,
-    audit_sample_size: int = 8,
+    audit_sample_size: int | None = None,
     verbose: bool = True,
 ) -> Any:
     from .audit import audit_sft_dataset
 
     text_tokenizer = _resolve_text_tokenizer(tokenizer or getattr(trainer, "processing_class", None) or getattr(trainer, "tokenizer", None))
     trainer_args = getattr(trainer, "args", None)
-    dataset_text_field = text_column or getattr(trainer_args, "dataset_text_field", "text")
+    raw_dataset_text_field = text_column or getattr(trainer_args, "dataset_text_field", "text")
+    dataset_text_field = (
+        raw_dataset_text_field
+        if isinstance(raw_dataset_text_field, str) and raw_dataset_text_field
+        else "text"
+    )
     trainer_max_length = getattr(trainer_args, "max_length", None)
     truncation_mode = getattr(trainer_args, "truncation_mode", None)
     effective_max_supervised_tokens = (
@@ -2330,6 +3035,15 @@ def mask_data(
             nonlocal dropped_untrainable_count
             output_batch = _empty_output_batch()
             batch_size = len(batch["input_ids"])
+            texts = batch.get(dataset_text_field)
+            batched_offsets = (
+                _tokenize_trainer_text_batch_with_offsets(text_tokenizer, texts)
+                if isinstance(texts, list)
+                and len(texts) == batch_size
+                and all(isinstance(text, str) for text in texts)
+                and TEICH_SUPERVISED_SPANS_COLUMN in batch
+                else None
+            )
             for index in range(batch_size):
                 row = {column_name: batch[column_name][index] for column_name in dataset.column_names}
                 masked_row = _mask_tokenized_row(
@@ -2343,6 +3057,7 @@ def mask_data(
                     train_on_system=train_on_system,
                     train_on_developer=train_on_developer,
                     train_on_tool_responses=train_on_tool_responses,
+                    encoded_with_offsets=batched_offsets[index] if batched_offsets is not None else None,
                 )
                 if masked_row is None:
                     dropped_untrainable_count += 1
